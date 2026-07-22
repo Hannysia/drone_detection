@@ -1,0 +1,10 @@
+.env
+configs/keys/key.json
+.venv/
+venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.mp4
+*.avi
