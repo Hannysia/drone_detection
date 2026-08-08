@@ -1,0 +1,86 @@
+import os
+import sys
+from pathlib import Path
+from huggingface_hub import HfApi
+sys.path.append(str(Path(__file__).parent.parent))
+
+from src.config import (
+    REPO_ID, HF_TOKEN, OUTPUT_DIR, LOG_FILE, TMP_DIR, VIDEO_EXTENSIONS, SPLITS
+)
+from src.utils.io import get_processed_list, mark_as_processed, cleanup_partial_files
+from src.processing.extractor import download_and_extract_assets, parse_annotations, extract_frames_and_labels
+
+def main() -> None:
+    api = HfApi(token=HF_TOKEN)
+    
+    print("Fetching file list from Hugging Face repository...")
+    repo_files = api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
+    processed_videos = get_processed_list(LOG_FILE)
+
+    for split in SPLITS:
+        print("\n" + "="*80)
+        print(f"STARTING SPLIT: {split.upper()}")
+        print("="*80)
+
+        hf_labels_root = f"labels/{split}/"
+        split_pos_dir = OUTPUT_DIR / split / "RAW_POSITIVES"
+        split_neg_dir = OUTPUT_DIR / split / "RAW_NEGATIVES"
+        split_tmp_dir = TMP_DIR / split
+
+        split_pos_dir.mkdir(parents=True, exist_ok=True)
+        split_neg_dir.mkdir(parents=True, exist_ok=True)
+        split_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        zip_tasks = [f for f in repo_files if f.startswith(hf_labels_root) and f.endswith('.zip')]
+
+        for zip_path in zip_tasks:
+            video_base_name = Path(zip_path).stem
+            
+            if video_base_name in processed_videos:
+                print(f"Skipping {video_base_name}: Already DONE.")
+                continue
+
+            video_path_hf = None
+            for ext in VIDEO_EXTENSIONS:
+                potential_path = f"{split}/{video_base_name}{ext}"
+                match = [f for f in repo_files if f.lower() == potential_path.lower()]
+                if match:
+                    video_path_hf = match[0]
+                    break
+
+            if not video_path_hf:
+                print(f"❌ NOT FOUND: Video for {video_base_name} in {split}/")
+                continue
+
+            cleanup_partial_files(video_base_name, split_pos_dir, split_neg_dir)
+
+            print(f"\nProcessing: {video_base_name}")
+            
+            try:
+                local_video, gt_temp_path = download_and_extract_assets(
+                    REPO_ID, HF_TOKEN, video_path_hf, zip_path, split_tmp_dir, video_base_name
+                )
+
+                annotations = parse_annotations(gt_temp_path)
+                
+                extract_frames_and_labels(
+                    local_video, annotations, video_base_name, split_pos_dir, split_neg_dir
+                )
+                
+                mark_as_processed(LOG_FILE, video_base_name)
+                
+                local_video.unlink(missing_ok=True)
+                gt_temp_path.unlink(missing_ok=True)
+                (split_tmp_dir / Path(zip_path).name).unlink(missing_ok=True)
+                
+                print(f"✅ Success: {video_base_name}")
+
+            except Exception as e:
+                print(f"⚠️ ERROR processing {video_base_name}: {e}")
+
+    print("\n" + "="*80)
+    print("PROCESS FINISHED")
+    print(f"Check {LOG_FILE} for the list of completed videos.")
+
+if __name__ == "__main__":
+    main()

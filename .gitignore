@@ -8,3 +8,6 @@ __pycache__/
 .vscode/
 *.mp4
 *.avi
+archive/
+
+notebooks/
