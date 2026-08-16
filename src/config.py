@@ -14,10 +14,28 @@ if IS_KAGGLE:
     HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
     
     KAGGLE_INPUT_DIR = Path("/kaggle/input")
+    parent_dir = KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh"
+    
     IMG_DATASET_NAME = "uav-detection-dataset"
-    EXTRACTED_DATA_DIR = KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh" / IMG_DATASET_NAME / "extracted_dataset"
+    
+    if parent_dir.exists():
+        attached_datasets = [d.name for d in parent_dir.iterdir() if d.is_dir()]
+        if attached_datasets:
+            IMG_DATASET_NAME = attached_datasets[0]
+            
+    EXTRACTED_DATA_DIR = parent_dir / IMG_DATASET_NAME / "extracted_dataset"
     WORKING_DIR = Path("/kaggle/working")
     OUTPUT_DIR = WORKING_DIR / "runs" / "detect" 
+    EMBEDDINGS_DIR = Path("/kaggle/working/embeddings")
+
+
+    
+    MOT_DATASET_DIR = WORKING_DIR / "drone_mot_dataset"
+    SEQMAPS_DIR = MOT_DATASET_DIR / "seqmaps"
+    YOLO_DETECTIONS_OUT = WORKING_DIR / "yolo_detections"
+    YOLO_MODEL_PATH = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.engine"
+    TRACKERS_OUT_DIR = WORKING_DIR / "trackers"
+    LOCAL_HF_DATA_DIR = WORKING_DIR / "drone_dataset"
 
 else:
     from dotenv import load_dotenv

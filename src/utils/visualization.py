@@ -527,3 +527,88 @@ def plot_false_positive_inline(
     plt.tight_layout()
     plt.show()
     plt.close()
+
+
+
+def plot_unified_calibration_curves(
+    thresholds: np.ndarray, 
+    precision: list[float], 
+    recall: list[float], 
+    f1: list[float], 
+    f05: list[float], 
+    neg_fa_rate: list[float],
+    opt_th_f1: float,
+    opt_th_f05: float
+) -> None:
+    """Plots unified calibration curves (P, R, F1, F0.5 with indicators) and watermark FA rates."""
+    plt.figure(figsize=(15, 6))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(thresholds, precision, 'g-', label='Precision (P)', linewidth=2)
+    plt.plot(thresholds, recall, 'b-', label='Recall (R)', linewidth=2)
+    plt.plot(thresholds, f1, 'y:', label='F1-Score', linewidth=2)
+    plt.plot(thresholds, f05, 'r-', label='F0.5-Score (Precision Weighted)', linewidth=3)
+    
+    plt.axvline(opt_th_f1, color='purple', linestyle='--', label=f'Max F1 Th ({opt_th_f1:.2f})')
+    plt.axvline(opt_th_f05, color='black', linestyle='-.', label=f'Max F0.5 Th ({opt_th_f05:.2f})')
+    
+    plt.xlabel('Confidence Threshold')
+    plt.ylabel('Score')
+    plt.title('YOLO Threshold Calibration Curves')
+    plt.legend(loc="lower left")
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(thresholds, neg_fa_rate, 'm-', linewidth=2, label='False Alarm Rate')
+    plt.axvline(opt_th_f1, color='purple', linestyle='--')
+    plt.axvline(opt_th_f05, color='black', linestyle='-.')
+    plt.xlabel('Confidence Threshold')
+    plt.ylabel('False Alarm Rate on Negatives (%)')
+    plt.title('Watermark / Background Noise Vulnerability Rate')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+def plot_evaluation_diagnostics_grid(df_diag: pd.DataFrame) -> None:
+    """Plots 2x2 grid of recall rates broken down by morphology, sensor, background, and scale."""
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    categories = ["morphology", "camera", "background", "size"]
+    ax_flat = axes.flatten()
+    
+    for i, cat in enumerate(categories):
+        summary = df_diag.groupby([cat, "type"]).size().unstack(fill_value=0)
+        if "True Positive" not in summary:
+            summary["True Positive"] = 0
+        if "False Negative" not in summary:
+            summary["False Negative"] = 0
+            
+        summary["Total"] = summary["True Positive"] + summary["False Negative"]
+        summary["Recall"] = summary["True Positive"] / summary["Total"]
+        summary = summary.reset_index()
+        
+        sns.barplot(
+            data=summary, x=cat, y="Recall", ax=ax_flat[i], hue=cat, palette="viridis", legend=False
+        )
+        ax_flat[i].set_ylim(0.0, 1.05)
+        ax_flat[i].set_title(f"Target Recall Rate by {cat.capitalize()}", fontsize=13, fontweight="bold")
+        ax_flat[i].set_ylabel("Recall Rate")
+        ax_flat[i].set_xlabel("")
+        
+        for bar in ax_flat[i].patches:
+            val = bar.get_height()
+            ax_flat[i].annotate(
+                f"{val*100:.1f}%",
+                (bar.get_x() + bar.get_width() / 2., val + 0.01),
+                ha='center', va='bottom', fontsize=9, fontweight='bold'
+            )
+            
+    plt.suptitle("Model Evaluation Diagnostic Breakdown (Optimal Threshold)", fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    plt.close()

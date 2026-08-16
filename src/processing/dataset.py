@@ -346,3 +346,42 @@ def parse_frame_filename_logic(filename: str) -> dict:
         "camera": camera,
         "background": background
     }
+
+
+
+def compile_kaggle_mot_dataset(local_hf_dir: Path, mot_dataset_dir: Path, seqmaps_dir: Path, video_extensions: tuple[str]) -> None:
+    """Compiles local Kaggle directories and extracts MOT labels to build TrackEval dataset."""
+    seqmaps_dir.mkdir(parents=True, exist_ok=True)
+    splits = ["test", "val"]
+
+    labels_root = local_hf_dir / "labels"
+    zip_files = {z.stem: z for z in labels_root.rglob("*.zip")}
+    print(f"Found {len(zip_files)} label archives in recursive search.")
+
+    for split in splits:
+        split_video_dir = local_hf_dir / split
+        trackeval_split_name = f"drone-{split}"
+        gt_dir = mot_dataset_dir / trackeval_split_name
+        gt_dir.mkdir(parents=True, exist_ok=True)
+        
+        videos = [f for f in split_video_dir.iterdir() if f.suffix.lower() in video_extensions]
+        matched_seqs = []
+        
+        for video_path in videos:
+            seq_name = video_path.stem
+            zip_path = zip_files.get(seq_name) or zip_files.get(f"{seq_name}_annotated")
+            
+            if zip_path:
+                matched_seqs.append(seq_name)
+                seq_gt_dir = gt_dir / seq_name / "gt"
+                seq_gt_dir.mkdir(parents=True, exist_ok=True)
+                seqinfo_path = gt_dir / seq_name / "seqinfo.ini"
+                
+                prepare_trackeval_sequence(video_path, zip_path, seq_gt_dir, seqinfo_path)
+            else:
+                print(f"Warning: No matching zip archive found for video {video_path.name}")
+                
+        with open(seqmaps_dir / f"{trackeval_split_name}.txt", "w", encoding="utf-8") as f:
+            f.write("name\n" + "\n".join(matched_seqs))
+            
+    print("Dataset compilation for TrackEval complete.")

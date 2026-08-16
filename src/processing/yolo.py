@@ -7,10 +7,17 @@ from huggingface_hub import HfApi
 import random
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
-from src.utils.visualization import plot_detections_summary
+from src.utils.visualization import plot_detections_summary, overlay_heatmap, plot_eigencam_results
+from src.utils.geometry import calculate_iou
+import cv2
+import numpy as np
+import torch
 from src.config import (
     EXTRACTED_DATA_DIR, OUTPUT_DIR, REPO_ID, HF_TOKEN, WORKING_DIR
 )
+
+from src.utils.geometry import calculate_iou
+
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +44,7 @@ def prepare_yolo_dataset(IMG_DATASET_PATH: Path, working_dir: Path, run_name: st
         (run_data_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
         
     def process_split(split_name: str) -> None:
-        pos_dir = EXTRACTED_DATA_DIR/ split_name / "RAW_POSITIVES"
+        pos_dir = IMG_DATASET_PATH / split_name / "RAW_POSITIVES"
         linked_pos_count = 0
         if pos_dir.exists():
             for jpg_path in pos_dir.glob("*.jpg"):
@@ -52,7 +59,7 @@ def prepare_yolo_dataset(IMG_DATASET_PATH: Path, working_dir: Path, run_name: st
 
         linked_neg_count = 0
         if use_negatives:
-            neg_dir = EXTRACTED_DATA_DIR/ split_name / "RAW_NEGATIVES"
+            neg_dir = IMG_DATASET_PATH / split_name / "RAW_NEGATIVES"
             if neg_dir.exists():
                 for jpg_path in neg_dir.glob("*.jpg"):
                     dest_img = run_data_dir / "images" / split_name / jpg_path.name
@@ -220,15 +227,6 @@ def evaluate_model(weights_path: Path, yaml_path: Path, run_name: str) -> None:
         log.info(f"mAP50:                      {metrics_dict.get('metrics/mAP50(B)', 0.0):.4f}")
         log.info(f"mAP50-95:                   {metrics_dict.get('metrics/mAP50-95(B)', 0.0):.4f}")
         log.info("="*50)
-
-
-
-import cv2
-import numpy as np
-import torch
-from pathlib import Path
-from ultralytics import YOLO
-from src.utils.visualization import overlay_heatmap, plot_eigencam_results
 
 
 def load_eval_model(weights_path: str, device: torch.device) -> tuple[YOLO, torch.nn.Module]:
@@ -507,3 +505,96 @@ def run_false_positive_inference(model: YOLO, negatives_dir: Path, conf_thresh: 
         log.info(f"  Min confidence: {false_positives[-1]['max_conf']:.3f}")
 
     return false_positives
+
+
+def evaluate_predictions(gt_boxes: list, pred_boxes: list, iou_threshold: float = 0.5) -> tuple[list[int], list[int], list[int]]:
+    """Greedy IoU matching between ground truths and predicted bounding boxes."""
+    if len(pred_boxes) == 0:
+        return [], [], list(range(len(gt_boxes)))
+    if len(gt_boxes) == 0:
+        return [], list(range(len(pred_boxes))), []
+
+    pred_boxes = sorted(pred_boxes, key=lambda x: x[4], reverse=True)
+    
+    matched_gts = set()
+    tp_indices = []
+    fp_indices = []
+    
+    for pred_idx, pred in enumerate(pred_boxes):
+        best_iou = -1.0
+        best_gt_idx = -1
+        
+        for gt_idx, gt in enumerate(gt_boxes):
+            if gt_idx in matched_gts:
+                continue
+            iou = calculate_iou(pred[:4], gt)
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = gt_idx
+                
+        if best_iou >= iou_threshold:
+            matched_gts.add(best_gt_idx)
+            tp_indices.append(pred_idx)
+        else:
+            fp_indices.append(pred_idx)
+            
+    fn_indices = [i for i in range(len(gt_boxes)) if i not in matched_gts]
+    return tp_indices, fp_indices, fn_indices
+
+
+def run_dataset_predictions_db(model: YOLO, test_dir: Path, imgsz: int = 1280) -> list[dict]:
+    """Runs batch predictions at conf 0.01 over test split to build evaluation database."""
+    test_pos_dir = test_dir / "RAW_POSITIVES"
+    test_neg_dir = test_dir / "RAW_NEGATIVES"
+    
+    test_images = []
+    for ext in ["*.jpg", "*.png", "*.jpeg"]:
+        if test_pos_dir.exists():
+            test_images.extend([(p, True) for p in test_pos_dir.glob(ext)])
+        if test_neg_dir.exists():
+            test_images.extend([(p, False) for p in test_neg_dir.glob(ext)])
+            
+    log.info(f"Found {len(test_images)} test images to process.")
+    
+    raw_database = []
+    
+    for img_path, is_positive in tqdm(test_images, desc="Running Evaluation Inference"):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        h_orig, w_orig = img.shape[:2]
+        
+        gt_boxes = []
+        if is_positive:
+            txt_path = img_path.with_suffix(".txt")
+            if txt_path.exists():
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) == 5:
+                            x_c, y_c, w, h = map(float, parts[1:5])
+                            x_min = (x_c - w / 2.0) * w_orig
+                            y_min = (y_c - h / 2.0) * h_orig
+                            x_max = (x_c + w / 2.0) * w_orig
+                            y_max = (y_c + h / 2.0) * h_orig
+                            gt_boxes.append([x_min, y_min, x_max, y_max])
+
+        device = 0 if torch.cuda.is_available() else "cpu"
+        results = model.predict(img, imgsz=imgsz, verbose=False, device=device)[0]
+        pred_boxes = []
+        for box in results.boxes:
+            coords = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            pred_boxes.append([coords[0], coords[1], coords[2], coords[3], conf])
+            
+        raw_database.append({
+            "filename": img_path.name,
+            "path": img_path,
+            "is_positive": is_positive,
+            "width": w_orig,
+            "height": h_orig,
+            "gt_boxes": gt_boxes,
+            "pred_boxes": pred_boxes
+        })
+        
+    return raw_database
