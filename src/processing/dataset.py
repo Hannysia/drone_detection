@@ -2,7 +2,6 @@ import logging
 import shutil
 from pathlib import Path
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import zipfile
 import numpy as np
 from src.processing.video import get_video_metadata
@@ -76,7 +75,9 @@ def perform_stratified_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
 
     df_safe = df[df['final_strat'].isin(safe_final_classes)]
     df_rare = df[~df['final_strat'].isin(safe_final_classes)]
-    
+
+    from sklearn.model_selection import train_test_split
+
     train_safe, temp_safe = train_test_split(
         df_safe, test_size=0.30, stratify=df_safe['final_strat'], random_state=42
     )
