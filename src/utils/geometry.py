@@ -28,3 +28,19 @@ def calculate_iou(box1: list[float], box2: list[float]) -> float:
     b1_area = box1[2] * box1[3]
     b2_area = box2[2] * box2[3]
     return iarea / (b1_area + b2_area - iarea + 1e-7)
+
+
+def calculate_iou_xyxy(box1: list[float], box2: list[float]) -> float:
+    """Calculates IoU for two absolute boxes in xyxy format [x_min, y_min, x_max, y_max]."""
+    ix1 = max(box1[0], box2[0])
+    iy1 = max(box1[1], box2[1])
+    ix2 = min(box1[2], box2[2])
+    iy2 = min(box1[3], box2[3])
+
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+
+    iarea = (ix2 - ix1) * (iy2 - iy1)
+    b1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    b2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    return iarea / (b1_area + b2_area - iarea + 1e-7)

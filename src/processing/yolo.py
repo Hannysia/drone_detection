@@ -8,16 +8,13 @@ import random
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
 from src.utils.visualization import plot_detections_summary, overlay_heatmap, plot_eigencam_results
-from src.utils.geometry import calculate_iou
+from src.utils.geometry import calculate_iou_xyxy
 import cv2
 import numpy as np
 import torch
 from src.config import (
     EXTRACTED_DATA_DIR, OUTPUT_DIR, REPO_ID, HF_TOKEN, WORKING_DIR
 )
-
-from src.utils.geometry import calculate_iou
-
 
 log = logging.getLogger(__name__)
 
@@ -527,7 +524,7 @@ def evaluate_predictions(gt_boxes: list, pred_boxes: list, iou_threshold: float 
         for gt_idx, gt in enumerate(gt_boxes):
             if gt_idx in matched_gts:
                 continue
-            iou = calculate_iou(pred[:4], gt)
+            iou = calculate_iou_xyxy(pred[:4], gt)
             if iou > best_iou:
                 best_iou = iou
                 best_gt_idx = gt_idx
