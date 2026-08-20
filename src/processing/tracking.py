@@ -8,31 +8,9 @@ from ultralytics import YOLO
 
 log = logging.getLogger(__name__)
 
-try:
-    from boxmot.trackers import ByteTrack, OcSort
-except ImportError:
-    try:
-        from boxmot.trackers.bbox.bytetrack.bytetrack import ByteTrack
-        try:
-            from boxmot.trackers.bbox.ocsort.ocsort import OcSort
-        except ImportError:
-            from boxmot.trackers.bbox.ocsort.ocsort import OCSort as OcSort
-    except ImportError:
-        try:
-            from boxmot.trackers.bytetrack.bytetrack import ByteTrack
-            try:
-                from boxmot.trackers.ocsort.ocsort import OcSort
-            except ImportError:
-                from boxmot.trackers.ocsort.ocsort import OCSort as OcSort
-        except ImportError:
-            try:
-                from boxmot import BYTETracker as ByteTrack
-                from boxmot import OCSORT as OcSort
-            except ImportError as e:
-                raise ImportError(
-                    "Failed to import trackers. Please check your BoxMOT installation. "
-                    f"Original error: {e}"
-                )
+from boxmot.trackers.bbox.bytetrack.bytetrack import ByteTrack
+from boxmot.trackers.bbox.ocsort.ocsort import OcSort
+
 
 logging.getLogger("boxmot").setLevel(logging.WARNING)
 try:
