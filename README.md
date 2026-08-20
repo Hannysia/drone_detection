@@ -7,10 +7,7 @@
 ![YOLO26n](https://img.shields.io/badge/Model-YOLO26n-yellow)
 
 <p align="center">
-  <video width="750" autoplay loop muted playsinline>
-    <source src="https://raw.githubusercontent.com/Hannysia/uav-detection/main/docs/demo.mp4" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
+  <video src="https://github.com/user-attachments/assets/531a8a64-148a-4106-9fde-620d44585e0f" width="750" controls></video>
 </p>
 
 ---
