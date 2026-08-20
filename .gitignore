@@ -10,4 +10,4 @@ __pycache__/
 *.avi
 archive/
 
-notebooks/
+hf_weights/
