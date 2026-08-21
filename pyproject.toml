@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone_classification"
+version = "0.1.0"
+description = "Latency-driven model and tracker selection for UAV interception: A system design study"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+[tool.pytest.ini_options]
+pythonpath = ["."]
