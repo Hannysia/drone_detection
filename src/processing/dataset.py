@@ -1,5 +1,6 @@
 import logging
 import shutil
+import os
 from pathlib import Path
 import pandas as pd
 import zipfile
@@ -386,3 +387,71 @@ def compile_kaggle_mot_dataset(local_hf_dir: Path, mot_dataset_dir: Path, seqmap
             f.write("name\n" + "\n".join(matched_seqs))
             
     print("Dataset compilation for TrackEval complete.")
+
+
+
+def safe_symlink(src: Path, dst: Path) -> None:
+    """Creates a symbolic link, safely unlinking any existing file or link at destination first."""
+    if dst.is_symlink() or dst.exists():
+        try:
+            dst.unlink()
+        except OSError:
+            return
+    try:
+        os.symlink(src, dst)
+    except FileExistsError:
+        pass
+
+def prepare_yolo_dataset(IMG_DATASET_PATH: Path, working_dir: Path, run_name: str, use_negatives: bool) -> Path:
+    """Prepares isolated directories and creates relative symlinks for images and labels."""
+    log.info(f"\n[DATA PREPARATION] Setting up dataset directories for run: {run_name}")
+    
+    run_data_dir = working_dir / f"yolo_dataset_{run_name}"
+    
+    for split in ["train", "val", "test"]:
+        (run_data_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (run_data_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+        
+    def process_split(split_name: str) -> None:
+        pos_dir = IMG_DATASET_PATH / split_name / "RAW_POSITIVES"
+        linked_pos_count = 0
+        if pos_dir.exists():
+            for jpg_path in pos_dir.glob("*.jpg"):
+                txt_path = jpg_path.with_suffix(".txt")
+                if txt_path.exists():
+                    dest_img = run_data_dir / "images" / split_name / jpg_path.name
+                    dest_lbl = run_data_dir / "labels" / split_name / txt_path.name
+                    
+                    safe_symlink(jpg_path, dest_img)
+                    safe_symlink(txt_path, dest_lbl)
+                    linked_pos_count += 1
+
+        linked_neg_count = 0
+        if use_negatives:
+            neg_dir = IMG_DATASET_PATH / split_name / "RAW_NEGATIVES"
+            if neg_dir.exists():
+                for jpg_path in neg_dir.glob("*.jpg"):
+                    dest_img = run_data_dir / "images" / split_name / jpg_path.name
+                    safe_symlink(jpg_path, dest_img)
+                    linked_neg_count += 1
+
+        log.info(f"[{split_name.upper()}] Symlinked {linked_pos_count:,} positives and {linked_neg_count:,} negatives.")
+
+    process_split("train")
+    process_split("val")
+    process_split("test")
+
+    yaml_data = {
+        "path": str(run_data_dir.resolve()),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "names": {0: "drone"}
+    }
+    
+    yaml_path = working_dir / f"dataset_{run_name}.yaml"
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        yaml.dump(yaml_data, f, default_flow_style=False)
+        
+    log.info(f"[DATA PREPARATION] Created YAML configuration at: {yaml_path}")
+    return yaml_path
