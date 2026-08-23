@@ -5,10 +5,9 @@ from src.processing.video import get_frame_count, get_video_metadata
 
 @patch("src.processing.video.cv2.VideoCapture")
 def test_get_frame_count_success(mock_video_capture):
-    # Mocking successful video opening
     mock_cap = MagicMock()
     mock_cap.isOpened.return_value = True
-    mock_cap.get.return_value = 150.0  # Simulated CAP_PROP_FRAME_COUNT
+    mock_cap.get.return_value = 150.0  
     mock_video_capture.return_value = mock_cap
 
     result = get_frame_count("mock_video.mp4")
@@ -19,7 +18,6 @@ def test_get_frame_count_success(mock_video_capture):
 
 @patch("src.processing.video.cv2.VideoCapture")
 def test_get_frame_count_failed_to_open(mock_video_capture):
-    # Mocking video opening failure
     mock_cap = MagicMock()
     mock_cap.isOpened.return_value = False
     mock_video_capture.return_value = mock_cap
