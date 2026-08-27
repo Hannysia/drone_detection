@@ -33,7 +33,9 @@ if IS_KAGGLE:
     MOT_DATASET_DIR = WORKING_DIR / "drone_mot_dataset"
     SEQMAPS_DIR = MOT_DATASET_DIR / "seqmaps"
     YOLO_DETECTIONS_OUT = WORKING_DIR / "yolo_detections"
-    YOLO_MODEL_PATH = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.engine"
+    YOLO_MODEL_PATH_PT = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.pt"
+    YOLO_MODEL_PATH_ENGINE = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.engine"
+
     TRACKERS_OUT_DIR = WORKING_DIR / "trackers"
     LOCAL_HF_DATA_DIR = WORKING_DIR / "drone_dataset"
 
