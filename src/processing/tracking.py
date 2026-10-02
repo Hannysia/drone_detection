@@ -8,9 +8,7 @@ from ultralytics import YOLO
 
 log = logging.getLogger(__name__)
 
-from boxmot.trackers.bbox.bytetrack.bytetrack import ByteTrack
-from boxmot.trackers.bbox.ocsort.ocsort import OcSort
-
+from boxmot.trackers import ByteTrack, OcSort
 
 logging.getLogger("boxmot").setLevel(logging.WARNING)
 try:
