@@ -489,7 +489,6 @@ def load_and_verify_embeddings(repo_id: str, filename: str, token: str | None = 
     print(f"  - Key format example: '{first_key}'")
     print(f"  - Vector shape: {first_vector.shape}")
     
-    # Convert PyTorch Tensor to Numpy array for validation metrics
     first_vector_np = first_vector.numpy() if isinstance(first_vector, torch.Tensor) else np.array(first_vector)
     l2_norm = np.linalg.norm(first_vector_np)
     print(f"  - L2 Norm of vector: {l2_norm:.6f} (Should be ~1.0 if normalized)")
@@ -647,7 +646,6 @@ def run_theta_analysis(
         dist_intra, dist_inter, theta_range, kept_fractions
     )
 
-    # 6. Print recommendation report
     print(f"\n{'='*50}\nRECOMMENDATIONS FOR THETA\n{'='*50}")
     
     theta1_conservative = np.percentile(dist_intra, 10)

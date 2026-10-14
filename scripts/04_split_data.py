@@ -50,7 +50,6 @@ def main() -> None:
     log.info(f"Val:   {val_df['frames'].sum()} кадрів ({val_df['frames'].sum()/total_frames*100:.1f}%) | {len(val_df)} відео")
     log.info(f"Test:  {test_df['frames'].sum()} кадрів ({test_df['frames'].sum()/total_frames*100:.1f}%) | {len(test_df)} відео")
 
-    # Фізичне копіювання файлів локально
     splits = {'train': train_df, 'val': val_df, 'test': test_df}
     log.info(f"\n[*] Preparing local directory structure in: {SPLIT_OUTPUT_DIR}")
     

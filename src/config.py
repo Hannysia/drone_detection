@@ -56,7 +56,7 @@ else:
     HF_TOKEN = os.getenv("HF_TOKEN")
     LOCAL_BASE_DIR = Path(os.getenv("LOCAL_BASE_DIR"))
 
-    WORKING_DIR = LOCAL_BASE_DIR / "working" #==========================================================
+    WORKING_DIR = LOCAL_BASE_DIR / "working"
 
 
     OUTPUT_DIR = LOCAL_BASE_DIR / "extracted_dataset"

@@ -88,7 +88,6 @@ def main() -> None:
             existing_files.append(new_file_name)
             processed_count += 1
             
-            # Захист від перевищення квоти запитів API (Rate Limits)
             time.sleep(4.0)
             
         except Exception as e:

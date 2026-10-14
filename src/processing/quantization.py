@@ -19,12 +19,10 @@ def benchmark_model(model: YOLO, label: str, dummy_img: np.ndarray, n_warmup: in
     """Measures FPS and latency of the model on a dummy image and prints output."""
     print(f"\nBenchmark: {label}")
 
-    # GPU Warmup
     for _ in range(n_warmup):
         model(dummy_img, verbose=False, device="cuda")
     torch.cuda.synchronize()
 
-    # Latency/FPS measurement
     times = []
     for _ in range(n_benchmark):
         torch.cuda.synchronize()
@@ -33,7 +31,7 @@ def benchmark_model(model: YOLO, label: str, dummy_img: np.ndarray, n_warmup: in
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
 
-    times = np.array(times) * 1000  # Convert to milliseconds
+    times = np.array(times) * 1000
     fps = 1000 / np.mean(times)
 
     result = {
