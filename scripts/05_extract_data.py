@@ -2,19 +2,44 @@ import os
 import sys
 from pathlib import Path
 from huggingface_hub import HfApi
+import json
+
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.config import (
-    REPO_ID, HF_TOKEN, OUTPUT_DIR, LOG_FILE, TMP_DIR, VIDEO_EXTENSIONS, SPLITS
+    REPO_ID, HF_TOKEN, OUTPUT_DIR, LOG_FILE, TMP_DIR, VIDEO_EXTENSIONS, SPLITS, PROJECT_ROOT
 )
 from src.utils.io import get_processed_list, mark_as_processed, cleanup_partial_files
 from src.processing.extractor import download_and_extract_assets, parse_annotations, extract_frames_and_labels
 
 def main() -> None:
+
     api = HfApi(token=HF_TOKEN)
-    
-    print("Fetching file list from Hugging Face repository...")
-    repo_files = api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
+
+    source_path = PROJECT_ROOT / "manifests" / "sources" / "hf.json"
+
+    with source_path.open("r", encoding="utf-8") as file:
+        source = json.load(file)
+
+    if source["repo_id"] != REPO_ID:
+        raise ValueError(
+            "Hugging Face repository ID does not match "
+            "the pinned source configuration"
+        )
+
+    if source["repo_type"] != "dataset":
+        raise ValueError("Expected a Hugging Face dataset repository")
+
+    revision = source["revision"]
+
+    print(f"Fetching files from HF revision: {revision}")
+
+    repo_files = api.list_repo_files(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        revision=revision,
+    )
+
     processed_videos = get_processed_list(LOG_FILE)
 
     for split in SPLITS:
@@ -57,8 +82,15 @@ def main() -> None:
             print(f"\nProcessing: {video_base_name}")
             
             try:
+
                 local_video, gt_temp_path = download_and_extract_assets(
-                    REPO_ID, HF_TOKEN, video_path_hf, zip_path, split_tmp_dir, video_base_name
+                    REPO_ID,
+                    HF_TOKEN,
+                    video_path_hf,
+                    zip_path,
+                    split_tmp_dir,
+                    video_base_name,
+                    revision=revision,
                 )
 
                 annotations = parse_annotations(gt_temp_path)

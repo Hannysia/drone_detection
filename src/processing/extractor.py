@@ -66,16 +66,17 @@ def download_and_extract_assets(
     video_path_hf: str,
     zip_path_hf: str,
     tmp_dir: Path,
-    video_base_name: str
+    video_base_name: str,
+    revision: str,
 ) -> tuple[Path, Path]:
     """Downloads video and zip with ground truth from Hugging Face."""
     local_video = Path(hf_hub_download(
         repo_id=repo_id, filename=video_path_hf, local_dir=tmp_dir, 
-        repo_type="dataset", token=hf_token
+        repo_type="dataset", token=hf_token, revision=revision
     ))
     local_zip = Path(hf_hub_download(
         repo_id=repo_id, filename=zip_path_hf, local_dir=tmp_dir, 
-        repo_type="dataset", token=hf_token
+        repo_type="dataset", token=hf_token, revision=revision
     ))
 
     gt_temp_path = tmp_dir / f"{video_base_name}_gt.txt"
