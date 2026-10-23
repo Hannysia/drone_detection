@@ -4,6 +4,10 @@ from pathlib import Path
 VIDEO_EXTENSIONS = ['.mp4', '.mov', '.m4v']
 SPLITS = ["train", "val", "test"]
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MANIFESTS_DIR = PROJECT_ROOT / "manifests"
+HISTORICAL_MANIFEST = MANIFESTS_DIR / "historical" / "final.csv"
+
 IS_KAGGLE = os.environ.get('KAGGLE_KERNEL_RUN_TYPE', '') != ''
 
 if IS_KAGGLE:
