@@ -29,6 +29,7 @@ if IS_KAGGLE:
             
     EXTRACTED_DATA_DIR = parent_dir / IMG_DATASET_NAME / "extracted_dataset"
     WORKING_DIR = Path("/kaggle/working")
+    FRAME_BASELINE_DIR = WORKING_DIR / "frame_baseline_v1" / "main"
     OUTPUT_DIR = WORKING_DIR / "runs" / "detect" 
     EMBEDDINGS_DIR = Path("/kaggle/working/embeddings")
 
@@ -59,6 +60,7 @@ else:
     REPO_ID = os.getenv("REPO_ID")
     HF_TOKEN = os.getenv("HF_TOKEN")
     LOCAL_BASE_DIR = Path(os.getenv("LOCAL_BASE_DIR"))
+    FRAME_BASELINE_DIR = LOCAL_BASE_DIR / "frame_baseline_v1" / "main"
 
     WORKING_DIR = LOCAL_BASE_DIR / "working"
 

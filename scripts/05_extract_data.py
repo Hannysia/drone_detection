@@ -3,16 +3,33 @@ import sys
 from pathlib import Path
 from huggingface_hub import HfApi
 import json
+from src.utils.io import (
+    get_processed_list,
+    mark_as_processed,
+    cleanup_partial_files,
+    get_extraction_paths,
+)
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.config import (
-    REPO_ID, HF_TOKEN, OUTPUT_DIR, LOG_FILE, TMP_DIR, VIDEO_EXTENSIONS, SPLITS, PROJECT_ROOT
+    REPO_ID, HF_TOKEN, VIDEO_EXTENSIONS, SPLITS, PROJECT_ROOT, FRAME_BASELINE_DIR, EXTRACTED_DATA_DIR
 )
 from src.utils.io import get_processed_list, mark_as_processed, cleanup_partial_files
 from src.processing.extractor import download_and_extract_assets, parse_annotations, extract_frames_and_labels
 
 def main() -> None:
+
+    output_dir, tmp_dir, log_file = get_extraction_paths(
+        baseline_dir=FRAME_BASELINE_DIR,
+        historical_dir=EXTRACTED_DATA_DIR,
+    )
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Extraction output: {output_dir}")
+    print(f"Temporary files: {tmp_dir}")
+    print(f"Progress log: {log_file}")
 
     api = HfApi(token=HF_TOKEN)
 
@@ -40,7 +57,7 @@ def main() -> None:
         revision=revision,
     )
 
-    processed_videos = get_processed_list(LOG_FILE)
+    processed_videos = get_processed_list(log_file)
 
     for split in SPLITS:
         print("\n" + "="*80)
@@ -48,9 +65,9 @@ def main() -> None:
         print("="*80)
 
         hf_labels_root = f"labels/{split}/"
-        split_pos_dir = OUTPUT_DIR / split / "RAW_POSITIVES"
-        split_neg_dir = OUTPUT_DIR / split / "RAW_NEGATIVES"
-        split_tmp_dir = TMP_DIR / split
+        split_pos_dir = output_dir / split / "RAW_POSITIVES"
+        split_neg_dir = output_dir / split / "RAW_NEGATIVES"
+        split_tmp_dir = tmp_dir / split
 
         split_pos_dir.mkdir(parents=True, exist_ok=True)
         split_neg_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +116,7 @@ def main() -> None:
                     local_video, annotations, video_base_name, split_pos_dir, split_neg_dir
                 )
                 
-                mark_as_processed(LOG_FILE, video_base_name)
+                mark_as_processed(log_file, video_base_name)
                 
                 local_video.unlink(missing_ok=True)
                 gt_temp_path.unlink(missing_ok=True)
@@ -112,7 +129,7 @@ def main() -> None:
 
     print("\n" + "="*80)
     print("PROCESS FINISHED")
-    print(f"Check {LOG_FILE} for the list of completed videos.")
+    print(f"Check {log_file} for the list of completed videos.")
 
 if __name__ == "__main__":
     main()

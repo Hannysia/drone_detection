@@ -1,9 +1,9 @@
 import glob
 import os
 import shutil
-from pathlib import Path
 import zipfile
 import logging
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -85,3 +85,31 @@ def create_zip_archive(
                     
     log.info(f"[{split_name.upper()}] Archive created: {output_zip_path} ({file_count} files packed)")
     return file_count > 0
+
+
+
+def get_extraction_paths(
+    baseline_dir: Path,
+    historical_dir: Path,
+) -> tuple[Path, Path, Path]:
+    """Return isolated extraction paths without modifying files."""
+
+    baseline = baseline_dir.expanduser().resolve()
+    historical = historical_dir.expanduser().resolve()
+
+    if (
+        baseline == historical
+        or baseline.is_relative_to(historical)
+        or historical.is_relative_to(baseline)
+    ):
+        raise ValueError(
+            "Extraction workspace must not overlap "
+            "the historical dataset: "
+            f"{baseline} vs {historical}"
+        )
+
+    output_dir = baseline
+    tmp_dir = baseline / ".tmp"
+    log_file = baseline / ".state" / "processed_videos.log"
+
+    return output_dir, tmp_dir, log_file
