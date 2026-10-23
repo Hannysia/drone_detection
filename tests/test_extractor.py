@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from src.processing.extractor import parse_annotations
+from src.processing.extractor import parse_annotations, select_annotation_zips
 
 def test_parse_annotations_standard_and_invalid_lines(tmp_path):
     mock_gt_file = tmp_path / "gt_mock.txt"
@@ -26,3 +26,44 @@ def test_parse_annotations_standard_and_invalid_lines(tmp_path):
     
     assert len(result[2]) == 1
     assert result[2][0] == [105.0, 155.0, 50.0, 60.0]
+
+
+
+def test_selects_zip_from_nested_batch():
+    files = [
+        "labels/train/batch_001/sample.zip",
+        "labels/train/batch_002/other.zip",
+        "labels/val/batch_001/sample.zip",
+        "train/sample.mp4",
+    ]
+
+    result = select_annotation_zips(
+        files,
+        split="train",
+        video_name="sample",
+    )
+
+    assert result == ["labels/train/batch_001/sample.zip"]
+
+
+def test_missing_annotation_zip_fails():
+    with pytest.raises(ValueError, match="found 0"):
+        select_annotation_zips(
+            [],
+            split="train",
+            video_name="sample",
+        )
+
+
+def test_duplicate_annotation_zip_fails():
+    files = [
+        "labels/train/batch_001/sample.zip",
+        "labels/train/batch_002/sample.zip",
+    ]
+
+    with pytest.raises(ValueError, match="found 2"):
+        select_annotation_zips(
+            files,
+            split="train",
+            video_name="sample",
+        )

@@ -1,24 +1,40 @@
-import os
+
+import argparse
+import json
 import sys
 from pathlib import Path
+
 from huggingface_hub import HfApi
-import json
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from src.config import (
+    REPO_ID,
+    HF_TOKEN,
+    VIDEO_EXTENSIONS,
+    SPLITS,
+    PROJECT_ROOT,
+    FRAME_BASELINE_DIR,
+    EXTRACTED_DATA_DIR,
+)
 from src.utils.io import (
     get_processed_list,
     mark_as_processed,
     cleanup_partial_files,
     get_extraction_paths,
 )
-
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.config import (
-    REPO_ID, HF_TOKEN, VIDEO_EXTENSIONS, SPLITS, PROJECT_ROOT, FRAME_BASELINE_DIR, EXTRACTED_DATA_DIR
+from src.processing.extractor import (
+    download_and_extract_assets,
+    parse_annotations,
+    extract_frames_and_labels,
+    select_annotation_zips,
 )
-from src.utils.io import get_processed_list, mark_as_processed, cleanup_partial_files
-from src.processing.extractor import download_and_extract_assets, parse_annotations, extract_frames_and_labels
 
-def main() -> None:
+
+def main(
+    target_split: str | None = None,
+    target_video: str | None = None,
+) -> None:
 
     output_dir, tmp_dir, log_file = get_extraction_paths(
         baseline_dir=FRAME_BASELINE_DIR,
@@ -60,11 +76,14 @@ def main() -> None:
     processed_videos = get_processed_list(log_file)
 
     for split in SPLITS:
+
+        if target_split is not None and split != target_split:
+            continue
+
         print("\n" + "="*80)
         print(f"STARTING SPLIT: {split.upper()}")
         print("="*80)
 
-        hf_labels_root = f"labels/{split}/"
         split_pos_dir = output_dir / split / "RAW_POSITIVES"
         split_neg_dir = output_dir / split / "RAW_NEGATIVES"
         split_tmp_dir = tmp_dir / split
@@ -73,7 +92,11 @@ def main() -> None:
         split_neg_dir.mkdir(parents=True, exist_ok=True)
         split_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        zip_tasks = [f for f in repo_files if f.startswith(hf_labels_root) and f.endswith('.zip')]
+        zip_tasks = select_annotation_zips(
+            repo_files=repo_files,
+            split=split,
+            video_name=target_video,
+        )
 
         for zip_path in zip_tasks:
             video_base_name = Path(zip_path).stem
@@ -91,7 +114,12 @@ def main() -> None:
                     break
 
             if not video_path_hf:
-                print(f"❌ NOT FOUND: Video for {video_base_name} in {split}/")
+                message = f"Video not found: {split}/{video_base_name}"
+
+                if target_video is not None:
+                    raise FileNotFoundError(message)
+
+                print(message)
                 continue
 
             cleanup_partial_files(video_base_name, split_pos_dir, split_neg_dir)
@@ -125,11 +153,41 @@ def main() -> None:
                 print(f"✅ Success: {video_base_name}")
 
             except Exception as e:
-                print(f"⚠️ ERROR processing {video_base_name}: {e}")
+                print(f"ERROR processing {video_base_name}: {e}")
+
+                if target_video is not None:
+                    raise
 
     print("\n" + "="*80)
     print("PROCESS FINISHED")
     print(f"Check {log_file} for the list of completed videos.")
 
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Extract frames from a pinned HF dataset revision."
+    )
+
+    parser.add_argument("--split", choices=SPLITS)
+    parser.add_argument(
+        "--video",
+        help="Video filename without extension",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Process every video explicitly",
+    )
+
+    args = parser.parse_args()
+
+    if args.all:
+        if args.split is not None or args.video is not None:
+            parser.error("--all cannot be combined with --split/--video")
+    elif args.split is None or args.video is None:
+        parser.error("Provide --split and --video, or use --all")
+
+    main(
+        target_split=args.split,
+        target_video=args.video,
+    )

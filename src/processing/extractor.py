@@ -87,3 +87,35 @@ def download_and_extract_assets(
             shutil.copyfileobj(src, dst)
 
     return local_video, gt_temp_path
+
+
+
+def select_annotation_zips(
+    repo_files: list[str],
+    split: str,
+    video_name: str | None = None,
+) -> list[str]:
+    """Select annotation archives for a split or a single video."""
+
+    prefix = f"labels/{split}/"
+
+    archives = sorted(
+        path
+        for path in repo_files
+        if path.startswith(prefix) and path.lower().endswith(".zip")
+    )
+
+    if video_name is not None:
+        archives = [
+            path
+            for path in archives
+            if Path(path).stem == video_name
+        ]
+
+        if len(archives) != 1:
+            raise ValueError(
+                f"Expected exactly one ZIP for "
+                f"{split}/{video_name}, found {len(archives)}"
+            )
+
+    return archives
