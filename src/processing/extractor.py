@@ -46,15 +46,23 @@ def extract_frames_and_labels(
             img_name = f"{file_id}.jpg"
             txt_name = f"{file_id}.txt"
             
-            if frame_idx in annotations:
-                cv2.imwrite(str(pos_dir / img_name), frame)
+            is_positive = frame_idx in annotations
+            image_dir = pos_dir if is_positive else neg_dir
+            image_path = image_dir / img_name
+
+            if not cv2.imwrite(str(image_path), frame):
+                raise OSError(f"Could not save JPEG: {image_path}")
+
+            if is_positive:
                 label_path = pos_dir / txt_name
-                with open(label_path, 'w', encoding='utf-8') as l_out:
+
+                with open(label_path, "w", encoding="utf-8") as l_out:
                     for box in annotations[frame_idx]:
                         cx, cy, wn, hn = mot_to_yolo(box, w, h)
-                        l_out.write(f"0 {cx:.6f} {cy:.6f} {wn:.6f} {hn:.6f}\n")
-            else:
-                cv2.imwrite(str(neg_dir / img_name), frame)
+                        l_out.write(
+                            f"0 {cx:.6f} {cy:.6f} {wn:.6f} {hn:.6f}\n"
+                        )
+
             
             frame_idx += 1
     finally:

@@ -1,6 +1,7 @@
 import pytest
 from pathlib import Path
 from src.processing.extractor import parse_annotations, select_annotation_zips
+from src.processing import extractor
 
 def test_parse_annotations_standard_and_invalid_lines(tmp_path):
     mock_gt_file = tmp_path / "gt_mock.txt"
@@ -67,3 +68,61 @@ def test_duplicate_annotation_zip_fails():
             split="train",
             video_name="sample",
         )
+
+
+
+def test_extraction_fails_when_jpeg_cannot_be_saved(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeCapture:
+        def __init__(self):
+            self.read_count = 0
+            self.released = False
+
+        def get(self, prop):
+            return 10
+
+        def isOpened(self):
+            return self.read_count == 0
+
+        def read(self):
+            self.read_count += 1
+            return True, object()
+
+        def release(self):
+            self.released = True
+
+    capture = FakeCapture()
+
+    monkeypatch.setattr(
+        extractor.cv2,
+        "VideoCapture",
+        lambda _: capture,
+    )
+
+    monkeypatch.setattr(
+        extractor.cv2,
+        "imwrite",
+        lambda *args: False,
+    )
+
+    positive_dir = tmp_path / "positives"
+    negative_dir = tmp_path / "negatives"
+
+    positive_dir.mkdir()
+    negative_dir.mkdir()
+
+    annotations = {1: [[1, 1, 2, 2]]}
+
+    with pytest.raises(OSError, match="Could not save JPEG"):
+        extractor.extract_frames_and_labels(
+            video_path=Path("dummy.mp4"),
+            annotations=annotations,
+            video_base_name="demo",
+            pos_dir=positive_dir,
+            neg_dir=negative_dir,
+        )
+
+    assert capture.released
+    assert not (positive_dir / "demo_f0001.txt").exists()

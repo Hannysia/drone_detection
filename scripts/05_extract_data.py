@@ -74,6 +74,7 @@ def main(
     )
 
     processed_videos = get_processed_list(log_file)
+    failures: list[str] = []
 
     for split in SPLITS:
 
@@ -119,6 +120,7 @@ def main(
                 if target_video is not None:
                     raise FileNotFoundError(message)
 
+                failures.append(message)
                 print(message)
                 continue
 
@@ -152,14 +154,30 @@ def main(
                 
                 print(f"✅ Success: {video_base_name}")
 
-            except Exception as e:
-                print(f"ERROR processing {video_base_name}: {e}")
+            except Exception as exc:
+                message = f"{split}/{video_base_name}: {exc}"
+
+                failures.append(message)
+                print(f"ERROR processing {message}")
 
                 if target_video is not None:
                     raise
 
     print("\n" + "="*80)
-    print("PROCESS FINISHED")
+
+    if failures:
+        print("\nEXTRACTION INCOMPLETE")
+
+        for message in failures:
+            print(f"  - {message}")
+
+        raise RuntimeError(
+            f"Failed to process {len(failures)} video(s)"
+        )
+
+    print("\nEXTRACTION FINISHED SUCCESSFULLY")
+    print(f"Progress log: {log_file}")
+
     print(f"Check {log_file} for the list of completed videos.")
 
 
