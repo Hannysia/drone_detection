@@ -12,14 +12,35 @@ from src.utils.shell import run_cmd
 log = logging.getLogger(__name__)
 api = HfApi(token=HF_TOKEN)
 
-def pull_batch_to_cvat(split: str, batch_name: str) -> None:
+ANNOTATION_SOURCES = {
+    "sam3": ("cvat_batches", "_mot.zip"),
+    "labels": ("labels", ".zip"),
+}
+
+def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sam3") -> None:
     """Downloads a batch from HF and automatically creates CVAT tasks for all videos."""
     log.info(f"📥 Searching for {batch_name} in split '{split}' on Hugging Face...")
     
-    batch_prefix = f"cvat_batches/{split}/{batch_name}/"
-    files = api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
-    
-    zip_files = [f for f in files if f.startswith(batch_prefix) and f.endswith('.zip')]
+    if annotation_source not in ANNOTATION_SOURCES:
+        raise ValueError(
+            f"Unknown annotation source: {annotation_source}"
+        )
+
+    source_dir, suffix = ANNOTATION_SOURCES[annotation_source]
+    batch_prefix = f"{source_dir}/{split}/{batch_name}/"
+
+    files = api.list_repo_files(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+    )
+
+    zip_files = [
+        path
+        for path in files
+        if path.startswith(batch_prefix)
+        and Path(path).parent.as_posix() == batch_prefix.rstrip("/")
+        and path.endswith(suffix)
+    ]
     
     if not zip_files:
         log.error("❌ No annotation archives found in this batch.")
@@ -29,10 +50,10 @@ def pull_batch_to_cvat(split: str, batch_name: str) -> None:
 
     for zip_file_repo_path in zip_files:
         zip_filename = Path(zip_file_repo_path).name
-        base_name = zip_filename.replace('_mot.zip', '')
+        base_name = zip_filename[:-len(suffix)]
         
         video_repo_path = next(
-            (f for f in files if f.startswith(f"{split}/{base_name}.") and f.endswith(VIDEO_EXTENSIONS)), 
+            (f for f in files if f.startswith(f"{split}/{base_name}.") and f.endswith(tuple(VIDEO_EXTENSIONS))), 
             None
         )
         
@@ -68,7 +89,7 @@ def pull_batch_to_cvat(split: str, batch_name: str) -> None:
         task_id = match.group(1)
         log.info(f"✅ Task created! Task ID: {task_id}")
 
-        log.info("📦 Uploading SAM 3 annotations to task...")
+        log.info(f"📦 Uploading {annotation_source} annotations to task...")
         upload_cmd = (
             f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
             f'--auth {CVAT_USER}:{CVAT_PASS} upload {task_id} "{local_zip_path}" --format "MOT 1.1"'
