@@ -5,7 +5,7 @@ import requests
 from huggingface_hub import HfApi, hf_hub_download
 
 from src.config import (
-    REPO_ID, CVAT_HOST, CVAT_PORT, LABELS_DIR, CVAT_USER, CVAT_PASS, HF_TOKEN, VIDEO_EXTENSIONS
+    REPO_ID, CVAT_HOST, CVAT_PORT, LABELS_DIR, CVAT_USER, CVAT_PASS, HF_TOKEN, VIDEO_EXTENSIONS, SPLITS
 )
 from src.utils.shell import run_cmd
 
@@ -16,6 +16,30 @@ ANNOTATION_SOURCES = {
     "sam3": ("cvat_batches", "_mot.zip"),
     "labels": ("labels", ".zip"),
 }
+
+CURATED_LABELS_ROOT = "labels_curated"
+
+def curated_annotation_path(
+    version: str,
+    split: str,
+    batch_name: str,
+    video_name: str,
+) -> str:
+    if not re.fullmatch(r"v[1-9][0-9]*", version):
+        raise ValueError(f"Invalid dataset version: {version}")
+
+    if split not in SPLITS:
+        raise ValueError(f"Invalid split: {split}")
+
+    for name in (batch_name, video_name):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise ValueError(f"Invalid name: {name}")
+
+    return (
+        f"{CURATED_LABELS_ROOT}/{version}/"
+        f"{split}/{batch_name}/{video_name}.zip"
+    )
+
 
 def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sam3") -> None:
     """Downloads a batch from HF and automatically creates CVAT tasks for all videos."""
@@ -98,43 +122,67 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
         
         log.info(f"🎉 Done: http://{CVAT_HOST}:{CVAT_PORT}/tasks/{task_id}")
 
-def push_batch_to_hf(task_id: str, split: str, batch_name: str) -> None:
-    """Exports validated annotations from CVAT and pushes them to HF labels."""
-    log.info(f"📤 Exporting annotation from CVAT (Task ID: {task_id})...")
-    
-    try:
-        response = requests.get(
-            f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks/{task_id}",
-            auth=(CVAT_USER, CVAT_PASS),
-            timeout=10
-        )
-        response.raise_for_status()
-        task_info = response.json()
-        task_name = task_info.get("name", f"task_{task_id}")
-        video_name = task_name.replace(f"_{split}", "")
-    except Exception as e:
-        log.warning(f"⚠️ Could not fetch task name from CVAT: {e}. Using Task ID instead.")
-        video_name = f"task_{task_id}"
+
+def push_batch_to_hf(
+    task_id: str,
+    split: str,
+    batch_name: str,
+    version: str,
+) -> None:
+    log.info(f"Exporting CVAT annotations for Task {task_id}")
+
+    response = requests.get(
+        f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks/{task_id}",
+        auth=(CVAT_USER, CVAT_PASS),
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    task_name = response.json()["name"]
+    suffix = f"_{split}"
+
+    if not task_name.endswith(suffix):
+        raise ValueError(f"Unexpected CVAT task name: {task_name}")
+
+    video_name = task_name[:-len(suffix)]
+
+    path_in_repo = curated_annotation_path(
+        version=version,
+        split=split,
+        batch_name=batch_name,
+        video_name=video_name,
+    )
+
+    if api.file_exists(repo_id=REPO_ID, filename=path_in_repo, repo_type="dataset",):
+        raise FileExistsError(f"Annotation already exists on HF: {path_in_repo}")
 
     LABELS_DIR.mkdir(parents=True, exist_ok=True)
+
     export_filename = f"{video_name}.zip"
     export_path = LABELS_DIR / export_filename
-    
+
     dump_cmd = (
         f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
-        f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} "{export_path}" --format "MOT 1.1"'
+        f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} '
+        f'"{export_path}" --format "MOT 1.1"'
     )
+
     run_cmd(dump_cmd)
-    
-    log.info(f"☁️ Sending the corrected annotation to Hugging Face as {export_filename}...")
-    path_in_repo = f"labels/{split}/{batch_name}/{export_filename}"
-    
-    api.upload_file(
+
+    if not export_path.is_file() or export_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"CVAT export was not created: {export_path}"
+        )
+
+    result = api.upload_file(
         path_or_fileobj=str(export_path),
         path_in_repo=path_in_repo,
         repo_id=REPO_ID,
         repo_type="dataset",
-        commit_message=f"Upload manually validated MOT annotations for {video_name}"
+        commit_message=(
+            f"Upload curated MOT annotations for "
+            f"{video_name} ({version})"
+        ),
     )
-    
-    log.info(f"✅ Success! The verified archive has been saved to HF: {path_in_repo}")
+
+    log.info(f"Saved to HF: {path_in_repo}")
