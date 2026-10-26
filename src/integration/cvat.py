@@ -21,6 +21,7 @@ ANNOTATION_SOURCES = {
 
 CURATED_LABELS_ROOT = "labels_curated"
 
+
 def curated_annotation_path(
     version: str,
     split: str,
@@ -41,6 +42,54 @@ def curated_annotation_path(
         f"{CURATED_LABELS_ROOT}/{version}/"
         f"{split}/{batch_name}/{video_name}.zip"
     )
+
+
+
+def find_existing_cvat_task_ids(task_name: str) -> list[int]:
+    task_ids = []
+    page = 1
+
+    while True:
+        response = requests.get(
+            f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks",
+            auth=(CVAT_USER, CVAT_PASS),
+            headers={"Accept": "application/vnd.cvat+json"},
+            params={
+                "name": task_name,
+                "page": page,
+                "page_size": 100,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("results"), list)
+            or "next" not in data
+        ):
+            raise ValueError("Unexpected CVAT tasks API response")
+
+        for task in data["results"]:
+            if (
+                not isinstance(task, dict)
+                or "id" not in task
+                or "name" not in task
+            ):
+                raise ValueError("Invalid CVAT task entry")
+
+            if task["name"] == task_name:
+                task_ids.append(task["id"])
+
+        if not data["next"]:
+            break
+
+        page += 1
+
+    return task_ids
+
 
 
 def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sam3") -> None:
@@ -77,6 +126,20 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
     for zip_file_repo_path in zip_files:
         zip_filename = Path(zip_file_repo_path).name
         base_name = zip_filename[:-len(suffix)]
+
+        task_name = f"{base_name}_{split}"
+        existing_ids = find_existing_cvat_task_ids(task_name)
+
+        if existing_ids:
+            log.warning(
+                "⏭️ Skipping %s: CVAT task already exists (ID: %s).",
+                task_name,
+                ", ".join(map(str, existing_ids)),
+            )
+            log.warning(
+                "Check its annotations if a previous import was interrupted."
+            )
+            continue
         
         video_repo_path = next(
             (f for f in files if f.startswith(f"{split}/{base_name}.") and f.endswith(tuple(VIDEO_EXTENSIONS))), 
@@ -96,7 +159,6 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
         )
 
         log.info(f"🚀 Creating a CVAT task for {base_name}...")
-        task_name = f"{base_name}_{split}"
         
         create_cmd = (
             f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
@@ -108,9 +170,11 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
         
         match = re.search(r'(?i)ID[\s:]*(\d+)', output)
         if not match:
-            log.error(f"❌ Failed to extract Task ID for {base_name}.")
-            log.error(f"🔍 Raw CVAT Output:\n{output.strip()}")
-            continue
+            raise RuntimeError(
+                f"Could not determine Task ID for {task_name}. "
+                f"Check CVAT before retrying. "
+                f"CLI output: {output.strip()}"
+            )
             
         task_id = match.group(1)
         log.info(f"✅ Task created! Task ID: {task_id}")
