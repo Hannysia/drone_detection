@@ -111,6 +111,7 @@ def test_pull_skips_existing_and_imports_missing(
         "train",
         "batch_001",
         annotation_source="sam3",
+        version="v1",
     )
 
     assert checked_names == [
@@ -167,4 +168,5 @@ def test_pull_stops_if_cvat_lookup_fails(
             "train",
             "batch_001",
             annotation_source="sam3",
+            version="v1",
         )

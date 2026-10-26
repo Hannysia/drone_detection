@@ -93,7 +93,7 @@ def find_existing_cvat_task_ids(task_name: str) -> list[int]:
 
 
 
-def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sam3") -> None:
+def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str, version: str,) -> None:
     """Downloads a batch from HF and automatically creates CVAT tasks for all videos."""
     log.info(f"📥 Searching for {batch_name} in split '{split}' on Hugging Face...")
     
@@ -105,10 +105,8 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
     source_dir, suffix = ANNOTATION_SOURCES[annotation_source]
     batch_prefix = f"{source_dir}/{split}/{batch_name}/"
 
-    files = api.list_repo_files(
-        repo_id=REPO_ID,
-        repo_type="dataset",
-    )
+    files = api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
+    repo_files = set(files)
 
     zip_files = [
         path
@@ -127,6 +125,33 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
     for zip_file_repo_path in zip_files:
         zip_filename = Path(zip_file_repo_path).name
         base_name = zip_filename[:-len(suffix)]
+
+        
+        curated_zip = curated_annotation_path(version, split, batch_name, base_name)
+
+        curated_review = (
+            curated_zip.removesuffix(".zip") + ".review.json"
+        )
+
+        zip_exists = curated_zip in repo_files
+        review_exists = curated_review in repo_files
+
+        if zip_exists and review_exists:
+            log.info(
+                "⏭️ Skipping %s: already curated on HF (%s).",
+                base_name,
+                version,
+            )
+            continue
+
+        if zip_exists or review_exists:
+            raise RuntimeError(
+                f"Incomplete curated result on HF for {base_name} "
+                f"({version}): MOT exists={zip_exists}, "
+                f"review exists={review_exists}. "
+                f"Check HF before retrying."
+            )
+
 
         task_name = f"{base_name}_{split}"
         existing_ids = find_existing_cvat_task_ids(task_name)

@@ -37,7 +37,12 @@ def test_pull_batch_selects_annotation_source(
         "hf_hub_download",
         lambda **kwargs: kwargs["filename"],
     )
-    monkeypatch.setattr(cvat, "LABELS_DIR", tmp_path)
+
+    monkeypatch.setattr(
+        cvat,
+        "find_existing_cvat_task_ids",
+        lambda task_name: [],
+    )
 
     commands = []
     task_ids = iter([101, 102])
@@ -56,6 +61,7 @@ def test_pull_batch_selects_annotation_source(
         split="val",
         batch_name="batch_001",
         annotation_source=source,
+        version="v1",
     )
 
     creates = [
@@ -94,4 +100,5 @@ def test_unknown_annotation_source_fails():
             "val",
             "batch_001",
             "unknown",
+            "v1",
         )
