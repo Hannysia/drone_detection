@@ -1,3 +1,4 @@
+from tempfile import TemporaryDirectory
 import logging
 import re
 from pathlib import Path
@@ -300,16 +301,37 @@ def push_batch_to_hf(
         repo_id=REPO_ID
     ).sha
 
-    for remote_path in (repo_zip, repo_review):
-        if api.file_exists(
-            repo_id=REPO_ID,
-            filename=remote_path,
-            repo_type="dataset",
-            revision=head_revision,
-        ):
-            raise FileExistsError(
-                f"File already exists on HF: {remote_path}"
-            )
+    
+    archive_on_hf = api.file_exists(
+        repo_id=REPO_ID,
+        filename=repo_zip,
+        repo_type="dataset",
+        revision=head_revision,
+    )
+
+    review_on_hf = api.file_exists(
+        repo_id=REPO_ID,
+        filename=repo_review,
+        repo_type="dataset",
+        revision=head_revision,
+    )
+
+    if archive_on_hf and review_on_hf:
+        log.info(
+            "Already published on HF: %s and %s. Skipping.",
+            repo_zip,
+            repo_review,
+        )
+        return
+
+    if archive_on_hf or review_on_hf:
+        raise RuntimeError(
+            f"Incomplete HF export for {video_name}: "
+            f"MOT exists={archive_on_hf}, "
+            f"review exists={review_on_hf}. "
+            f"Check HF files before retrying."
+        )
+
 
     meta_response = requests.get(
         f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks/{task_id}/data/meta",
@@ -333,41 +355,45 @@ def push_batch_to_hf(
     archive_path = export_dir / f"{video_name}.zip"
     review_path = export_dir / f"{video_name}.review.json"
 
-    if archive_path.exists() or review_path.exists():
-        raise FileExistsError(
-            f"Local export already exists: "
-            f"{archive_path} or {review_path}"
-        )
-
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    dump_cmd = (
-        f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
-        f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} '
-        f'"{archive_path}" --format "MOT 1.1"'
-    )
+    with TemporaryDirectory(
+        prefix=".cvat_push_",
+        dir=export_dir,
+    ) as staging_dir:
+        staging_archive = Path(staging_dir) / archive_path.name
+        staging_review = Path(staging_dir) / review_path.name
 
-    run_cmd(dump_cmd)
-
-    if not zipfile.is_zipfile(archive_path):
-        raise ValueError(
-            f"CVAT export is not a ZIP archive: {archive_path}"
+        dump_cmd = (
+            f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
+            f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} '
+            f'"{staging_archive}" --format "MOT 1.1"'
         )
 
-    with zipfile.ZipFile(archive_path) as archive:
-        if not archive.namelist() or archive.testzip() is not None:
+        run_cmd(dump_cmd)
+
+        if not zipfile.is_zipfile(staging_archive):
             raise ValueError(
-                f"Invalid CVAT ZIP archive: {archive_path}"
+                f"CVAT export is not a valid ZIP: {staging_archive}"
             )
 
-    review_path.write_text(
-        json.dumps(
-            review_data,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        with zipfile.ZipFile(staging_archive) as archive:
+            if not archive.namelist() or archive.testzip() is not None:
+                raise ValueError(
+                    f"Corrupted CVAT ZIP: {staging_archive}"
+                )
+
+        staging_review.write_text(
+            json.dumps(
+                review_data,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        staging_archive.replace(archive_path)
+        staging_review.replace(review_path)
 
     result = api.create_commit(
         repo_id=REPO_ID,
