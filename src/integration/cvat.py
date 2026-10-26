@@ -158,12 +158,23 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str, vers
 
         if existing_ids:
             log.warning(
-                "⏭️ Skipping %s: CVAT task already exists (ID: %s).",
+                "⚠️ SKIP %s: CVAT Task already exists (IDs: %s). "
+                "Annotation import status is NOT VERIFIED.",
                 task_name,
                 ", ".join(map(str, existing_ids)),
             )
+
+            for task_id in existing_ids:
+                log.warning(
+                    "🔎 Verify annotations: http://%s:%s/tasks/%s",
+                    CVAT_HOST,
+                    CVAT_PORT,
+                    task_id,
+                )
+
             log.warning(
-                "Check its annotations if a previous import was interrupted."
+                "Existing annotations were not modified. "
+                "Inspect the task before deciding whether to retry."
             )
             continue
         

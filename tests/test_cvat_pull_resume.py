@@ -170,3 +170,49 @@ def test_pull_stops_if_cvat_lookup_fails(
             annotation_source="sam3",
             version="v1",
         )
+
+
+
+def test_existing_task_warns_about_unverified_import(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    import logging
+
+    monkeypatch.setattr(cvat, "LABELS_DIR", tmp_path)
+
+    monkeypatch.setattr(
+        cvat.api,
+        "list_repo_files",
+        lambda **kwargs: [
+            "labels/test/batch_004/wing_thermal_sky_540.zip",
+        ],
+    )
+
+    monkeypatch.setattr(
+        cvat,
+        "find_existing_cvat_task_ids",
+        lambda task_name: [695],
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Existing CVAT task must not be modified")
+
+    monkeypatch.setattr(cvat, "hf_hub_download", forbidden)
+    monkeypatch.setattr(cvat, "run_cmd", forbidden)
+
+    with caplog.at_level(logging.WARNING, logger=cvat.log.name):
+        cvat.pull_batch_to_cvat(
+            split="test",
+            batch_name="batch_004",
+            annotation_source="labels",
+            version="v1",
+        )
+
+    assert "Annotation import status is NOT VERIFIED" in caplog.text
+    assert (
+        f"http://{cvat.CVAT_HOST}:{cvat.CVAT_PORT}/tasks/695"
+        in caplog.text
+    )
+    assert "Existing annotations were not modified" in caplog.text
