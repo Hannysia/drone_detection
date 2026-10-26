@@ -2,7 +2,9 @@ import logging
 import re
 from pathlib import Path
 import requests
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
+import json
+import zipfile
 
 from src.config import (
     REPO_ID, CVAT_HOST, CVAT_PORT, LABELS_DIR, CVAT_USER, CVAT_PASS, HF_TOKEN, VIDEO_EXTENSIONS, SPLITS
@@ -123,66 +125,210 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str = "sa
         log.info(f"🎉 Done: http://{CVAT_HOST}:{CVAT_PORT}/tasks/{task_id}")
 
 
+def build_review_metadata(
+    meta: dict,
+    video_name: str,
+    task_id: str,
+    version: str,
+) -> dict:
+    required = (
+        "size",
+        "start_frame",
+        "stop_frame",
+        "frame_filter",
+        "included_frames",
+        "deleted_frames",
+    )
+
+    missing = [key for key in required if key not in meta]
+
+    if missing:
+        raise ValueError(
+            f"Missing CVAT metadata fields: {missing}"
+        )
+
+    if type(meta["size"]) is not int or meta["size"] <= 0:
+        raise ValueError("Invalid CVAT frame count")
+
+    if (
+        type(meta["start_frame"]) is not int
+        or type(meta["stop_frame"]) is not int
+        or meta["start_frame"] < 0
+        or meta["stop_frame"] < meta["start_frame"]
+    ):
+        raise ValueError("Invalid CVAT frame range")
+
+    deleted = meta["deleted_frames"]
+
+    if (
+        not isinstance(deleted, list)
+        or any(
+            type(index) is not int or index < 0
+            for index in deleted
+        )
+        or len(deleted) != len(set(deleted))
+    ):
+        raise ValueError("Invalid CVAT deleted_frames")
+
+    included = meta["included_frames"]
+
+    if included is not None and (
+        not isinstance(included, list)
+        or any(
+            type(index) is not int or index < 0
+            for index in included
+        )
+        or len(included) != len(set(included))
+    ):
+        raise ValueError("Invalid CVAT included_frames")
+
+    if not isinstance(meta["frame_filter"], str):
+        raise ValueError("Invalid CVAT frame_filter")
+
+    return {
+        "video_name": video_name,
+        "task_id": int(task_id),
+        "version": version,
+        "size": meta["size"],
+        "start_frame": meta["start_frame"],
+        "stop_frame": meta["stop_frame"],
+        "frame_filter": meta["frame_filter"],
+        "included_frames": included,
+        "deleted_frames": sorted(deleted),
+    }
+
+
+
 def push_batch_to_hf(
     task_id: str,
     split: str,
     batch_name: str,
     version: str,
 ) -> None:
-    log.info(f"Exporting CVAT annotations for Task {task_id}")
-
     response = requests.get(
         f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks/{task_id}",
         auth=(CVAT_USER, CVAT_PASS),
-        timeout=10,
+        headers={"Accept": "application/vnd.cvat+json"},
+        timeout=30,
     )
     response.raise_for_status()
 
     task_name = response.json()["name"]
     suffix = f"_{split}"
 
-    if not task_name.endswith(suffix):
+    if not task_name.endswith(suffix) or len(task_name) <= len(suffix):
         raise ValueError(f"Unexpected CVAT task name: {task_name}")
 
     video_name = task_name[:-len(suffix)]
 
-    path_in_repo = curated_annotation_path(
-        version=version,
-        split=split,
-        batch_name=batch_name,
-        video_name=video_name,
+    repo_zip = curated_annotation_path(
+        version,
+        split,
+        batch_name,
+        video_name,
     )
 
-    if api.file_exists(repo_id=REPO_ID, filename=path_in_repo, repo_type="dataset",):
-        raise FileExistsError(f"Annotation already exists on HF: {path_in_repo}")
+    repo_review = (
+        repo_zip.removesuffix(".zip") + ".review.json"
+    )
 
-    LABELS_DIR.mkdir(parents=True, exist_ok=True)
+    head_revision = api.dataset_info(
+        repo_id=REPO_ID
+    ).sha
 
-    export_filename = f"{video_name}.zip"
-    export_path = LABELS_DIR / export_filename
+    for remote_path in (repo_zip, repo_review):
+        if api.file_exists(
+            repo_id=REPO_ID,
+            filename=remote_path,
+            repo_type="dataset",
+            revision=head_revision,
+        ):
+            raise FileExistsError(
+                f"File already exists on HF: {remote_path}"
+            )
+
+    meta_response = requests.get(
+        f"http://{CVAT_HOST}:{CVAT_PORT}/api/tasks/{task_id}/data/meta",
+        auth=(CVAT_USER, CVAT_PASS),
+        headers={"Accept": "application/vnd.cvat+json"},
+        timeout=30,
+    )
+    meta_response.raise_for_status()
+
+    review_data = build_review_metadata(
+        meta_response.json(),
+        video_name,
+        task_id,
+        version,
+    )
+
+    export_dir = (
+        LABELS_DIR / "exports" / version / split / batch_name
+    )
+
+    archive_path = export_dir / f"{video_name}.zip"
+    review_path = export_dir / f"{video_name}.review.json"
+
+    if archive_path.exists() or review_path.exists():
+        raise FileExistsError(
+            f"Local export already exists: "
+            f"{archive_path} or {review_path}"
+        )
+
+    export_dir.mkdir(parents=True, exist_ok=True)
 
     dump_cmd = (
         f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
         f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} '
-        f'"{export_path}" --format "MOT 1.1"'
+        f'"{archive_path}" --format "MOT 1.1"'
     )
 
     run_cmd(dump_cmd)
 
-    if not export_path.is_file() or export_path.stat().st_size == 0:
-        raise RuntimeError(
-            f"CVAT export was not created: {export_path}"
+    if not zipfile.is_zipfile(archive_path):
+        raise ValueError(
+            f"CVAT export is not a ZIP archive: {archive_path}"
         )
 
-    result = api.upload_file(
-        path_or_fileobj=str(export_path),
-        path_in_repo=path_in_repo,
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        commit_message=(
-            f"Upload curated MOT annotations for "
-            f"{video_name} ({version})"
+    with zipfile.ZipFile(archive_path) as archive:
+        if not archive.namelist() or archive.testzip() is not None:
+            raise ValueError(
+                f"Invalid CVAT ZIP archive: {archive_path}"
+            )
+
+    review_path.write_text(
+        json.dumps(
+            review_data,
+            ensure_ascii=False,
+            indent=2,
         ),
+        encoding="utf-8",
     )
 
-    log.info(f"Saved to HF: {path_in_repo}")
+    result = api.create_commit(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        parent_commit=head_revision,
+        commit_message=(
+            f"Upload curated MOT and frame exclusions "
+            f"for {video_name} ({version})"
+        ),
+        operations=[
+            CommitOperationAdd(
+                path_in_repo=repo_zip,
+                path_or_fileobj=str(archive_path),
+            ),
+            CommitOperationAdd(
+                path_in_repo=repo_review,
+                path_or_fileobj=str(review_path),
+            ),
+        ],
+    )
+
+    log.info("Saved MOT: %s", repo_zip)
+    log.info("Saved frame exclusions: %s", repo_review)
+    log.info(
+        "Deleted frames: %d",
+        len(review_data["deleted_frames"]),
+    )
+    log.info("HF commit: %s", result.oid)
