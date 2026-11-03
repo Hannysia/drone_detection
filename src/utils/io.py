@@ -1,9 +1,11 @@
 import glob
 import os
+import json
 import shutil
 import zipfile
 import logging
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 log = logging.getLogger(__name__)
 
@@ -113,3 +115,55 @@ def get_extraction_paths(
     log_file = baseline / ".state" / "processed_videos.log"
 
     return output_dir, tmp_dir, log_file
+
+
+
+def check_extraction_source(
+    dataset_root: Path,
+    source: dict,
+    *,
+    initialize: bool = False,
+) -> None:
+    source_path = dataset_root / "source.json"
+    expected = {
+        key: source[key]
+        for key in ("repo_id", "repo_type", "revision", "annotation_version")
+    }
+
+    if source_path.exists():
+        with source_path.open(encoding="utf-8") as file:
+            actual = json.load(file)
+
+        if actual != expected:
+            raise ValueError(f"Extraction source mismatch: {source_path}")
+
+        return
+
+    if not initialize:
+        raise FileNotFoundError(f"Missing extraction source: {source_path}")
+
+    if dataset_root.exists() and any(dataset_root.iterdir()):
+        raise ValueError(
+            f"Cannot initialize a non-empty workspace without source.json: {dataset_root}"
+        )
+
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=dataset_root,
+            prefix=".source-",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = Path(file.name)
+            json.dump(expected, file, indent=2, sort_keys=True)
+            file.write("\n")
+
+        temporary_path.replace(source_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

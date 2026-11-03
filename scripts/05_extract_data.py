@@ -23,6 +23,7 @@ from src.utils.io import (
     mark_as_processed,
     cleanup_partial_files,
     get_extraction_paths,
+    check_extraction_source
 )
 from src.processing.extractor import (
     download_and_extract_assets,
@@ -63,10 +64,11 @@ def main(
         raise ValueError("Invalid annotation version")
 
     output_dir, tmp_dir, log_file = get_extraction_paths(
-        baseline_dir=FRAME_BASELINE_DIR / version / revision,
+        baseline_dir=FRAME_BASELINE_DIR / version,
         historical_dir=EXTRACTED_DATA_DIR,
     )
 
+    check_extraction_source(output_dir, source, initialize=True)
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Extraction output: {output_dir}")
