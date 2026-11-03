@@ -3,6 +3,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import re
 
 from huggingface_hub import HfApi
 
@@ -36,17 +37,6 @@ def main(
     target_video: str | None = None,
 ) -> None:
 
-    output_dir, tmp_dir, log_file = get_extraction_paths(
-        baseline_dir=FRAME_BASELINE_DIR,
-        historical_dir=EXTRACTED_DATA_DIR,
-    )
-
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"Extraction output: {output_dir}")
-    print(f"Temporary files: {tmp_dir}")
-    print(f"Progress log: {log_file}")
-
     api = HfApi(token=HF_TOKEN)
 
     source_path = PROJECT_ROOT / "manifests" / "sources" / "hf.json"
@@ -64,6 +54,24 @@ def main(
         raise ValueError("Expected a Hugging Face dataset repository")
 
     revision = source["revision"]
+    version = source["annotation_version"]
+
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("Expected an immutable HF commit SHA")
+
+    if not re.fullmatch(r"v[1-9][0-9]*", version):
+        raise ValueError("Invalid annotation version")
+
+    output_dir, tmp_dir, log_file = get_extraction_paths(
+        baseline_dir=FRAME_BASELINE_DIR / version / revision,
+        historical_dir=EXTRACTED_DATA_DIR,
+    )
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Extraction output: {output_dir}")
+    print(f"Temporary files: {tmp_dir}")
+    print(f"Progress log: {log_file}")
 
     print(f"Fetching files from HF revision: {revision}")
 
@@ -96,6 +104,7 @@ def main(
         zip_tasks = select_annotation_zips(
             repo_files=repo_files,
             split=split,
+            version=version,
             video_name=target_video,
         )
 
@@ -130,7 +139,7 @@ def main(
             
             try:
 
-                local_video, gt_temp_path = download_and_extract_assets(
+                local_video, gt_temp_path, review = download_and_extract_assets(
                     REPO_ID,
                     HF_TOKEN,
                     video_path_hf,
@@ -141,9 +150,14 @@ def main(
                 )
 
                 annotations = parse_annotations(gt_temp_path)
-                
+
                 extract_frames_and_labels(
-                    local_video, annotations, video_base_name, split_pos_dir, split_neg_dir
+                    local_video,
+                    annotations,
+                    video_base_name,
+                    split_pos_dir,
+                    split_neg_dir,
+                    review=review,
                 )
                 
                 mark_as_processed(log_file, video_base_name)

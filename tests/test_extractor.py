@@ -32,19 +32,26 @@ def test_parse_annotations_standard_and_invalid_lines(tmp_path):
 
 def test_selects_zip_from_nested_batch():
     files = [
-        "labels/train/batch_001/sample.zip",
-        "labels/train/batch_002/other.zip",
-        "labels/val/batch_001/sample.zip",
+        "labels_curated/v1/train/batch_001/sample.zip",
+        "labels_curated/v1/train/batch_002/other.zip",
+        "labels_curated/v1/val/batch_001/sample.zip",
         "train/sample.mp4",
+    ]
+
+    files += [
+        path.removesuffix(".zip") + ".review.json"
+        for path in files
+        if path.endswith(".zip")
     ]
 
     result = select_annotation_zips(
         files,
         split="train",
         video_name="sample",
+        version="v1"
     )
 
-    assert result == ["labels/train/batch_001/sample.zip"]
+    assert result == ["labels_curated/v1/train/batch_001/sample.zip"]
 
 
 def test_missing_annotation_zip_fails():
@@ -53,13 +60,14 @@ def test_missing_annotation_zip_fails():
             [],
             split="train",
             video_name="sample",
+            version="v1"
         )
 
 
 def test_duplicate_annotation_zip_fails():
     files = [
-        "labels/train/batch_001/sample.zip",
-        "labels/train/batch_002/sample.zip",
+        "labels_curated/v1/train/batch_001/sample.zip",
+        "labels_curated/v1/train/batch_002/sample.zip",
     ]
 
     with pytest.raises(ValueError, match="found 2"):
@@ -67,6 +75,7 @@ def test_duplicate_annotation_zip_fails():
             files,
             split="train",
             video_name="sample",
+            version="v1"
         )
 
 
@@ -122,6 +131,15 @@ def test_extraction_fails_when_jpeg_cannot_be_saved(
             video_base_name="demo",
             pos_dir=positive_dir,
             neg_dir=negative_dir,
+            review={
+                "video_name": "demo",
+                "size": 1,
+                "start_frame": 0,
+                "stop_frame": 0,
+                "frame_filter": "",
+                "included_frames": None,
+                "deleted_frames": [],
+            },
         )
 
     assert capture.released

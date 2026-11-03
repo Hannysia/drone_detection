@@ -5,6 +5,10 @@ import cv2
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 from src.utils.geometry import mot_to_yolo
+import json
+import re
+
+from src.processing.frame_alignment import build_frame_mapping
 
 def parse_annotations(gt_file_path: Path) -> dict[int, list[list[float]]]:
     """Parses ground truth MOT annotations file."""
@@ -19,52 +23,68 @@ def parse_annotations(gt_file_path: Path) -> dict[int, list[list[float]]]:
             annotations.setdefault(f_id, []).append(bbox)
     return annotations
 
+
 def extract_frames_and_labels(
-    video_path: Path, 
-    annotations: dict[int, list[list[float]]], 
-    video_base_name: str, 
-    pos_dir: Path, 
-    neg_dir: Path
+    video_path: Path,
+    annotations: dict[int, list[list[float]]],
+    video_base_name: str,
+    pos_dir: Path,
+    neg_dir: Path,
+    review: dict,
 ) -> None:
-    """Reads video and saves positive and negative frames with YOLO labels."""
+    mapping = build_frame_mapping(review)
+
+    if review.get("video_name") != video_base_name:
+        raise ValueError("Review video_name does not match the video")
+
+    if any(
+        type(frame) is not int or not 1 <= frame <= len(mapping) or not boxes
+        for frame, boxes in annotations.items()
+    ):
+        raise ValueError("Invalid MOT frame IDs or empty annotations")
+
     cap = cv2.VideoCapture(str(video_path))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    if w == 0 or h == 0:
-        cap.release()
-        raise ValueError(f"Could not open video or dimensions are zero: {video_path}")
-
-    frame_idx = 1
     try:
-        while cap.isOpened():
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if not cap.isOpened() or w <= 0 or h <= 0:
+            raise ValueError(f"Could not open video: {video_path}")
+
+        for frame_idx in range(1, review["size"] + 1):
             ret, frame = cap.read()
+
             if not ret:
-                break
-            
+                raise ValueError(f"Could not read source frame {frame_idx}")
+
+            if frame_idx not in mapping:
+                continue
+
+            boxes = annotations.get(mapping[frame_idx], [])
+
             file_id = f"{video_base_name}_f{frame_idx:04d}"
-            img_name = f"{file_id}.jpg"
-            txt_name = f"{file_id}.txt"
-            
-            is_positive = frame_idx in annotations
+            is_positive = bool(boxes)
             image_dir = pos_dir if is_positive else neg_dir
-            image_path = image_dir / img_name
+            image_path = image_dir / f"{file_id}.jpg"
 
             if not cv2.imwrite(str(image_path), frame):
                 raise OSError(f"Could not save JPEG: {image_path}")
 
             if is_positive:
-                label_path = pos_dir / txt_name
+                label_path = pos_dir / f"{file_id}.txt"
 
-                with open(label_path, "w", encoding="utf-8") as l_out:
-                    for box in annotations[frame_idx]:
+                with label_path.open("w", encoding="utf-8") as output:
+                    for box in boxes:
                         cx, cy, wn, hn = mot_to_yolo(box, w, h)
-                        l_out.write(
+                        output.write(
                             f"0 {cx:.6f} {cy:.6f} {wn:.6f} {hn:.6f}\n"
                         )
 
-            
-            frame_idx += 1
+        ret, _ = cap.read()
+
+        if ret:
+            raise ValueError("Video contains more frames than review size")
     finally:
         cap.release()
 
@@ -76,36 +96,76 @@ def download_and_extract_assets(
     tmp_dir: Path,
     video_base_name: str,
     revision: str,
-) -> tuple[Path, Path]:
-    """Downloads video and zip with ground truth from Hugging Face."""
-    local_video = Path(hf_hub_download(
-        repo_id=repo_id, filename=video_path_hf, local_dir=tmp_dir, 
-        repo_type="dataset", token=hf_token, revision=revision
+) -> tuple[Path, Path, dict]:
+    review_path_hf = zip_path_hf.removesuffix(".zip") + ".review.json"
+
+    local_review = Path(hf_hub_download(
+        repo_id=repo_id,
+        filename=review_path_hf,
+        local_dir=tmp_dir,
+        repo_type="dataset",
+        token=hf_token,
+        revision=revision,
     ))
+
+    with local_review.open(encoding="utf-8") as file:
+        review = json.load(file)
+
+    build_frame_mapping(review)
+
+    if (
+        review.get("video_name") != video_base_name
+        or review.get("version") != zip_path_hf.split("/")[1]
+    ):
+        raise ValueError("Review identity does not match the annotation path")
+
+    local_video = Path(hf_hub_download(
+        repo_id=repo_id,
+        filename=video_path_hf,
+        local_dir=tmp_dir,
+        repo_type="dataset",
+        token=hf_token,
+        revision=revision,
+    ))
+
     local_zip = Path(hf_hub_download(
-        repo_id=repo_id, filename=zip_path_hf, local_dir=tmp_dir, 
-        repo_type="dataset", token=hf_token, revision=revision
+        repo_id=repo_id,
+        filename=zip_path_hf,
+        local_dir=tmp_dir,
+        repo_type="dataset",
+        token=hf_token,
+        revision=revision,
     ))
 
     gt_temp_path = tmp_dir / f"{video_base_name}_gt.txt"
-    with zipfile.ZipFile(local_zip, 'r') as zip_ref:
-        internal_files = zip_ref.namelist()
-        gt_internal = [n for n in internal_files if 'gt.txt' in n][0]
-        with zip_ref.open(gt_internal) as src, open(gt_temp_path, 'wb') as dst:
-            shutil.copyfileobj(src, dst)
 
-    return local_video, gt_temp_path
+    with zipfile.ZipFile(local_zip) as archive:
+        gt_files = [
+            name
+            for name in archive.namelist()
+            if Path(name).name == "gt.txt"
+        ]
 
+        if len(gt_files) != 1:
+            raise ValueError("Expected exactly one gt.txt in MOT archive")
+
+        with archive.open(gt_files[0]) as source:
+            with gt_temp_path.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+
+    return local_video, gt_temp_path, review
 
 
 def select_annotation_zips(
     repo_files: list[str],
     split: str,
+    version: str,
     video_name: str | None = None,
 ) -> list[str]:
-    """Select annotation archives for a split or a single video."""
+    if not re.fullmatch(r"v[1-9][0-9]*", version):
+        raise ValueError(f"Invalid annotation version: {version}")
 
-    prefix = f"labels/{split}/"
+    prefix = f"labels_curated/{version}/{split}/"
 
     archives = sorted(
         path
@@ -125,5 +185,17 @@ def select_annotation_zips(
                 f"Expected exactly one ZIP for "
                 f"{split}/{video_name}, found {len(archives)}"
             )
+
+    if not archives:
+        raise ValueError(f"No curated annotations found for {version}/{split}")
+
+    for path in archives:
+        review_path = path.removesuffix(".zip") + ".review.json"
+
+        if review_path not in repo_files:
+            raise ValueError(f"Missing review metadata: {review_path}")
+
+    if len({Path(path).stem for path in archives}) != len(archives):
+        raise ValueError(f"Duplicate curated videos in {version}/{split}")
 
     return archives
