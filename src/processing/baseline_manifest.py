@@ -1,4 +1,3 @@
-import csv
 import json
 import re
 from collections import Counter
@@ -11,11 +10,13 @@ from src.config import (
     REPO_ID,
     SPLITS,
 )
-from src.processing.historical_manifest import (
+
+from src.processing.manifests import (
     CATEGORY_DIRS,
-    FIELDNAMES,
-    collect_historical_rows,
+    collect_frame_rows,
+    write_manifest,
 )
+
 from src.utils.io import check_extraction_source, get_extraction_paths
 
 def save_baseline_manifest(
@@ -31,7 +32,7 @@ def save_baseline_manifest(
     if output_path.exists():
         raise FileExistsError(f"Manifest already exists: {output_path}")
 
-    rows = collect_historical_rows(dataset_root)
+    rows = collect_frame_rows(dataset_root)
 
     for split in SPLITS:
         for category, folder_name in CATEGORY_DIRS.items():
@@ -47,12 +48,7 @@ def save_baseline_manifest(
                 if not label.read_text(encoding="utf-8").strip():
                     raise ValueError(f"Empty positive label: {label}")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_path.open("x", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_manifest(rows, output_path, include_excluded=False)
 
     return Counter((row["split"], row["category"]) for row in rows)
 
