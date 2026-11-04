@@ -10,6 +10,10 @@ HISTORICAL_MANIFEST = MANIFESTS_DIR / "historical" / "final.csv"
 
 IS_KAGGLE = os.environ.get('KAGGLE_KERNEL_RUN_TYPE', '') != ''
 
+EMBEDDING_MODEL_NAME = "dinov2_vitb14"
+EMBEDDING_MODEL_REVISION = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+EMBEDDING_BATCH_SIZE = 64
+
 if IS_KAGGLE:
     from kaggle_secrets import UserSecretsClient
     
