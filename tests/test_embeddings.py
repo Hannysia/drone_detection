@@ -89,10 +89,12 @@ def test_generation_uses_only_active_train_rows(bundle, category, expected):
 def test_missing_positive_file_fails(bundle, filename):
     (bundle[0] / "train/RAW_POSITIVES" / filename).unlink()
 
+    dataset = embeddings.DroneEmbeddingDataset(
+        bundle[0], bundle[1], "positive",
+    )
+
     with pytest.raises(FileNotFoundError):
-        embeddings.DroneEmbeddingDataset(
-            bundle[0], bundle[1], "positive",
-        )
+        dataset[0]
 
 
 @pytest.mark.parametrize("content", [
@@ -376,3 +378,16 @@ def test_failed_metadata_write_cleans_up_and_allows_retry(
     assert list(output.iterdir()) == []
 
     embeddings._bind_run(output, {"model": "first"})
+
+
+def test_dataset_selection_does_not_access_frame_directory(bundle, tmp_path):
+    dataset = embeddings.DroneEmbeddingDataset(
+        tmp_path / "unavailable_frames",
+        bundle[1],
+        "positive",
+    )
+
+    assert len(dataset) == 1
+
+    with pytest.raises(FileNotFoundError):
+        dataset[0]

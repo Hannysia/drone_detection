@@ -64,15 +64,6 @@ class DroneEmbeddingDataset(Dataset):
         if not self.image_paths:
             raise ValueError(f"No active train frames for {category}")
 
-        for image_path in self.image_paths:
-            if not image_path.is_file():
-                raise FileNotFoundError(image_path)
-
-            if category == "positive":
-                label_path = image_path.with_suffix(".txt")
-                if not label_path.is_file():
-                    raise FileNotFoundError(label_path)
-
     def __len__(self) -> int:
         return len(self.image_paths)
 
@@ -282,7 +273,11 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=EMBEDDING_BATCH_SIZE,
     )
-    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate source and manifest without opening images or labels",
+    )
     args = parser.parse_args(argv)
 
     if args.batch_size <= 0:
@@ -310,7 +305,7 @@ def main(argv: list[str] | None = None) -> None:
     dataset = DroneEmbeddingDataset(
         args.dataset_root, manifest, args.category,
     )
-    print(f"train/{args.category}: {len(dataset)}")
+    print(f"train/{args.category}: {len(dataset)}", flush=True)
 
     if args.check_only:
         return
@@ -353,6 +348,8 @@ def main(argv: list[str] | None = None) -> None:
     _bind_run(output_dir, metadata)
 
     device = torch.device("cuda")
+
+    print(f"Loading {EMBEDDING_MODEL_NAME} on CUDA...", flush=True)
     model = torch.hub.load(
         f"facebookresearch/dinov2:{EMBEDDING_MODEL_REVISION}",
         EMBEDDING_MODEL_NAME,
