@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image, UnidentifiedImageError
-
+import hashlib
+import sys
 from src.processing import embeddings
 from src.processing.manifests import write_manifest
 import json
@@ -391,3 +392,156 @@ def test_dataset_selection_does_not_access_frame_directory(bundle, tmp_path):
 
     with pytest.raises(FileNotFoundError):
         dataset[0]
+
+
+
+@pytest.fixture
+def publication(cli_bundle, monkeypatch):
+    import src.config as config
+
+    root, output = cli_bundle
+    folder = output / "v1"
+    folder.mkdir(parents=True)
+
+    metadata = {
+        "source": json.loads((root / "source.json").read_text()),
+        "manifest_sha256": hashlib.sha256(
+            (root / "manifest.csv").read_bytes()
+        ).hexdigest(),
+        "input_counts": {"positive": 1, "negative": 1},
+    }
+    (folder / "run.json").write_text(json.dumps(metadata))
+
+    torch.save(
+        {"a.jpg": np.ones(6, dtype=np.float32) / np.sqrt(6)},
+        folder / "train_positives_embeddings.pt",
+    )
+    torch.save(
+        {"b.jpg": np.array([1, 0, 0, 0, 0, 0], dtype=np.float32)},
+        folder / "train_negatives_embeddings.pt",
+    )
+
+    published = set()
+    calls = []
+
+    def commit(**kwargs):
+        calls.append(kwargs)
+        published.update(
+            operation.path_in_repo
+            for operation in kwargs["operations"]
+        )
+        return SimpleNamespace(
+            oid="new",
+            commit_url="https://huggingface.co/test-commit",
+        )
+
+    api = SimpleNamespace(
+        repo_info=lambda **kwargs: SimpleNamespace(sha="parent"),
+        list_repo_files=lambda **kwargs: list(published),
+        create_commit=commit,
+    )
+
+    monkeypatch.setattr(config, "HF_TOKEN", "test-token")
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            HfApi=lambda **kwargs: api,
+            CommitOperationAdd=lambda **kwargs: SimpleNamespace(
+                **kwargs,
+            ),
+        ),
+    )
+
+    return root, folder, published, calls
+
+
+def test_publication_uploads_both_categories_and_metadata_in_one_commit(
+    publication,
+):
+    root, folder, published, calls = publication
+
+    embeddings.validate_and_publish_embeddings(root)
+
+    assert len(calls) == 1
+    assert calls[0]["parent_commit"] == "parent"
+    assert published == {
+        "embeddings/v1/run.json",
+        "embeddings/v1/train_positives_embeddings.pt",
+        "embeddings/v1/train_negatives_embeddings.pt",
+    }
+    assert len(list(folder.iterdir())) == 3
+
+
+@pytest.mark.parametrize("problem", [
+    "filename",
+    "nan",
+    "norm",
+    "dimension",
+    "negative_crop",
+    "metadata",
+])
+def test_invalid_artifacts_are_not_uploaded(publication, problem):
+    root, folder, _, calls = publication
+
+    if problem == "metadata":
+        metadata_path = folder / "run.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["manifest_sha256"] = "wrong"
+        metadata_path.write_text(json.dumps(metadata))
+    else:
+        category = (
+            "negatives"
+            if problem in {"dimension", "negative_crop"}
+            else "positives"
+        )
+        name = "b.jpg" if category == "negatives" else "a.jpg"
+        vector = np.ones(6, dtype=np.float32) / np.sqrt(6)
+
+        if problem == "filename":
+            name = "wrong.jpg"
+        elif problem == "nan":
+            vector[0] = np.nan
+        elif problem == "norm":
+            vector *= 2
+        elif problem == "dimension":
+            vector = np.ones(8, dtype=np.float32) / np.sqrt(8)
+
+        torch.save(
+            {name: vector},
+            folder / f"train_{category}_embeddings.pt",
+        )
+
+    with pytest.raises(ValueError):
+        embeddings.validate_and_publish_embeddings(root)
+
+    assert calls == []
+
+
+def test_publication_does_not_overwrite_existing_hf_files(publication):
+    root, _, published, calls = publication
+    published.add("embeddings/v1/run.json")
+
+    with pytest.raises(FileExistsError):
+        embeddings.validate_and_publish_embeddings(root)
+
+    assert calls == []
+
+
+def test_cli_publication_does_not_regenerate_embeddings(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        embeddings,
+        "validate_and_publish_embeddings",
+        calls.append,
+    )
+
+    embeddings.main([
+        "--dataset-root", str(tmp_path),
+        "--publish-only",
+    ])
+
+    assert calls == [tmp_path]

@@ -7,7 +7,7 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-
+import numpy as np
 import torch
 import torchvision
 import torch.nn as nn
@@ -263,11 +263,12 @@ def main(argv: list[str] | None = None) -> None:
         description="Generate train embeddings from a manifest",
     )
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--category",
         choices=tuple(CATEGORY_DIRS),
-        required=True,
     )
+    mode.add_argument("--publish-only", action="store_true")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -282,6 +283,14 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+
+    if args.publish_only:
+        if args.check_only:
+            parser.error(
+                "--publish-only cannot be combined with --check-only",
+            )
+        validate_and_publish_embeddings(args.dataset_root)
+        return
 
     source = json.loads(
         (MANIFESTS_DIR / "sources" / "hf.json").read_text(
@@ -371,6 +380,175 @@ def main(argv: list[str] | None = None) -> None:
         del model
         torch.cuda.empty_cache()
 
+def validate_and_publish_embeddings(dataset_root: Path) -> str:
+    from huggingface_hub import CommitOperationAdd, HfApi
+    from src.config import HF_TOKEN
+
+    source = json.loads(
+        (MANIFESTS_DIR / "sources" / "hf.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    check_extraction_source(dataset_root, source)
+
+    version = source["annotation_version"]
+    manifest = dataset_root / "manifest.csv"
+    rows = read_manifest(manifest)
+    expected_rows = read_manifest(
+        MANIFESTS_DIR / "baseline" / version / "main.csv",
+    )
+
+    if rows != expected_rows:
+        raise ValueError(
+            "Uploaded manifest differs from the project baseline",
+        )
+
+    output_dir = EMBEDDINGS_DIR / version
+    metadata_path = output_dir / "run.json"
+    metadata = json.loads(
+        metadata_path.read_text(encoding="utf-8"),
+    )
+    counts = dict(Counter(
+        row["category"]
+        for row in rows
+        if row["split"] == "train" and not row["excluded_at"]
+    ))
+
+    if (
+        metadata["source"] != source
+        or metadata["manifest_sha256"]
+        != hashlib.sha256(manifest.read_bytes()).hexdigest()
+        or metadata["input_counts"] != counts
+    ):
+        raise ValueError(
+            "Embedding metadata does not match the dataset",
+        )
+
+    files = [metadata_path]
+    dimension = None
+
+    for category in CATEGORY_DIRS:
+        path = output_dir / f"train_{category}s_embeddings.pt"
+        data = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        expected = {
+            row["filename"]
+            for row in rows
+            if row["split"] == "train"
+            and row["category"] == category
+            and not row["excluded_at"]
+        }
+
+        if (
+            not isinstance(data, dict)
+            or not expected
+            or set(data) != expected
+        ):
+            raise ValueError(
+                f"Embedding filenames mismatch: {path}",
+            )
+
+        for name, vector in data.items():
+            if (
+                dimension is None
+                and isinstance(vector, np.ndarray)
+                and vector.ndim == 1
+            ):
+                dimension = vector.size
+
+            if (
+                not isinstance(vector, np.ndarray)
+                or vector.ndim != 1
+                or vector.size != dimension
+                or not vector.size
+                or vector.size % 2
+                or not np.issubdtype(vector.dtype, np.floating)
+                or not np.isfinite(vector).all()
+                or not np.isclose(
+                    np.linalg.norm(vector),
+                    1.0,
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+            ):
+                raise ValueError(
+                    f"Invalid embedding: {path.name}/{name}",
+                )
+
+            if (
+                category == "negative"
+                and np.count_nonzero(vector[dimension // 2:])
+            ):
+                raise ValueError(
+                    f"Nonzero crop component for negative frame: {name}",
+                )
+
+        print(
+            f"Verified train/{category}: {len(data)}, "
+            f"dimension={dimension}",
+            flush=True,
+        )
+        files.append(path)
+        del data
+
+    if not HF_TOKEN:
+        raise ValueError("HF_TOKEN is missing")
+
+    api = HfApi(token=HF_TOKEN)
+    repo_id = source["repo_id"]
+    prefix = f"embeddings/{version}"
+    targets = {f"{prefix}/{path.name}" for path in files}
+
+    head = api.repo_info(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision="main",
+    ).sha
+
+    existing = set(api.list_repo_files(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=head,
+    ))
+
+    if targets & existing:
+        raise FileExistsError(
+            f"HF files already exist: {sorted(targets & existing)}",
+        )
+
+    commit = api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision="main",
+        parent_commit=head,
+        commit_message=(
+            f"feat(data): publish validated {version} train embeddings"
+        ),
+        operations=[
+            CommitOperationAdd(
+                path_in_repo=f"{prefix}/{path.name}",
+                path_or_fileobj=str(path),
+            )
+            for path in files
+        ],
+    )
+
+    published = set(api.list_repo_files(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=commit.oid,
+    ))
+
+    if not targets <= published:
+        raise RuntimeError(
+            f"Published files missing at {commit.commit_url}",
+        )
+
+    print("Published:", commit.commit_url, flush=True)
+    return commit.commit_url
 
 if __name__ == "__main__":
     main()
