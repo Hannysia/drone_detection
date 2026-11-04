@@ -8,6 +8,8 @@ from src.processing import embeddings
 from src.processing.manifests import write_manifest
 import json
 from types import SimpleNamespace
+import hashlib
+import sys
 
 class TinyModel(torch.nn.Module):
     def forward(self, images):
@@ -397,14 +399,13 @@ def test_dataset_selection_does_not_access_frame_directory(bundle, tmp_path):
 
 @pytest.fixture
 def publication(cli_bundle, monkeypatch):
-    import src.config as config
-
     root, output = cli_bundle
     folder = output / "v1"
     folder.mkdir(parents=True)
 
+    source = json.loads((root / "source.json").read_text())
     metadata = {
-        "source": json.loads((root / "source.json").read_text()),
+        "source": source,
         "manifest_sha256": hashlib.sha256(
             (root / "manifest.csv").read_bytes()
         ).hexdigest(),
@@ -422,10 +423,10 @@ def publication(cli_bundle, monkeypatch):
     )
 
     published = set()
-    calls = []
+    commits = []
 
     def commit(**kwargs):
-        calls.append(kwargs)
+        commits.append(kwargs)
         published.update(
             operation.path_in_repo
             for operation in kwargs["operations"]
@@ -441,7 +442,6 @@ def publication(cli_bundle, monkeypatch):
         create_commit=commit,
     )
 
-    monkeypatch.setattr(config, "HF_TOKEN", "test-token")
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
@@ -453,18 +453,42 @@ def publication(cli_bundle, monkeypatch):
         ),
     )
 
-    return root, folder, published, calls
+    return root, folder, source, published, commits
 
 
-def test_publication_uploads_both_categories_and_metadata_in_one_commit(
-    publication,
-):
-    root, folder, published, calls = publication
+def test_validation_does_not_access_hf(publication, monkeypatch):
+    root, folder, source, _, commits = publication
 
-    embeddings.validate_and_publish_embeddings(root)
+    def fail(**kwargs):
+        pytest.fail("Validation must not access HF")
 
-    assert len(calls) == 1
-    assert calls[0]["parent_commit"] == "parent"
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(HfApi=fail),
+    )
+
+    files = embeddings.validate_embeddings(root, source)
+
+    assert {path.name for path in files} == {
+        path.name for path in folder.iterdir()
+    }
+    assert commits == []
+
+
+def test_publication_uploads_all_files_in_one_commit(publication):
+    root, folder, source, published, commits = publication
+    files = embeddings.validate_embeddings(root, source)
+
+    embeddings.publish_embeddings(
+        files,
+        repo_id=source["repo_id"],
+        version="v1",
+        token="test-token",
+    )
+
+    assert len(commits) == 1
+    assert commits[0]["parent_commit"] == "parent"
     assert published == {
         "embeddings/v1/run.json",
         "embeddings/v1/train_positives_embeddings.pt",
@@ -481,14 +505,14 @@ def test_publication_uploads_both_categories_and_metadata_in_one_commit(
     "negative_crop",
     "metadata",
 ])
-def test_invalid_artifacts_are_not_uploaded(publication, problem):
-    root, folder, _, calls = publication
+def test_validation_rejects_invalid_artifacts(publication, problem):
+    root, folder, source, _, commits = publication
 
     if problem == "metadata":
-        metadata_path = folder / "run.json"
-        metadata = json.loads(metadata_path.read_text())
+        path = folder / "run.json"
+        metadata = json.loads(path.read_text())
         metadata["manifest_sha256"] = "wrong"
-        metadata_path.write_text(json.dumps(metadata))
+        path.write_text(json.dumps(metadata))
     else:
         category = (
             "negatives"
@@ -513,35 +537,73 @@ def test_invalid_artifacts_are_not_uploaded(publication, problem):
         )
 
     with pytest.raises(ValueError):
-        embeddings.validate_and_publish_embeddings(root)
+        embeddings.validate_embeddings(root, source)
 
-    assert calls == []
+    assert commits == []
 
 
 def test_publication_does_not_overwrite_existing_hf_files(publication):
-    root, _, published, calls = publication
+    root, _, source, published, commits = publication
+    files = embeddings.validate_embeddings(root, source)
     published.add("embeddings/v1/run.json")
 
     with pytest.raises(FileExistsError):
-        embeddings.validate_and_publish_embeddings(root)
+        embeddings.publish_embeddings(
+            files,
+            repo_id=source["repo_id"],
+            version="v1",
+            token="test-token",
+        )
 
-    assert calls == []
+    assert commits == []
 
 
-def test_cli_publication_does_not_regenerate_embeddings(
-    tmp_path,
+@pytest.mark.parametrize("check_only", [False, True])
+def test_cli_coordinates_validation_and_publication(
+    cli_bundle,
     monkeypatch,
+    check_only,
 ):
+    root, _ = cli_bundle
     calls = []
-    monkeypatch.setattr(
-        embeddings,
-        "validate_and_publish_embeddings",
-        calls.append,
+
+    def validate(*args):
+        calls.append("validate")
+        return [root / "run.json"]
+
+    def publish(*args, **kwargs):
+        calls.append("publish")
+
+    monkeypatch.setattr(embeddings, "validate_embeddings", validate)
+    monkeypatch.setattr(embeddings, "publish_embeddings", publish)
+
+    argv = ["--dataset-root", str(root), "--publish-only"]
+
+    if check_only:
+        argv.append("--check-only")
+
+    embeddings.main(argv)
+
+    assert calls == (
+        ["validate"] if check_only else ["validate", "publish"]
     )
 
-    embeddings.main([
-        "--dataset-root", str(tmp_path),
-        "--publish-only",
-    ])
 
-    assert calls == [tmp_path]
+def test_cli_does_not_publish_when_validation_fails(
+    cli_bundle,
+    monkeypatch,
+):
+    def fail(*args):
+        raise ValueError("invalid embeddings")
+
+    def publish(*args, **kwargs):
+        pytest.fail("Invalid embeddings must not be published")
+
+    monkeypatch.setattr(embeddings, "validate_embeddings", fail)
+    monkeypatch.setattr(embeddings, "publish_embeddings", publish)
+
+    with pytest.raises(ValueError, match="invalid embeddings"):
+        embeddings.main([
+            "--dataset-root", str(cli_bundle[0]),
+            "--publish-only",
+        ])

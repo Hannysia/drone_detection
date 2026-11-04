@@ -24,6 +24,7 @@ from src.config import (
     EMBEDDINGS_DIR,
     MANIFESTS_DIR,
     PROJECT_ROOT,
+    HF_TOKEN,
 )
 from src.processing.manifests import CATEGORY_DIRS, read_manifest
 from src.utils.io import check_extraction_source
@@ -277,26 +278,32 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--check-only",
         action="store_true",
-        help="Validate source and manifest without opening images or labels",
+        help="Check inputs or saved embeddings without generating or publishing",
     )
     args = parser.parse_args(argv)
 
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
 
-    if args.publish_only:
-        if args.check_only:
-            parser.error(
-                "--publish-only cannot be combined with --check-only",
-            )
-        validate_and_publish_embeddings(args.dataset_root)
-        return
-
     source = json.loads(
         (MANIFESTS_DIR / "sources" / "hf.json").read_text(
             encoding="utf-8",
         )
     )
+    
+    if args.publish_only:
+        files = validate_embeddings(args.dataset_root, source)
+
+        if not args.check_only:
+            publish_embeddings(
+                files,
+                repo_id=source["repo_id"],
+                version=source["annotation_version"],
+                token=HF_TOKEN,
+            )
+
+        return
+
     check_extraction_source(args.dataset_root, source)
 
     version = source["annotation_version"]
@@ -380,15 +387,10 @@ def main(argv: list[str] | None = None) -> None:
         del model
         torch.cuda.empty_cache()
 
-def validate_and_publish_embeddings(dataset_root: Path) -> str:
-    from huggingface_hub import CommitOperationAdd, HfApi
-    from src.config import HF_TOKEN
-
-    source = json.loads(
-        (MANIFESTS_DIR / "sources" / "hf.json").read_text(
-            encoding="utf-8",
-        )
-    )
+def validate_embeddings(
+    dataset_root: Path,
+    source: dict,
+) -> list[Path]:
     check_extraction_source(dataset_root, source)
 
     version = source["annotation_version"]
@@ -494,11 +496,27 @@ def validate_and_publish_embeddings(dataset_root: Path) -> str:
         files.append(path)
         del data
 
-    if not HF_TOKEN:
+    return files
+
+
+def publish_embeddings(
+    files: list[Path],
+    *,
+    repo_id: str,
+    version: str,
+    token: str,
+) -> str:
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    if not files or len({path.name for path in files}) != len(files):
+        raise ValueError(
+            "Publication requires files with unique names",
+        )
+
+    if not token:
         raise ValueError("HF_TOKEN is missing")
 
-    api = HfApi(token=HF_TOKEN)
-    repo_id = source["repo_id"]
+    api = HfApi(token=token)
     prefix = f"embeddings/{version}"
     targets = {f"{prefix}/{path.name}" for path in files}
 
