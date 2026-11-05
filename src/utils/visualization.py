@@ -612,3 +612,59 @@ def plot_evaluation_diagnostics_grid(df_diag: pd.DataFrame) -> None:
     plt.tight_layout()
     plt.show()
     plt.close()
+
+
+
+def plot_theta_candidate_analysis(
+    results: pd.DataFrame,
+    *,
+    title: str,
+) -> plt.Figure:
+    required = {
+        "theta",
+        "kept_fraction",
+        "coverage_p95",
+        "coverage_max",
+    }
+
+    if results.empty or not required.issubset(results.columns):
+        raise ValueError(
+            "Expected nonempty theta evaluation results",
+        )
+
+    ordered = results.sort_values("theta")
+    frontier = results.sort_values("kept_fraction")
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    figure.suptitle(title)
+
+    axes[0].plot(
+        ordered["theta"],
+        ordered["kept_fraction"] * 100,
+        marker=".",
+    )
+    axes[0].set_xlabel("Theta")
+    axes[0].set_ylabel("Frames retained (%)")
+    axes[0].set_title("Dataset size")
+
+    for column, label in (
+        ("coverage_p95", "95th percentile"),
+        ("coverage_max", "Maximum"),
+    ):
+        axes[1].plot(
+            frontier["kept_fraction"] * 100,
+            frontier[column],
+            marker=".",
+            label=label,
+        )
+
+    axes[1].set_xlabel("Frames retained (%)")
+    axes[1].set_ylabel("Distance to nearest retained frame")
+    axes[1].set_title("Representation error")
+    axes[1].legend()
+
+    for axis in axes:
+        axis.grid(alpha=0.3)
+
+    figure.tight_layout()
+    return figure
