@@ -517,7 +517,7 @@ def evaluate_theta_candidates(
         kept = 0
         distances = []
 
-        for matrix in matrices:
+        for matrix in tqdm( matrices, desc=f"theta={theta:g}", leave=False):
             selected = k_center_greedy_threshold(
                 matrix,
                 float(theta),

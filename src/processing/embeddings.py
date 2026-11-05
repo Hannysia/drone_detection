@@ -390,11 +390,17 @@ def main(argv: list[str] | None = None) -> None:
 def validate_embeddings(
     dataset_root: Path,
     source: dict,
+    *,
+    manifest_path: Path | None = None,
 ) -> list[Path]:
     check_extraction_source(dataset_root, source)
 
     version = source["annotation_version"]
-    manifest = dataset_root / "manifest.csv"
+    manifest = (
+        manifest_path
+        if manifest_path is not None
+        else dataset_root / "manifest.csv"
+    )
     rows = read_manifest(manifest)
     expected_rows = read_manifest(
         MANIFESTS_DIR / "baseline" / version / "main.csv",

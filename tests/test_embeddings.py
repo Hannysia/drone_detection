@@ -607,3 +607,25 @@ def test_cli_does_not_publish_when_validation_fails(
             "--dataset-root", str(cli_bundle[0]),
             "--publish-only",
         ])
+
+
+
+def test_validation_accepts_manifest_outside_dataset(
+    publication,
+    tmp_path,
+):
+    root, folder, source, _, commits = publication
+    manifest = tmp_path / "baseline.csv"
+    (root / "manifest.csv").rename(manifest)
+
+    files = embeddings.validate_embeddings(
+        root,
+        source,
+        manifest_path=manifest,
+    )
+
+    assert {path.name for path in files} == {
+        path.name for path in folder.iterdir()
+    }
+    assert not (root / "manifest.csv").exists()
+    assert commits == []
