@@ -7,6 +7,7 @@ from pathlib import Path
 from src.processing.video import get_video_metadata
 from src.processing.dataset import extract_metadata_from_filename, parse_frame_filename_logic
 from src.utils.visualization import plot_theta_analysis_dashboard
+from src.processing.clustering import k_center_greedy_threshold
 from pathlib import Path
 from PIL import Image
 import cv2
@@ -463,6 +464,89 @@ def simulate_elbow_curve(groups: dict, sample_n: int, theta_steps: int) -> tuple
 
 
 
+def evaluate_theta_candidates(
+    groups: dict,
+    theta_values: list[float] | np.ndarray,
+) -> pd.DataFrame:
+    thetas = np.asarray(theta_values, dtype=float)
+
+    if (
+        thetas.ndim != 1
+        or not thetas.size
+        or not np.isfinite(thetas).all()
+        or (thetas < 0).any()
+    ):
+        raise ValueError(
+            "Provide a nonempty sequence of finite, nonnegative theta values",
+        )
+
+    matrices = []
+
+    for video_id, frames in groups.items():
+        if not frames:
+            continue
+
+        matrix = np.stack([
+            embedding for _, embedding in frames
+        ])
+
+        if (
+            matrix.ndim != 2
+            or matrix.shape[1] == 0
+            or not np.isfinite(matrix).all()
+            or not np.allclose(
+                np.linalg.norm(matrix, axis=1),
+                1.0,
+                rtol=1e-5,
+                atol=1e-6,
+            )
+        ):
+            raise ValueError(
+                f"Expected finite, L2-normalized embeddings for {video_id}",
+            )
+
+        matrices.append(matrix)
+
+    if not matrices:
+        raise ValueError("No frames to evaluate")
+
+    total = sum(len(matrix) for matrix in matrices)
+    records = []
+
+    for theta in tqdm(thetas, desc="Evaluating theta candidates"):
+        kept = 0
+        distances = []
+
+        for matrix in matrices:
+            selected = k_center_greedy_threshold(
+                matrix,
+                float(theta),
+            )
+
+            similarity = matrix @ matrix[selected].T
+            nearest = (
+                1.0 - np.clip(similarity, -1.0, 1.0)
+            ).min(axis=1)
+
+            nearest[selected] = 0.0
+            kept += len(selected)
+            distances.append(nearest)
+
+        coverage = np.concatenate(distances)
+
+        records.append({
+            "theta": float(theta),
+            "total_frames": total,
+            "kept_frames": kept,
+            "kept_fraction": kept / total,
+            "coverage_p95": float(np.percentile(coverage, 95)),
+            "coverage_max": float(coverage.max()),
+        })
+
+    return pd.DataFrame(records)
+
+
+    
 def load_and_verify_embeddings(repo_id: str, filename: str, token: str | None = None) -> dict | None:
     """Downloads, loads, and performs validation metrics on a PyTorch embeddings file."""
     print(f"\n1. Downloading embeddings from Hugging Face...")

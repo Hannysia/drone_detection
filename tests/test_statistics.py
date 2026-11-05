@@ -5,7 +5,8 @@ from src.processing.statistics import (
     pairwise_distances, 
     group_embeddings_by_video, 
     filter_active_embeddings, 
-    analyze_video_formats
+    analyze_video_formats,
+    evaluate_theta_candidates
 )
 
 def test_pairwise_distances_orthogonal():
@@ -71,3 +72,115 @@ def test_analyze_video_formats_mock_filesystem(tmp_path):
     assert ext_counter[".mov"] == 1
     assert ext_counter[".jpg"] == 1
     assert ext_counter["no_extension"] == 1
+
+
+
+def test_theta_evaluation_counts_and_coverage():
+    groups = {
+        "duplicates": [
+            ("a.jpg", np.array([1.0, 0.0])),
+            ("b.jpg", np.array([1.0, 0.0])),
+        ],
+        "different": [
+            ("c.jpg", np.array([1.0, 0.0])),
+            ("d.jpg", np.array([0.0, 1.0])),
+        ],
+        "single": [
+            ("e.jpg", np.array([-1.0, 0.0])),
+        ],
+    }
+    original = {
+        name: [vector.copy() for _, vector in frames]
+        for name, frames in groups.items()
+    }
+
+    result = evaluate_theta_candidates(
+        groups, [0.0, 0.5, 1.5],
+    )
+
+    assert result["total_frames"].tolist() == [5, 5, 5]
+    assert result["kept_frames"].tolist() == [5, 4, 3]
+    assert result["kept_fraction"].tolist() == pytest.approx(
+        [1.0, 0.8, 0.6],
+    )
+    assert result["coverage_p95"].tolist() == pytest.approx(
+        [0.0, 0.0, 0.8],
+    )
+    assert result["coverage_max"].tolist() == pytest.approx(
+        [0.0, 0.0, 1.0],
+    )
+
+    for name, frames in groups.items():
+        for (_, vector), expected in zip(frames, original[name]):
+            np.testing.assert_array_equal(vector, expected)
+
+
+def test_theta_evaluation_keeps_each_video_represented():
+    groups = {
+        "first": [
+            ("a.jpg", np.array([1.0, 0.0])),
+        ],
+        "second": [
+            ("b.jpg", np.array([1.0, 0.0])),
+        ],
+    }
+
+    result = evaluate_theta_candidates(groups, [0.5])
+
+    assert result.loc[0, "kept_frames"] == 2
+    assert result.loc[0, "coverage_max"] == 0.0
+
+
+@pytest.mark.parametrize("theta", [0.1, 1.0, 1.1])
+def test_theta_evaluation_matches_selector(theta):
+    from src.processing.clustering import k_center_greedy_threshold
+
+    matrix = np.array([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    groups = {
+        "demo": [
+            (str(i), vector)
+            for i, vector in enumerate(matrix)
+        ],
+    }
+
+    result = evaluate_theta_candidates(groups, [theta])
+
+    assert result.loc[0, "kept_frames"] == len(
+        k_center_greedy_threshold(matrix, theta),
+    )
+
+
+@pytest.mark.parametrize("thetas", [
+    [],
+    [-0.1],
+    [np.nan],
+    [np.inf],
+    [[0.1]],
+])
+def test_theta_evaluation_rejects_invalid_thresholds(thetas):
+    with pytest.raises(ValueError, match="theta"):
+        evaluate_theta_candidates({}, thetas)
+
+
+def test_theta_evaluation_rejects_empty_groups():
+    with pytest.raises(ValueError, match="No frames"):
+        evaluate_theta_candidates(
+            {"empty": []},
+            [0.1],
+        )
+
+
+@pytest.mark.parametrize("vector", [
+    np.array([np.nan, 0.0]),
+    np.array([2.0, 0.0]),
+])
+def test_theta_evaluation_rejects_invalid_embeddings(vector):
+    with pytest.raises(ValueError, match="L2-normalized"):
+        evaluate_theta_candidates(
+            {"demo": [("a.jpg", vector)]},
+            [0.1],
+        )
