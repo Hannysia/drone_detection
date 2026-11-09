@@ -1,0 +1,21 @@
+{
+  "baseline_sha256": "49df589b5da756d8a8b5a661431f43af8879dec106c552db20b15c66aaae3719",
+  "code_revision": "c4e9abc7d4fc0e824cd18f4dc79d1871ba8b13d3",
+  "embedding_files_sha256": {
+    "run.json": "45f56d25f6df06fd94f769b850ebd2a26eb693df353108f91195388db2e963b6",
+    "train_negatives_embeddings.pt": "4ea2f78bac4bec6ff570cc6ac40ce62bfe86a350a75e619103651a3ed99d9820",
+    "train_positives_embeddings.pt": "6f5374e58798452dc3e1340426f12e97be23d04d1a6a667011f421d3fb9d70f3"
+  },
+  "manifest_sha256": "76f5ea5eb9af2d18101549aba81c661d8756c55bd7a55607253738527e0aa33f",
+  "numpy_version": "2.4.6",
+  "source": {
+    "annotation_version": "v1",
+    "repo_id": "hannusia123123/drone_dataset",
+    "repo_type": "dataset",
+    "revision": "09c0d83e5c22fc940d87eef5a657ee225d4d5891"
+  },
+  "thresholds": {
+    "negative": 0.014048218727111816,
+    "positive": 0.09
+  }
+}
