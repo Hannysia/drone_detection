@@ -101,7 +101,13 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def save_embedding_selection(rows, metadata, output_dir):
+def save_embedding_selection(
+    rows,
+    metadata,
+    output_dir,
+    *,
+    expected_manifest_sha256=None,
+):
     output_dir = Path(output_dir)
 
     if output_dir.exists() or output_dir.is_symlink():
@@ -115,12 +121,17 @@ def save_embedding_selection(rows, metadata, output_dir):
     ) as temporary:
         staging = Path(temporary) / "selection"
         write_manifest(rows, staging / "main.csv")
+        manifest_sha256 = file_sha256(staging / "main.csv")
 
-        record = dict(
-            metadata,
-            manifest_sha256=file_sha256(staging / "main.csv"),
-        )
+        if (
+            expected_manifest_sha256 is not None
+            and manifest_sha256 != expected_manifest_sha256
+        ):
+            raise ValueError(
+                "Reproduced manifest differs from the recorded result"
+            )
 
+        record = dict(metadata, manifest_sha256=manifest_sha256)
         (staging / "run.json").write_text(
             json.dumps(
                 record,
@@ -132,6 +143,24 @@ def save_embedding_selection(rows, metadata, output_dir):
         )
 
         staging.rename(output_dir)
+
+
+
+def verify_run_inputs(recorded, current):
+    fields = (
+        "source",
+        "baseline_sha256",
+        "embedding_files_sha256",
+    )
+
+    for field in fields:
+        if field not in recorded or recorded[field] != current[field]:
+            raise ValueError(f"Reproduction input mismatch: {field}")
+
+    digest = recorded.get("manifest_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValueError("Missing or invalid recorded manifest checksum")
+
 
 
 def main():
@@ -147,30 +176,78 @@ def main():
     from src.processing.embeddings import validate_embeddings
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--positive-theta", type=float, required=True)
-    parser.add_argument("--negative-theta", type=float, required=True)
+    parser.add_argument("--positive-theta", type=float)
+    parser.add_argument("--negative-theta", type=float)
+    parser.add_argument("--from-run", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
-    thresholds = {
-        "positive": args.positive_theta,
-        "negative": args.negative_theta,
-    }
+    recorded = None
+
+    if args.from_run is not None:
+        if args.positive_theta is not None or args.negative_theta is not None:
+            parser.error(
+                "--from-run cannot be combined with threshold arguments"
+            )
+
+        if args.output_dir is None:
+            parser.error("--from-run requires --output-dir")
+
+        recorded = json.loads(
+            args.from_run.read_text(encoding="utf-8")
+        )
+        thresholds = recorded["thresholds"]
+    else:
+        if args.positive_theta is None or args.negative_theta is None:
+            parser.error(
+                "Provide both --positive-theta and --negative-theta"
+            )
+
+        thresholds = {
+            "positive": args.positive_theta,
+            "negative": args.negative_theta,
+        }
 
     source_path = MANIFESTS_DIR / "sources" / "hf.json"
     source = json.loads(source_path.read_text(encoding="utf-8"))
     version = source["annotation_version"]
-
     baseline = MANIFESTS_DIR / "baseline" / version / "main.csv"
-    output_dir = MANIFESTS_DIR / "embeddings" / version / "within_video"
+
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else MANIFESTS_DIR / "embeddings" / version / "within_video"
+    )
 
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"Selection already exists: {output_dir}")
+
+    if recorded is not None and recorded.get("source") != source:
+        raise ValueError("Reproduction input mismatch: source")
 
     files = validate_embeddings(
         FRAME_BASELINE_DIR / version,
         source,
         manifest_path=baseline,
     )
+
+    metadata = {
+        "source": source,
+        "thresholds": thresholds,
+        "baseline_sha256": file_sha256(baseline),
+        "embedding_files_sha256": {
+            path.name: file_sha256(path)
+            for path in files
+        },
+        "code_revision": subprocess.check_output(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+            text=True,
+        ).strip(),
+        "numpy_version": np.__version__,
+    }
+
+    if recorded is not None:
+        verify_run_inputs(recorded, metadata)
 
     embeddings = {
         category: torch.load(
@@ -187,37 +264,23 @@ def main():
         thresholds,
     )
 
-    code_paths = [
-        Path(__file__),
-        Path(__file__).with_name("clustering.py"),
-        Path(__file__).with_name("manifests.py"),
-    ]
+    expected_checksum = (
+        recorded["manifest_sha256"]
+        if recorded is not None
+        else None
+    )
 
-    metadata = {
-        "stage": "embeddings_within_video",
-        "source": source,
-        "thresholds": thresholds,
-        "baseline_sha256": file_sha256(baseline),
-        "embedding_files_sha256": {
-            path.name: file_sha256(path)
-            for path in files
-        },
-        "code_revision": subprocess.check_output(
-            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
-            text=True,
-        ).strip(),
-        "code_sha256": {
-            path.name: file_sha256(path)
-            for path in code_paths
-        },
-        "numpy_version": np.__version__,
-        "ordering": "video_id ascending, original frame number ascending",
-        "initial_center": "first active frame in each video",
-    }
-
-    save_embedding_selection(rows, metadata, output_dir)
+    save_embedding_selection(
+        rows,
+        metadata,
+        output_dir,
+        expected_manifest_sha256=expected_checksum,
+    )
 
     print(f"Manifest: {output_dir / 'main.csv'}")
+
+    if recorded is not None:
+        print("Reproduced manifest checksum matches the recorded result")
 
     counts = Counter(
         (row["split"], row["category"])

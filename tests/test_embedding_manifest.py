@@ -141,7 +141,8 @@ def test_metadata_failure_leaves_no_partial_result(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_main_writes_selection_with_provenance(tmp_path, monkeypatch, capsys):
+@pytest.fixture
+def cli_setup(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace
 
@@ -185,7 +186,9 @@ def test_main_writes_selection_with_provenance(tmp_path, monkeypatch, capsys):
     monkeypatch.setitem(
         sys.modules,
         "src.processing.embeddings",
-        SimpleNamespace(validate_embeddings=lambda *args, **kwargs: paths),
+        SimpleNamespace(
+            validate_embeddings=lambda *args, **kwargs: paths,
+        ),
     )
     monkeypatch.setattr(
         sys,
@@ -197,7 +200,12 @@ def test_main_writes_selection_with_provenance(tmp_path, monkeypatch, capsys):
         ],
     )
 
-    embedding_manifest.main()
+    return embedding_manifest, manifests_dir, source, thresholds, rows
+
+
+def test_main_writes_selection_with_provenance(cli_setup, capsys):
+    module, manifests_dir, source, thresholds, rows = cli_setup
+    module.main()
 
     output = manifests_dir / "embeddings/v1/within_video"
     record = json.loads((output / "run.json").read_text())
@@ -205,7 +213,187 @@ def test_main_writes_selection_with_provenance(tmp_path, monkeypatch, capsys):
     assert len(read_manifest(output / "main.csv")) == len(rows)
     assert record["thresholds"] == thresholds
     assert record["source"] == source
-    assert record["manifest_sha256"] == embedding_manifest.file_sha256(
+    assert record["manifest_sha256"] == module.file_sha256(
         output / "main.csv"
     )
     assert "Manifest:" in capsys.readouterr().out
+
+
+def test_replay_reproduces_exact_csv(cli_setup, tmp_path, monkeypatch):
+    import sys
+
+    module, manifests_dir, _, _, _ = cli_setup
+    module.main()
+
+    original = manifests_dir / "embeddings/v1/within_video"
+    output = tmp_path / "reproduced"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "embedding_manifest",
+            "--from-run", str(original / "run.json"),
+            "--output-dir", str(output),
+        ],
+    )
+
+    module.main()
+
+    assert (
+        (original / "main.csv").read_bytes()
+        == (output / "main.csv").read_bytes()
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source",
+        "baseline_sha256",
+        "embedding_files_sha256",
+        "manifest_sha256",
+    ],
+)
+def test_replay_rejects_mismatches(
+    cli_setup,
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    import sys
+
+    module, manifests_dir, _, _, _ = cli_setup
+    module.main()
+
+    original = manifests_dir / "embeddings/v1/within_video"
+    record = json.loads((original / "run.json").read_text())
+    record[field] = "0" * 64
+
+    changed_run = tmp_path / "changed.json"
+    changed_run.write_text(json.dumps(record))
+    output = tmp_path / "reproduced"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "embedding_manifest",
+            "--from-run", str(changed_run),
+            "--output-dir", str(output),
+        ],
+    )
+
+    with pytest.raises(ValueError):
+        module.main()
+
+    assert not output.exists()
+    assert module.file_sha256(original / "main.csv") != "0" * 64
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--positive-theta", "0.09"],
+        ["--from-run", "run.json"],
+        [
+            "--from-run", "run.json",
+            "--output-dir", "replay",
+            "--negative-theta", "0.02",
+        ],
+    ],
+)
+def test_invalid_cli_arguments_fail(
+    cli_setup,
+    monkeypatch,
+    arguments,
+):
+    import sys
+
+    module, _, _, _, _ = cli_setup
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["embedding_manifest", *arguments],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("field", ["code_revision", "numpy_version"])
+def test_replay_accepts_changed_informational_fields(
+    cli_setup,
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    import sys
+
+    module, manifests_dir, _, _, _ = cli_setup
+    module.main()
+
+    original = manifests_dir / "embeddings/v1/within_video"
+    record = json.loads((original / "run.json").read_text())
+    record[field] = "different recorded version"
+
+    changed_run = tmp_path / "changed.json"
+    changed_run.write_text(json.dumps(record))
+    output = tmp_path / "reproduced"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "embedding_manifest",
+            "--from-run", str(changed_run),
+            "--output-dir", str(output),
+        ],
+    )
+
+    module.main()
+
+    assert (
+        (original / "main.csv").read_bytes()
+        == (output / "main.csv").read_bytes()
+    )
+
+    updated = json.loads((output / "run.json").read_text())
+    assert updated[field] != record[field]
+
+
+def test_replay_uses_recorded_thresholds(
+    cli_setup,
+    tmp_path,
+    monkeypatch,
+):
+    import sys
+
+    module, manifests_dir, _, _, _ = cli_setup
+    module.main()
+
+    original = manifests_dir / "embeddings/v1/within_video"
+    record = json.loads((original / "run.json").read_text())
+    record["thresholds"] = {"positive": 0.0, "negative": 0.0}
+
+    changed_run = tmp_path / "changed.json"
+    changed_run.write_text(json.dumps(record))
+    output = tmp_path / "reproduced"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "embedding_manifest",
+            "--from-run", str(changed_run),
+            "--output-dir", str(output),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Reproduced manifest differs"):
+        module.main()
+
+    assert not output.exists()
