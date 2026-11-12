@@ -1,0 +1,14 @@
+{
+  "block_size": 5,
+  "code_revision": "60c629d4aef5f8fac331b777674d9f2edbbe5b35",
+  "input_manifest_sha256": "76f5ea5eb9af2d18101549aba81c661d8756c55bd7a55607253738527e0aa33f",
+  "input_run_sha256": "b49fc6ec04388037c39557ff873322dfd5c72b0e947237b166fa60c59e47e63b",
+  "manifest_sha256": "2bac89bad4874561074f6951ec0eaba2f1089225b8f2e26485b6597ee1cbae19",
+  "numpy_version": "2.4.6",
+  "source": {
+    "annotation_version": "v1",
+    "repo_id": "hannusia123123/drone_dataset",
+    "repo_type": "dataset",
+    "revision": "09c0d83e5c22fc940d87eef5a657ee225d4d5891"
+  }
+}
