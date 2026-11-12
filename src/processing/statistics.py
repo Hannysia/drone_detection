@@ -95,7 +95,11 @@ def get_splits_metadata_df(split_dir: Path, splits: list[str]) -> pd.DataFrame:
     return pd.DataFrame(all_data)
 
 
-def gather_dataset_geometry(pos_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def gather_dataset_geometry(
+    pos_dir: Path,
+    *,
+    selected_frames: set[tuple[str, str]] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Scans positive images and labels, calculates geometry dimensions and scales.
     Returns:
@@ -115,6 +119,12 @@ def gather_dataset_geometry(pos_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     image_paths = sorted(list(pos_dir.glob("*.jpg")))
     
     for img_path in image_paths:
+        if (
+            selected_frames is not None
+            and (pos_dir.parent.name, img_path.name) not in selected_frames
+        ):
+            continue
+
         lbl_path = img_path.with_suffix(".txt")
 
         try:
@@ -170,7 +180,12 @@ def gather_dataset_geometry(pos_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df_images, df_bboxes
 
 
-def gather_spatial_coordinates(extracted_data_dir: Path, splits: list[str]) -> tuple[np.ndarray, np.ndarray, int]:
+def gather_spatial_coordinates(
+    extracted_data_dir: Path,
+    splits: list[str],
+    *,
+    selected_frames: set[tuple[str, str]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Scans all split positive labels and extracts normalized bounding box coordinates.
     Returns:
@@ -188,6 +203,14 @@ def gather_spatial_coordinates(extracted_data_dir: Path, splits: list[str]) -> t
             continue
             
         for path in pos_dir.glob("*.txt"):
+            if (
+                selected_frames is not None
+                and (
+                    split,
+                    path.with_suffix(".jpg").name,
+                ) not in selected_frames
+            ):
+                continue
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     for line in f:
@@ -205,7 +228,12 @@ def gather_spatial_coordinates(extracted_data_dir: Path, splits: list[str]) -> t
     return np.array(x_centers), np.array(y_centers), total_boxes
 
 
-def gather_dataset_frame_metadata_df(extracted_data_dir: Path, splits: list[str]) -> pd.DataFrame:
+def gather_dataset_frame_metadata_df(
+    extracted_data_dir: Path,
+    splits: list[str],
+    *,
+    selected_frames: set[tuple[str, str]] | None = None,
+) -> pd.DataFrame:
     """
     Scans positive and negative image directories across splits,
     extracts frame-level metadata, and returns a compiled Pandas DataFrame.
@@ -218,6 +246,11 @@ def gather_dataset_frame_metadata_df(extracted_data_dir: Path, splits: list[str]
         
         if pos_dir.exists():
             for img_path in pos_dir.glob("*.jpg"):
+                if (
+                    selected_frames is not None
+                    and (split, img_path.name) not in selected_frames
+                ):
+                    continue
                 meta = parse_frame_filename_logic(img_path.name)
                 data_records.append({
                     "filename": img_path.name,
@@ -231,6 +264,11 @@ def gather_dataset_frame_metadata_df(extracted_data_dir: Path, splits: list[str]
                 
         if neg_dir.exists():
             for img_path in neg_dir.glob("*.jpg"):
+                if (
+                    selected_frames is not None
+                    and (split, img_path.name) not in selected_frames
+                ):
+                    continue
                 meta = parse_frame_filename_logic(img_path.name)
                 data_records.append({
                     "filename": img_path.name,
@@ -245,7 +283,12 @@ def gather_dataset_frame_metadata_df(extracted_data_dir: Path, splits: list[str]
     return pd.DataFrame(data_records)
 
 
-def gather_all_splits_geometry(extracted_data_dir: Path, splits: list[str]) -> pd.DataFrame:
+def gather_all_splits_geometry(
+    extracted_data_dir: Path,
+    splits: list[str],
+    *,
+    selected_frames: set[tuple[str, str]] | None = None,
+) -> pd.DataFrame:
     """
     Scans and gathers geometry statistics (width, height, area, aspect ratio) 
     for all bounding boxes across multiple splits. Uses fast PIL header scanner.
@@ -262,6 +305,13 @@ def gather_all_splits_geometry(extracted_data_dir: Path, splits: list[str]) -> p
             
         image_paths = sorted(list(pos_dir.glob("*.jpg")))
         for img_path in image_paths:
+
+            if (
+                selected_frames is not None
+                and (pos_dir.parent.name, img_path.name) not in selected_frames
+            ):
+                continue
+
             lbl_path = img_path.with_suffix(".txt")
             if not lbl_path.exists():
                 continue
@@ -295,7 +345,12 @@ def gather_all_splits_geometry(extracted_data_dir: Path, splits: list[str]) -> p
     })
 
 
-def calculate_dataset_local_contrast(extracted_data_dir: Path, splits: list[str]) -> pd.DataFrame:
+def calculate_dataset_local_contrast(
+    extracted_data_dir: Path,
+    splits: list[str],
+    *,
+    selected_frames: set[tuple[str, str]] | None = None,
+) -> pd.DataFrame:
     """
     Computes Local Weber Contrast for all bounding boxes in positive frames across splits.
     Extracts target luminance vs surrounding background ring luminance.
@@ -308,6 +363,14 @@ def calculate_dataset_local_contrast(extracted_data_dir: Path, splits: list[str]
             continue
             
         for path in pos_dir.glob("*.txt"):
+            if (
+                selected_frames is not None
+                and (
+                    split,
+                    path.with_suffix(".jpg").name,
+                ) not in selected_frames
+            ):
+                continue
             meta = parse_frame_filename_logic(path.name)
             if meta["camera"] == "unknown" or meta["background"] == "unknown":
                 continue
