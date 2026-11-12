@@ -13,8 +13,7 @@ CATEGORY_DIRS = {
 
 FIELDNAMES = ("filename", "split", "category")
 SELECTION_FIELDNAMES = FIELDNAMES + ("excluded_at",)
-EXCLUSION_STAGES = {"", "iou", "embeddings"}
-
+EXCLUSION_STAGES = {"", "iou", "embeddings", "temporal"}
 
 def _validate_fields(fields: Iterable[str]) -> None:
     fields = tuple(fields)
