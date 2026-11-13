@@ -1,0 +1,2 @@
+manifests/**/*.csv -text
+manifests/**/*.json -text

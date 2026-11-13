@@ -140,6 +140,7 @@ def save_embedding_selection(
                 allow_nan=False,
             ) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
 
         staging.rename(output_dir)
