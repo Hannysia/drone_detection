@@ -45,22 +45,6 @@ def read_yolo_bbox(label_path: Path) -> list[float]:
         parts = first_line.split()
     return list(map(float, parts[1:5]))
 
-def move_to_trash(file_path: Path, trash_dir: Path, is_positive: bool = True) -> None:
-    """Moves image (.jpg) and optionally its YOLO label (.txt) to trash directory."""
-    try:
-        if is_positive:
-            label_path = file_path.with_suffix('.txt')
-            if label_path.exists():
-                shutil.move(str(label_path), trash_dir / label_path.name)
-        
-        img_path = file_path.with_suffix('.jpg')
-        if img_path.exists():
-            shutil.move(str(img_path), trash_dir / img_path.name)
-            
-    except OSError as e:
-        raise OSError(f"Error moving file {file_path.name} to trash: {e}")
-
-
 
 def create_zip_archive(
     split_name: str, 

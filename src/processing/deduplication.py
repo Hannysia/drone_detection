@@ -1,7 +1,5 @@
 import re
 from pathlib import Path
-from src.utils.geometry import calculate_iou
-from src.utils.io import read_yolo_bbox, move_to_trash
 import itertools
 import logging
 import imagehash
@@ -19,26 +17,6 @@ def group_labels_by_video(labels: list[Path]) -> dict[str, list[Path]]:
         groups[video_id].sort()
     return groups
 
-def deduplicate_video_group(labels: list[Path], iou_threshold: float, trash_dir: Path) -> int:
-    """Deduplicates a single sorted group of frames using IoU threshold. Returns count of removed frames."""
-    if not labels:
-        return 0
-
-    moved_count = 0
-    anchor_box = read_yolo_bbox(labels[0])
-
-    for lbl_path in labels[1:]:
-        try:
-            curr_box = read_yolo_bbox(lbl_path)
-            if calculate_iou(anchor_box, curr_box) > iou_threshold:
-                move_to_trash(lbl_path, trash_dir, is_positive=True)
-                moved_count += 1
-            else:
-                anchor_box = curr_box
-        except (ValueError, IndexError) as e:
-            continue
-
-    return moved_count
 
 def group_files_by_video(files: list[Path]) -> dict[str, list[Path]]:
     """Groups file paths by their video identifier using regex."""
