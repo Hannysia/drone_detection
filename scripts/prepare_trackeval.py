@@ -42,7 +42,6 @@ def main() -> None:
             zip_path = zip_files.get(seq_name) or zip_files.get(f"{seq_name}_annotated")
             
             if zip_path:
-                matched_seqs.append(seq_name)
                 log.info(f"[{split.upper()}] Processing sequence: {seq_name}")
                 
                 seq_gt_dir = gt_dir / seq_name / "gt"
@@ -54,10 +53,12 @@ def main() -> None:
                         video_path=video_path,
                         zip_path=zip_path,
                         seq_gt_dir=seq_gt_dir,
-                        seqinfo_path=seqinfo_path
+                        seqinfo_path=seqinfo_path,
                     )
                 except Exception as e:
                     log.error(f"❌ Failed to process sequence {seq_name}: {e}")
+                else:
+                    matched_seqs.append(seq_name)
             else:
                 log.warning(f"Warning: No matching zip archive found for {video_path.name}")
                 
