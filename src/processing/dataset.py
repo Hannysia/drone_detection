@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import zipfile
 import numpy as np
+import yaml
 from src.processing.video import get_video_metadata
 
 log = logging.getLogger(__name__)
