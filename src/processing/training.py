@@ -107,14 +107,12 @@ def run_yolo_training(
     return best_weights
 
 def run_full_pipeline(use_negatives: bool, run_name: str, **train_kwargs) -> Path:
-    """Executes the setup, training, and subsequent test evaluation pipeline with dynamic parameters."""
-    from src.processing.evaluation import evaluate_model
+    """Prepares the dataset and returns the trained weights."""
     
     if not EXTRACTED_DATA_DIR.exists():
         raise FileNotFoundError(f"Dataset path {EXTRACTED_DATA_DIR} does not exist.")
         
     yaml_path = prepare_yolo_dataset(EXTRACTED_DATA_DIR, WORKING_DIR, run_name, use_negatives)
     best_weights = run_yolo_training(yaml_path, run_name, **train_kwargs)
-    evaluate_model(best_weights, yaml_path, run_name)
     
     return best_weights
