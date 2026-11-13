@@ -166,7 +166,7 @@ def verify_run_inputs(recorded, current):
 
 def main():
     import subprocess
-    import torch
+    from src.utils.embedding_io import load_embedding_file
 
     from src.config import (
         EMBEDDINGS_DIR,
@@ -251,10 +251,8 @@ def main():
         verify_run_inputs(recorded, metadata)
 
     embeddings = {
-        category: torch.load(
-            EMBEDDINGS_DIR / version / f"train_{category}s_embeddings.pt",
-            map_location="cpu",
-            weights_only=False,
+        category: load_embedding_file(
+            EMBEDDINGS_DIR / version / f"train_{category}s_embeddings.pt"
         )
         for category in CATEGORY_DIRS
     }

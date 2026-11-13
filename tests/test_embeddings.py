@@ -6,6 +6,7 @@ import hashlib
 import sys
 from src.processing import embeddings
 from src.processing.manifests import write_manifest
+from src.utils.embedding_io import load_embedding_file
 import json
 from types import SimpleNamespace
 import hashlib
@@ -71,8 +72,8 @@ def test_generation_uses_only_active_train_rows(bundle, category, expected):
         num_workers=0,
     )
 
-    result = torch.load(output, weights_only=False)
-
+    result = load_embedding_file(output)
+    
     assert set(result) == {expected}
 
     vector = result[expected]

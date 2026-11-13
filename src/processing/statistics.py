@@ -8,6 +8,7 @@ from src.processing.video import get_video_metadata
 from src.processing.dataset import extract_metadata_from_filename, parse_frame_filename_logic
 from src.utils.visualization import plot_theta_analysis_dashboard
 from src.processing.clustering import k_center_greedy_threshold
+from src.utils.embedding_io import load_embedding_file
 from pathlib import Path
 from PIL import Image
 import cv2
@@ -621,7 +622,7 @@ def load_and_verify_embeddings(repo_id: str, filename: str, token: str | None = 
 
     print("\n2. Loading embeddings file into memory...")
     try:
-        embeddings = torch.load(file_path, map_location="cpu", weights_only=False)
+        embeddings = load_embedding_file(file_path)
     except Exception as e:
         print(f"Error loading PyTorch file: {e}")
         return None

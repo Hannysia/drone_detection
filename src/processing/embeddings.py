@@ -28,6 +28,7 @@ from src.config import (
 )
 from src.processing.manifests import CATEGORY_DIRS, read_manifest
 from src.utils.io import check_extraction_source
+from src.utils.embedding_io import load_embedding_file
 
 IMAGE_TRANSFORM = transforms.Compose([
     transforms.Resize(
@@ -437,11 +438,7 @@ def validate_embeddings(
 
     for category in CATEGORY_DIRS:
         path = output_dir / f"train_{category}s_embeddings.pt"
-        data = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False,
-        )
+        data = load_embedding_file(path)
         expected = {
             row["filename"]
             for row in rows

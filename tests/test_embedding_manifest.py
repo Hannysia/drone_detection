@@ -176,9 +176,9 @@ def cli_setup(tmp_path, monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "torch",
+        "src.utils.embedding_io",
         SimpleNamespace(
-            load=lambda path, **kwargs: embeddings[
+            load_embedding_file=lambda path: embeddings[
                 "negative" if "negatives" in path.name else "positive"
             ],
         ),
