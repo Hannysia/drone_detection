@@ -7,6 +7,7 @@ import zipfile
 import numpy as np
 import yaml
 from src.processing.video import get_video_metadata
+from io import BytesIO
 
 log = logging.getLogger(__name__)
 
@@ -106,26 +107,36 @@ def prepare_trackeval_sequence(
         f"frameRate={int(fps)}\nseqLength={length}\n"
         f"imWidth={width}\nimHeight={height}\nimExt=.jpg\n"
     )
-    with open(seqinfo_path, "w", encoding="utf-8") as f:
-        f.write(seqinfo_content)
-        
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        gt_file_in_zip = next((name for name in zip_ref.namelist() if name.endswith("gt.txt")), None)
-        
-        if gt_file_in_zip:
-            with zip_ref.open(gt_file_in_zip) as f_stream:
-                gt_data = np.loadtxt(f_stream, delimiter=',')
-            
-            if gt_data.ndim == 2:
-                gt_data[:, 7] = 1
-            elif gt_data.ndim == 1:
-                gt_data[7] = 1
-            
-            target_gt_path = seq_gt_dir / "gt.txt"
-            np.savetxt(target_gt_path, gt_data, fmt='%d,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f')
-        else:
-            log.warning(f"Warning: gt.txt was not found inside {zip_path.name}")
+    
+    with zipfile.ZipFile(zip_path) as archive:
+        entries = [
+            entry
+            for entry in archive.infolist()
+            if not entry.is_dir() and Path(entry.filename).name == "gt.txt"
+        ]
+        if len(entries) != 1:
+            raise ValueError(
+                f"{zip_path}: expected exactly one gt.txt, found {len(entries)}"
+            )
+        contents = archive.read(entries[0])
 
+    target = seq_gt_dir / "gt.txt"
+
+    if contents.strip():
+        data = np.loadtxt(BytesIO(contents), delimiter=",", ndmin=2)
+        if data.shape[1] != 9:
+            raise ValueError(f"{zip_path}: expected 9 columns in gt.txt")
+
+        data[:, 7] = 1
+        np.savetxt(
+            target,
+            data,
+            fmt="%d,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f",
+        )
+    else:
+        target.write_bytes(b"")
+
+    seqinfo_path.write_text(seqinfo_content, encoding="utf-8")
 
 def list_trash_folders_logic(trash_dir: Path) -> None:
     """Lists all available trash folders and file counts."""
