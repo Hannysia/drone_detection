@@ -7,20 +7,41 @@ from huggingface_hub import hf_hub_download
 from src.utils.geometry import mot_to_yolo
 import json
 import re
+import math
 
 from src.processing.frame_alignment import build_frame_mapping
 
 def parse_annotations(gt_file_path: Path) -> dict[int, list[list[float]]]:
-    """Parses ground truth MOT annotations file."""
     annotations = {}
-    with open(gt_file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            parts = line.strip().split(',')
-            if len(parts) < 6:
+
+    with gt_file_path.open(encoding="utf-8") as stream:
+        for number, line in enumerate(stream, start=1):
+            if not line.strip():
                 continue
-            f_id = int(parts[0])
-            bbox = [float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])]
-            annotations.setdefault(f_id, []).append(bbox)
+
+            fields = line.split(",")
+            location = f"{gt_file_path}:{number}"
+
+            if len(fields) < 6:
+                raise ValueError(
+                    f"{location}: expected at least 6 MOT fields, got {len(fields)}"
+                )
+
+            try:
+                frame = int(fields[0])
+                bbox = [float(value) for value in fields[2:6]]
+            except ValueError as exc:
+                raise ValueError(
+                    f"{location}: invalid frame ID or bounding box number"
+                ) from exc
+
+            if frame < 1 or not all(map(math.isfinite, bbox)) or min(bbox[2:]) <= 0:
+                raise ValueError(
+                    f"{location}: invalid frame ID or bounding box dimensions"
+                )
+
+            annotations.setdefault(frame, []).append(bbox)
+
     return annotations
 
 

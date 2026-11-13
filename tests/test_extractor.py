@@ -3,30 +3,45 @@ from pathlib import Path
 from src.processing.extractor import parse_annotations, select_annotation_zips
 from src.processing import extractor
 
-def test_parse_annotations_standard_and_invalid_lines(tmp_path):
-    mock_gt_file = tmp_path / "gt_mock.txt"
-    
-    gt_content = (
+
+
+def test_parse_annotations_groups_valid_rows(tmp_path):
+    path = tmp_path / "gt.txt"
+    path.write_text(
         "1,1,100.0,150.0,50.0,60.0,1,1,1\n"
         "1,2,200.0,250.0,30.0,40.0,1,1,1\n"
         "2,1,105.0,155.0,50.0,60.0,1,1,1\n"
-        "3,1,10.0\n"
+        "   \n",
+        encoding="utf-8",
     )
-    mock_gt_file.write_text(gt_content, encoding="utf-8")
 
-    result = parse_annotations(mock_gt_file)
+    assert parse_annotations(path) == {
+        1: [
+            [100.0, 150.0, 50.0, 60.0],
+            [200.0, 250.0, 30.0, 40.0],
+        ],
+        2: [[105.0, 155.0, 50.0, 60.0]],
+    }
 
-    assert len(result) == 2
-    assert 1 in result
-    assert 2 in result
-    assert 3 not in result
-    
-    assert len(result[1]) == 2
-    assert result[1][0] == [100.0, 150.0, 50.0, 60.0]
-    assert result[1][1] == [200.0, 250.0, 30.0, 40.0]
-    
-    assert len(result[2]) == 1
-    assert result[2][0] == [105.0, 155.0, 50.0, 60.0]
+
+@pytest.mark.parametrize(
+    ("row", "reason"),
+    [
+        ("3,1,10", "expected at least 6 MOT fields"),
+        ("abc,1,10,20,30,40", "invalid frame ID or bounding box number"),
+        ("1,1,10,20,bad,40", "invalid frame ID or bounding box number"),
+        ("1,1,nan,20,30,40", "invalid frame ID or bounding box dimensions"),
+        ("1,1,10,20,0,40", "invalid frame ID or bounding box dimensions"),
+    ],
+)
+def test_parse_annotations_reports_invalid_row(tmp_path, row, reason):
+    path = tmp_path / "gt.txt"
+    path.write_text(f"1,1,10,20,30,40\n\n{row}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        parse_annotations(path)
+
+    assert f"{path}:3: {reason}" in str(error.value)
 
 
 
