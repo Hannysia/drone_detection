@@ -1,14 +1,26 @@
+import os
 import subprocess
-import sys
 
-def run_cmd(cmd: str) -> str:
-    """Executes a terminal command and returns combined stdout and stderr."""
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(
-            f"❌ Command execution error (exit code {result.returncode})\n"
-            f"STDERR: {result.stderr}\n"
-            f"STDOUT: {result.stdout}"
-        )
-        sys.exit(1)
-    return result.stdout + "\n" + result.stderr
+
+def run_cmd(args: list[str], *, password: str) -> str:
+    env = os.environ.copy()
+    env.pop("CVAT_ACCESS_TOKEN", None)
+    env.pop("CVAT_PASS", None)
+    env["PASS"] = password
+
+    result = subprocess.run(
+        args,
+        shell=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + "\n" + result.stderr
+
+    if result.returncode:
+        output = output.replace(password, "[REDACTED]")
+        print(f"Command failed (exit code {result.returncode})\n{output}")
+        raise SystemExit(1)
+
+    return output

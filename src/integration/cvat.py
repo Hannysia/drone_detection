@@ -23,6 +23,22 @@ ANNOTATION_SOURCES = {
 CURATED_LABELS_ROOT = "labels_curated"
 
 
+def run_cvat(args: list[str]) -> str:
+    if not CVAT_USER or ":" in CVAT_USER or not CVAT_PASS:
+        raise ValueError("Configure CVAT_USER (without a colon) and CVAT_PASS")
+
+    return run_cmd(
+        [
+            "cvat-cli",
+            "--server-host", CVAT_HOST,
+            "--server-port", str(CVAT_PORT),
+            "--auth", CVAT_USER,
+            *args,
+        ],
+        password=CVAT_PASS,
+    )
+
+
 def curated_annotation_path(
     version: str,
     split: str,
@@ -197,31 +213,26 @@ def pull_batch_to_cvat(split: str, batch_name: str, annotation_source: str, vers
 
         log.info(f"🚀 Creating a CVAT task for {base_name}...")
         
-        create_cmd = (
-            f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
-            f'--auth {CVAT_USER}:{CVAT_PASS} create "{task_name}" '
-            f'--labels "[{{\\"name\\": \\"pedestrian\\\"}}, {{\\"name\\": \\"drone\\\"}}]" '
-            f'local "{local_video_path}"'
-        )
-        output = run_cmd(create_cmd)
+        output = run_cvat([
+            "create", task_name,
+            "--labels", json.dumps([{"name": "pedestrian"}, {"name": "drone"}]),
+            "local", str(local_video_path),
+        ])
         
         match = re.search(r'(?i)ID[\s:]*(\d+)', output)
         if not match:
             raise RuntimeError(
                 f"Could not determine Task ID for {task_name}. "
-                f"Check CVAT before retrying. "
-                f"CLI output: {output.strip()}"
+                "Check CVAT before retrying."
             )
             
         task_id = match.group(1)
         log.info(f"✅ Task created! Task ID: {task_id}")
 
         log.info(f"📦 Uploading {annotation_source} annotations to task...")
-        upload_cmd = (
-            f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
-            f'--auth {CVAT_USER}:{CVAT_PASS} upload {task_id} "{local_zip_path}" --format "MOT 1.1"'
-        )
-        run_cmd(upload_cmd)
+        run_cvat([
+            "upload", task_id, str(local_zip_path), "--format", "MOT 1.1",
+        ])
         
         log.info(f"🎉 Done: http://{CVAT_HOST}:{CVAT_PORT}/tasks/{task_id}")
 
@@ -400,13 +411,9 @@ def push_batch_to_hf(
         staging_archive = Path(staging_dir) / archive_path.name
         staging_review = Path(staging_dir) / review_path.name
 
-        dump_cmd = (
-            f'cvat-cli --server-host {CVAT_HOST} --server-port {CVAT_PORT} '
-            f'--auth {CVAT_USER}:{CVAT_PASS} dump {task_id} '
-            f'"{staging_archive}" --format "MOT 1.1"'
-        )
-
-        run_cmd(dump_cmd)
+        run_cvat([
+            "dump", str(task_id), str(staging_archive), "--format", "MOT 1.1",
+        ])
 
         if not zipfile.is_zipfile(staging_archive):
             raise ValueError(

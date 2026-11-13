@@ -128,14 +128,9 @@ def test_push_uploads_both_files(
 
     
     def fake_run(command):
-        match = re.search(
-            r'dump \d+ "([^"]+)" --format "MOT 1\.1"',
-            command,
-        )
-
-        assert match is not None
-
-        archive_path = Path(match.group(1))
+        assert command[:2] == ["dump", "695"]
+        assert command[3:] == ["--format", "MOT 1.1"]
+        archive_path = Path(command[2])
 
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr(
@@ -145,7 +140,7 @@ def test_push_uploads_both_files(
 
         return ""
 
-    monkeypatch.setattr(cvat, "run_cmd", fake_run)
+    monkeypatch.setattr(cvat, "run_cvat", fake_run)
 
     cvat.push_batch_to_hf(
         "695",
@@ -239,14 +234,9 @@ def test_push_recovers_after_failed_upload(
     export_calls = []
 
     def fake_run(command):
-        match = re.search(
-            r'dump \d+ "([^"]+)" --format "MOT 1\.1"',
-            command,
-        )
-
-        assert match is not None
-
-        archive_path = Path(match.group(1))
+        assert command[:2] == ["dump", "695"]
+        assert command[3:] == ["--format", "MOT 1.1"]
+        archive_path = Path(command[2])
         export_calls.append(archive_path)
 
         with zipfile.ZipFile(archive_path, "w") as archive:
@@ -257,7 +247,7 @@ def test_push_recovers_after_failed_upload(
 
         return ""
 
-    monkeypatch.setattr(cvat, "run_cmd", fake_run)
+    monkeypatch.setattr(cvat, "run_cvat", fake_run)
 
     args = ("695", "test", "batch_004", "v1")
 

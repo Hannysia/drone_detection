@@ -52,7 +52,7 @@ def test_pull_skips_completed_video_on_hf(
     )
     monkeypatch.setattr(
         cvat,
-        "run_cmd",
+        "run_cvat",
         forbidden,
     )
 
@@ -98,7 +98,7 @@ def test_pull_rejects_incomplete_hf_result(
     )
     monkeypatch.setattr(
         cvat,
-        "run_cmd",
+        "run_cvat",
         forbidden,
     )
 
@@ -153,7 +153,7 @@ def test_v1_completion_does_not_block_v2(
     )
     monkeypatch.setattr(
         cvat,
-        "run_cmd",
+        "run_cvat",
         forbidden,
     )
 

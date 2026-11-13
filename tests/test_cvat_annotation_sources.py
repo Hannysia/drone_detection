@@ -2,7 +2,7 @@
 import pytest
 
 from src.integration import cvat
-
+from pathlib import Path
 
 @pytest.mark.parametrize(
     ("source", "directory", "suffix"),
@@ -50,12 +50,12 @@ def test_pull_batch_selects_annotation_source(
     def fake_run(command):
         commands.append(command)
 
-        if " create " in command:
+        if "create" in command:
             return f"Task ID: {next(task_ids)}"
 
         return ""
 
-    monkeypatch.setattr(cvat, "run_cmd", fake_run)
+    monkeypatch.setattr(cvat, "run_cvat", fake_run)
 
     cvat.pull_batch_to_cvat(
         split="val",
@@ -67,13 +67,13 @@ def test_pull_batch_selects_annotation_source(
     creates = [
         command
         for command in commands
-        if " create " in command
+        if "create" in command
     ]
 
     uploads = [
         command
         for command in commands
-        if " upload " in command
+        if "upload" in command
     ]
 
     assert len(creates) == 2
@@ -86,7 +86,7 @@ def test_pull_batch_selects_annotation_source(
         )
 
         assert any(
-            archive in command
+            Path(command[2]).as_posix().endswith(archive)
             for command in uploads
         )
 

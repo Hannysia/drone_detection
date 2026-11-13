@@ -100,12 +100,12 @@ def test_pull_skips_existing_and_imports_missing(
     def fake_run_cmd(command):
         commands.append(command)
 
-        if " create " in command:
+        if command[0] == "create":
             return "Task ID: 700"
 
         return "Upload successful"
 
-    monkeypatch.setattr(cvat, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cvat, "run_cvat", fake_run_cmd)
 
     cvat.pull_batch_to_cvat(
         "train",
@@ -125,9 +125,9 @@ def test_pull_skips_existing_and_imports_missing(
     ]
 
     assert len(commands) == 2
-    assert " create " in commands[0]
+    assert commands[0][0] == "create"
     assert "fresh_train" in commands[0]
-    assert " upload 700 " in commands[1]
+    assert commands[1][:2] == ["upload", "700"]
 
 
 def test_pull_stops_if_cvat_lookup_fails(
@@ -159,7 +159,7 @@ def test_pull_stops_if_cvat_lookup_fails(
 
     monkeypatch.setattr(
         cvat,
-        "run_cmd",
+        "run_cvat",
         forbidden_command,
     )
 
@@ -200,7 +200,7 @@ def test_existing_task_warns_about_unverified_import(
         pytest.fail("Existing CVAT task must not be modified")
 
     monkeypatch.setattr(cvat, "hf_hub_download", forbidden)
-    monkeypatch.setattr(cvat, "run_cmd", forbidden)
+    monkeypatch.setattr(cvat, "run_cvat", forbidden)
 
     with caplog.at_level(logging.WARNING, logger=cvat.log.name):
         cvat.pull_batch_to_cvat(

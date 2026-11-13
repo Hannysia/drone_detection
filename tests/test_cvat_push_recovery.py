@@ -1,6 +1,5 @@
 
 import json
-import re
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,13 +81,9 @@ def push_env(monkeypatch, tmp_path):
     def successful_dump(command):
         dump_calls.append(command)
 
-        match = re.search(
-            r'dump 695 "([^"]+)" --format "MOT 1\.1"',
-            command,
-        )
-
-        assert match is not None
-        archive_path = Path(match.group(1))
+        assert command[:2] == ["dump", "695"]
+        assert command[3:] == ["--format", "MOT 1.1"]
+        archive_path = Path(command[2])
 
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr(
@@ -98,7 +93,7 @@ def push_env(monkeypatch, tmp_path):
 
         return ""
 
-    monkeypatch.setattr(cvat, "run_cmd", successful_dump)
+    monkeypatch.setattr(cvat, "run_cvat", successful_dump)
 
     export_dir = (
         tmp_path / "exports" / "v1" / "test" / "batch_004"
@@ -135,15 +130,13 @@ def test_interrupted_dump_preserves_existing_local_files_and_retries(
         attempts += 1
 
         if attempts == 1:
-            match = re.search(r'dump 695 "([^"]+)"', command)
-            assert match is not None
-
-            Path(match.group(1)).write_bytes(b"incomplete ZIP")
+            assert command[:2] == ["dump", "695"]
+            Path(command[2]).write_bytes(b"incomplete ZIP")
             raise SystemExit(1)
 
         return push_env.successful_dump(command)
 
-    monkeypatch.setattr(cvat, "run_cmd", interrupted_dump)
+    monkeypatch.setattr(cvat, "run_cvat", interrupted_dump)
 
     with pytest.raises(SystemExit) as error:
         cvat.push_batch_to_hf(*ARGS)

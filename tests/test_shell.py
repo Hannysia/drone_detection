@@ -1,69 +1,44 @@
-
-import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-from src.utils.shell import run_cmd
+from src.integration import cvat
+from src.utils import shell
 
 
-@pytest.mark.parametrize(
-    "operation",
-    ["create", "upload", "dump"],
-)
-def test_run_cmd_stops_on_cli_failure(monkeypatch, operation):
-    command = f"cvat-cli {operation}"
+@pytest.mark.parametrize("operation", ["create", "upload", "dump"])
+@pytest.mark.parametrize("status", [0, 2])
+def test_cvat_cli_credentials(monkeypatch, capsys, operation, status):
+    secret = "example-password"
+    path = "folder with spaces/file.zip"
 
-    def fake_run(cmd, **kwargs):
-        assert cmd == command
-        assert kwargs["capture_output"] is True
-        assert kwargs["text"] is True
+    monkeypatch.setattr(cvat, "CVAT_USER", "reviewer")
+    monkeypatch.setattr(cvat, "CVAT_PASS", secret)
+
+    def fake_run(args, *, shell, env, capture_output, text):
+        assert shell is False
+        assert args[args.index("--auth"):] == [
+            "--auth", "reviewer", operation, path,
+        ]
+        assert secret not in repr(args)
+        assert env["PASS"] == secret
 
         return SimpleNamespace(
-            returncode=2,
-            stdout="",
-            stderr=f"{operation} failed",
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    with pytest.raises(SystemExit) as exc:
-        run_cmd(command)
-
-    assert exc.value.code == 1
-
-
-def test_run_cmd_returns_output_on_success(monkeypatch):
-    def fake_run(cmd, **kwargs):
-        return SimpleNamespace(
-            returncode=0,
+            returncode=status,
             stdout="Task ID: 700",
-            stderr="",
+            stderr=secret if status else "",
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(shell.subprocess, "run", fake_run)
 
-    assert run_cmd("cvat-cli create") == "Task ID: 700\n"
+    if status:
+        with pytest.raises(SystemExit) as exc:
+            cvat.run_cvat([operation, path])
 
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+    else:
+        output = cvat.run_cvat([operation, path])
 
-def test_run_cmd_does_not_print_credentials(monkeypatch, capsys):
-    secret = "test-secret-do-not-print"
-
-    def fake_run(cmd, **kwargs):
-        return SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="Authentication failed",
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    with pytest.raises(SystemExit):
-        run_cmd(
-            f"cvat-cli --auth user:{secret} upload 695"
-        )
-
-    output = capsys.readouterr().out
-
+    assert "Task ID: 700" in output
     assert secret not in output
-    assert "Authentication failed" in output
