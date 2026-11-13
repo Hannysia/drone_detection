@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 import pandas as pd
-import tqdm
+from tqdm import tqdm
 import cv2
 import numpy as np
 import torch

@@ -1,5 +1,5 @@
 import pytest
-from src.processing.evaluation import evaluate_predictions
+from src.processing.evaluation import evaluate_predictions, run_dataset_predictions_db
 
 def test_evaluate_predictions_empty_preds():
     gt_boxes = [[100.0, 100.0, 200.0, 200.0]]
@@ -49,3 +49,7 @@ def test_evaluate_predictions_greedy_matching_by_confidence():
     assert tp == [0]
     assert fp == [1]
     assert fn == []
+
+
+def test_predictions_db_empty_directory(tmp_path):
+    assert run_dataset_predictions_db(None, tmp_path) == []
