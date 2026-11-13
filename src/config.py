@@ -36,8 +36,6 @@ if IS_KAGGLE:
     FRAME_BASELINE_DIR = WORKING_DIR / "frame_baseline"
     OUTPUT_DIR = WORKING_DIR / "runs" / "detect" 
     EMBEDDINGS_DIR = Path("/kaggle/working/embeddings")
-
-
     
     MOT_DATASET_DIR = WORKING_DIR / "drone_mot_dataset"
     SEQMAPS_DIR = MOT_DATASET_DIR / "seqmaps"
@@ -52,61 +50,52 @@ else:
     from dotenv import load_dotenv
     load_dotenv()
 
-    IOU_THRESHOLD = 0.95
-    THETA_1_wv_pos = 0.10 
-    THETA_2_wv_pos = 0.538
-    THETA_1_wv_neg = 0.020
-    THETA_2_wv_neg = 0.025
-    HASH_THRESHOLD = 5
-    MIN_BBOX_AREA = 256.0
-    FORCE_CLASS_ID = "0"
+    _PATH_ENV = {
+        "LOCAL_BASE_DIR": "LOCAL_BASE_DIR",
+        "EMBEDDINGS_DIR": "EMBEDDINGS_DIR",
+        "EXTRACTED_DATA_DIR": "EXTRACTED_DATA_PATH",
+        "TRASH_DIR": "TRASH_DIR",
+        "MT_TRASH_DIR": "MT_TRASH_DIR",
+        "SOURCE_ROOT": "SOURCE_ROOT",
+        "CLASSIFIED_DIR": "CLASSIFIED_DIR",
+        "KEY_JSON_PATH": "KEY_JSON_PATH",
+        "RENAMED_DIR": "RENAMED_DIR",
+        "SPLIT_OUTPUT_DIR": "SPLIT_OUTPUT_DIR",
+        "LABELS_DIR": "LABELS_DIR",
+        "TRACKEVAL_DIR": "TRACKEVAL_DIR",
+        "DUPLICATES_DIR": "DUPLICATES_DIR",
+    }
+
+    _BASE_CHILDREN = {
+        "FRAME_BASELINE_DIR": "frame_baseline",
+        "WORKING_DIR": "working",
+        "OUTPUT_DIR": "extracted_dataset",
+        "LOG_FILE": "processed_videos.log",
+        "TMP_DIR": "tmp",
+    }
+
+    def __getattr__(name: str) -> Path:
+        child = _BASE_CHILDREN.get(name)
+        key = "LOCAL_BASE_DIR" if child is not None else _PATH_ENV.get(name)
+
+        if key is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+        value = os.getenv(key)
+        if not value or not value.strip():
+            raise ValueError(f"Set {key} in the environment or .env to use {name}")
+
+        path = Path(value)
+        return path / child if child is not None else path
 
     REPO_ID = os.getenv("REPO_ID")
     HF_TOKEN = os.getenv("HF_TOKEN")
-    LOCAL_BASE_DIR = Path(os.getenv("LOCAL_BASE_DIR"))
-    FRAME_BASELINE_DIR = LOCAL_BASE_DIR / "frame_baseline"
 
-    WORKING_DIR = LOCAL_BASE_DIR / "working"
-
-
-    OUTPUT_DIR = LOCAL_BASE_DIR / "extracted_dataset"
-    LOG_FILE = LOCAL_BASE_DIR / "processed_videos.log"
-    TMP_DIR = LOCAL_BASE_DIR / "tmp"
-
-    EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR"))
-
-    EXTRACTED_DATA_DIR = Path(os.getenv("EXTRACTED_DATA_PATH"))
-    TRASH_DIR = Path(os.getenv("TRASH_DIR"))
-
-    MIN_BBOX_AREA = float(os.getenv("MIN_BBOX_AREA", 256.0))
-    MT_TRASH_DIR = Path(os.getenv("MT_TRASH_DIR"))
-
-
-    SAMPLE_EVERY = {
-        ("val",  "positives"): 4,
-        ("val",  "negatives"): 1,
-        ("test", "positives"): 3,
-        ("test", "negatives"): 1,
-    }
-
-    CAP_PER_VIDEO = {
-        ("val",  "positives"): None,
-        ("val",  "negatives"): 25,
-        ("test", "positives"): None,
-        ("test", "negatives"): 45,
-    }
-
-    SOURCE_ROOT = Path(os.getenv("SOURCE_ROOT"))
-    CLASSIFIED_DIR = Path(os.getenv("CLASSIFIED_DIR"))
+    HASH_THRESHOLD = 5
     SAVE_DEBUG_FRAMES = False
-    KEY_JSON_PATH = Path(os.getenv("KEY_JSON_PATH"))
-    RENAMED_DIR = Path(os.getenv("RENAMED_DIR"))
-    SPLIT_OUTPUT_DIR = Path(os.getenv("SPLIT_OUTPUT_DIR"))
+    FORCE_CLASS_ID = os.getenv("FORCE_CLASS_ID", "0")
+
     CVAT_HOST = os.getenv("CVAT_HOST", "localhost")
     CVAT_PORT = os.getenv("CVAT_PORT", "8080")
-    LABELS_DIR = Path(os.getenv("LABELS_DIR"))
     CVAT_USER = os.getenv("CVAT_USER")
     CVAT_PASS = os.getenv("CVAT_PASS")
-    TRACKEVAL_DIR = Path(os.getenv("TRACKEVAL_DIR"))
-    DUPLICATES_DIR = Path(os.getenv("DUPLICATES_DIR"))
-    FORCE_CLASS_ID = os.getenv("FORCE_CLASS_ID", "0")
