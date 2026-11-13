@@ -408,6 +408,7 @@ def prepare_yolo_dataset(IMG_DATASET_PATH: Path, working_dir: Path, run_name: st
     log.info(f"\n[DATA PREPARATION] Setting up dataset directories for run: {run_name}")
     
     run_data_dir = working_dir / f"yolo_dataset_{run_name}"
+    run_data_dir.mkdir(parents=True, exist_ok=False)
     
     for split in ["train", "val", "test"]:
         (run_data_dir / "images" / split).mkdir(parents=True, exist_ok=True)
