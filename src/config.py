@@ -22,16 +22,11 @@ if IS_KAGGLE:
     HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
     
     KAGGLE_INPUT_DIR = Path("/kaggle/input")
-    parent_dir = KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh"
-    
     IMG_DATASET_NAME = "uav-detection-dataset"
-    
-    if parent_dir.exists():
-        attached_datasets = [d.name for d in parent_dir.iterdir() if d.is_dir()]
-        if attached_datasets:
-            IMG_DATASET_NAME = attached_datasets[0]
-            
-    EXTRACTED_DATA_DIR = parent_dir / IMG_DATASET_NAME / "extracted_dataset"
+    EXTRACTED_DATA_DIR = (
+        KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh"
+        / IMG_DATASET_NAME / "extracted_dataset"
+    )
     WORKING_DIR = Path("/kaggle/working")
     FRAME_BASELINE_DIR = WORKING_DIR / "frame_baseline"
     OUTPUT_DIR = WORKING_DIR / "runs" / "detect" 
