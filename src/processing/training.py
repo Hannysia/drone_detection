@@ -9,19 +9,6 @@ from src.processing.dataset import prepare_yolo_dataset
 
 log = logging.getLogger(__name__)
 
-def find_run_best_weights(run_name: str) -> Path:
-    """Dynamically locates the best weights file for a specific execution run."""
-    search_pattern = f"{run_name}*/weights/best.pt"
-    found_weights = sorted(list(OUTPUT_DIR.glob(search_pattern)))
-    
-    if found_weights:
-        best_weights = found_weights[-1]
-        log.info(f"[INFO] Dynamically detected best weights at: {best_weights.resolve()}")
-        return best_weights
-    else:
-        best_weights = OUTPUT_DIR / run_name / "weights" / "best.pt"
-        log.warning(f"[WARNING] Dynamic search failed. Defaulting to: {best_weights.resolve()}")
-        return best_weights
 
 def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
     """Uploads model weights to Hugging Face repository under an isolated path."""
@@ -90,7 +77,9 @@ def run_yolo_training(
     default_args.update(train_kwargs)
     results = model.train(data=str(yaml_path), **default_args)
 
-    best_weights = find_run_best_weights(run_name)
+    best_weights = Path(model.trainer.best)
+    if not best_weights.is_file():
+        raise FileNotFoundError(f"Checkpoint missing after training: {best_weights}")
 
     if results is not None and hasattr(results, "results_dict"):
         metrics = results.results_dict

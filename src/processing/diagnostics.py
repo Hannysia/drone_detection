@@ -168,37 +168,27 @@ def run_shortcut_analysis(
     output_dir = Path(output_dir_path) / run_name
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    resolved_weights_path = None
-    hf_file_name = f"models/yolo26n_{run_name}_best.pt"
+    resolved_weights_path = Path(weights_path)
+    if not resolved_weights_path.is_file():
+        hf_file_name = f"models/yolo26n_{run_name}_best.pt"
+        if REPO_ID and HF_TOKEN:
+            try:
+                resolved_weights_path = Path(hf_hub_download(
+                    repo_id=REPO_ID,
+                    filename=hf_file_name,
+                    repo_type="dataset",
+                    token=HF_TOKEN,
+                ))
+            except Exception as exc:
+                log.warning("Could not fetch %s: %s", hf_file_name, exc)
 
-    if REPO_ID and HF_TOKEN:
-        log.info(f"[INFO] Attempting download from HF Hub: {hf_file_name}")
-        try:
-            downloaded = hf_hub_download(
-                repo_id=REPO_ID,
-                filename=hf_file_name,
-                repo_type="dataset",
-                token=HF_TOKEN
+        if not resolved_weights_path.is_file():
+            resolved_weights_path = (
+                WORKING_DIR / "runs/detect/yolo26_shortcut_analysis"
+                / run_name / "weights" / "best.pt"
             )
-            resolved_weights_path = Path(downloaded)
-            log.info(f"[SUCCESS] Weights downloaded to secure cache: {resolved_weights_path}")
-        except Exception as e:
-            log.warning(f"[WARNING] Could not fetch from Hugging Face Hub: {e}")
-
-    if resolved_weights_path is None or not resolved_weights_path.exists():
-        direct_path = Path(weights_path)
-        if direct_path.exists():
-            resolved_weights_path = direct_path
-        else:
-            log.info("[INFO] Fallback searching local directories...")
-            search_pattern = f"runs/detect/yolo26_shortcut_analysis/{run_name}*/weights/best.pt"
-            found_weights = sorted(list(WORKING_DIR.glob(search_pattern)))
-            if found_weights:
-                resolved_weights_path = found_weights[-1]
-                log.info(f"[SUCCESS] Local checkpoint located: {resolved_weights_path}")
-            else:
-                log.error("❌ [ERROR] Could not resolve any valid 'best.pt' file.")
-                return
+            if not resolved_weights_path.is_file():
+                raise FileNotFoundError(f"No checkpoint found for run {run_name!r}")
 
     model, pytorch_model = load_eval_model(str(resolved_weights_path), device)
     target_layer, _ = find_sppf_layer(pytorch_model)
