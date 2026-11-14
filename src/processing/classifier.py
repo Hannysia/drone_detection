@@ -3,7 +3,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
-def classify_single_video(client: genai.Client, frames: list[Image.Image]) -> dict | None:
+def classify_single_video(client: genai.Client, frames: list[Image.Image]) -> dict:
     """Sends extracted frames to Gemini API for morphological classification."""
     prompt = """
         You are an expert in computer vision and military UAV reconnaissance. You have been provided with a chronological sequence of several frames from a SINGLE video recording.
@@ -47,14 +47,24 @@ def classify_single_video(client: genai.Client, frames: list[Image.Image]) -> di
             "background": "field"
         }
     """
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=[prompt, *frames],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+        ),
+    )
+
+    text = response.text
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Gemini returned no response text")
+
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-pro',
-            contents=[prompt, *frames],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        return json.loads(response.text)
-    except Exception:
-        return None
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Gemini returned invalid JSON") from exc
+
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Expected a non-empty JSON object from Gemini")
+
+    return data

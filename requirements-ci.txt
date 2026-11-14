@@ -13,3 +13,4 @@ requests
 tqdm
 huggingface-hub
 ultralytics
+google-genai==2.9.0

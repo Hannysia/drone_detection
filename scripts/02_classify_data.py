@@ -71,10 +71,6 @@ def main() -> None:
                     pil_img.save(debug_dir / f"frame_{i:03d}.png")
                     
             classification = classify_single_video(client, frames)
-            if not classification:
-                tqdm.write(f" [!] Empty API response for: {video_path.name}")
-                error_count += 1
-                continue
                 
             target = classification.get("target_shape", "unknown")
             camera = classification.get("camera_type", "unknown")
@@ -91,7 +87,7 @@ def main() -> None:
             time.sleep(4.0)
             
         except Exception as e:
-            tqdm.write(f" [CRITICAL ERROR] Failed file {video_path.name}: {e}")
+            tqdm.write(f" [CRITICAL ERROR] Failed file {video_path.name}: {type(e).__name__}: {e}")
             error_count += 1
             continue
 
