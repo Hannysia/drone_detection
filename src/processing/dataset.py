@@ -8,6 +8,11 @@ import numpy as np
 import yaml
 from src.processing.video import get_video_metadata
 from io import BytesIO
+from collections import Counter
+from tempfile import TemporaryDirectory
+
+from src.config import MANIFESTS_DIR, SPLITS
+from src.processing.manifests import CATEGORY_DIRS, read_manifest
 
 log = logging.getLogger(__name__)
 
@@ -414,57 +419,76 @@ def safe_symlink(src: Path, dst: Path) -> None:
     except FileExistsError:
         pass
 
-def prepare_yolo_dataset(IMG_DATASET_PATH: Path, working_dir: Path, run_name: str, use_negatives: bool) -> Path:
-    """Prepares isolated directories and creates relative symlinks for images and labels."""
-    log.info(f"\n[DATA PREPARATION] Setting up dataset directories for run: {run_name}")
-    
-    run_data_dir = working_dir / f"yolo_dataset_{run_name}"
-    run_data_dir.mkdir(parents=True, exist_ok=False)
-    
-    for split in ["train", "val", "test"]:
-        (run_data_dir / "images" / split).mkdir(parents=True, exist_ok=True)
-        (run_data_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
-        
-    def process_split(split_name: str) -> None:
-        pos_dir = IMG_DATASET_PATH / split_name / "RAW_POSITIVES"
-        linked_pos_count = 0
-        if pos_dir.exists():
-            for jpg_path in pos_dir.glob("*.jpg"):
-                txt_path = jpg_path.with_suffix(".txt")
-                if txt_path.exists():
-                    dest_img = run_data_dir / "images" / split_name / jpg_path.name
-                    dest_lbl = run_data_dir / "labels" / split_name / txt_path.name
-                    
-                    safe_symlink(jpg_path, dest_img)
-                    safe_symlink(txt_path, dest_lbl)
-                    linked_pos_count += 1
 
-        linked_neg_count = 0
-        if use_negatives:
-            neg_dir = IMG_DATASET_PATH / split_name / "RAW_NEGATIVES"
-            if neg_dir.exists():
-                for jpg_path in neg_dir.glob("*.jpg"):
-                    dest_img = run_data_dir / "images" / split_name / jpg_path.name
-                    safe_symlink(jpg_path, dest_img)
-                    linked_neg_count += 1
 
-        log.info(f"[{split_name.upper()}] Symlinked {linked_pos_count:,} positives and {linked_neg_count:,} negatives.")
-
-    process_split("train")
-    process_split("val")
-    process_split("test")
-
-    yaml_data = {
-        "path": str(run_data_dir.resolve()),
-        "train": "images/train",
-        "val": "images/val",
-        "test": "images/test",
-        "names": {0: "drone"}
-    }
-    
+def prepare_yolo_dataset(
+    IMG_DATASET_PATH: Path,
+    working_dir: Path,
+    run_name: str,
+    use_negatives: bool,
+    *,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+) -> Path:
+    root = IMG_DATASET_PATH.resolve()
+    output = working_dir / f"yolo_dataset_{run_name}"
     yaml_path = working_dir / f"dataset_{run_name}.yaml"
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        yaml.dump(yaml_data, f, default_flow_style=False)
-        
-    log.info(f"[DATA PREPARATION] Created YAML configuration at: {yaml_path}")
+
+    if output.exists() or output.is_symlink() or yaml_path.exists() or yaml_path.is_symlink():
+        raise FileExistsError(f"Dataset output already exists for {run_name}")
+
+    rows = read_manifest(manifest_path)
+    working_dir.mkdir(parents=True, exist_ok=True)
+    counts = Counter()
+
+    with TemporaryDirectory(dir=working_dir) as tmp:
+        staged = Path(tmp) / "dataset"
+        for split in SPLITS:
+            for kind in ("images", "labels"):
+                (staged / kind / split).mkdir(parents=True)
+
+        for row in rows:
+            split, category = row["split"], row["category"]
+            if row["excluded_at"]:
+                continue
+            if split == "train" and category == "negative" and not use_negatives:
+                continue
+
+            image = root / split / CATEGORY_DIRS[category] / row["filename"]
+            files = [("images", image)]
+            if category == "positive":
+                files.append(("labels", image.with_suffix(".txt")))
+
+            for kind, source in files:
+                if not source.is_file():
+                    raise FileNotFoundError(f"Missing selected file: {source}")
+                destination = staged / kind / split / source.name
+                try:
+                    destination.symlink_to(source)
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) != 1314:
+                        raise
+                    shutil.copy2(source, destination)
+
+            counts[split, category] += 1
+
+        config = {"path": str(output.resolve()), "names": {0: "drone"}}
+        config.update({split: f"images/{split}" for split in SPLITS})
+
+        staged_yaml = Path(tmp) / "dataset.yaml"
+        staged_yaml.write_text(yaml.safe_dump(config), encoding="utf-8")
+        staged.rename(output)
+        try:
+            os.link(staged_yaml, yaml_path)
+        except OSError:
+            shutil.rmtree(output)
+            raise
+
+    for split in SPLITS:
+        log.info(
+            "%s: %d positives, %d negatives",
+            split,
+            counts[split, "positive"],
+            counts[split, "negative"],
+        )
+
     return yaml_path
