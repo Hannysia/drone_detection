@@ -1,0 +1,15 @@
+pytest
+numpy>=2,<2.6
+pandas
+opencv-python
+ImageHash
+Pillow
+matplotlib
+seaborn
+plotly
+PyYAML
+python-dotenv
+requests
+tqdm
+huggingface-hub
+ultralytics
