@@ -1,5 +1,8 @@
 import pytest
 from src.processing.evaluation import evaluate_predictions, run_dataset_predictions_db
+from unittest.mock import Mock
+import cv2
+import numpy as np
 
 def test_evaluate_predictions_empty_preds():
     gt_boxes = [[100.0, 100.0, 200.0, 200.0]]
@@ -52,4 +55,19 @@ def test_evaluate_predictions_greedy_matching_by_confidence():
 
 
 def test_predictions_db_empty_directory(tmp_path):
-    assert run_dataset_predictions_db(None, tmp_path) == []
+    assert run_dataset_predictions_db(None, tmp_path, collection_conf=0.01) == []
+
+
+def test_predictions_db_passes_collection_conf_to_model(tmp_path):
+    folder = tmp_path / "RAW_NEGATIVES"
+    folder.mkdir()
+    assert cv2.imwrite(str(folder / "frame.png"), np.zeros((8, 8, 3), dtype=np.uint8))
+
+    model = Mock()
+    model.predict.return_value = [Mock(boxes=[])]
+
+    rows = run_dataset_predictions_db(model, tmp_path, collection_conf=0.07)
+
+    model.predict.assert_called_once()
+    assert model.predict.call_args.kwargs["conf"] == 0.07
+    assert [row["filename"] for row in rows] == ["frame.png"]

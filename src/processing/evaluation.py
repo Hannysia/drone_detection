@@ -227,19 +227,25 @@ def evaluate_predictions(gt_boxes: list, pred_boxes: list, iou_threshold: float 
     return tp_indices, fp_indices, fn_indices
 
 
-def run_dataset_predictions_db(model: YOLO, test_dir: Path, imgsz: int = 1280) -> list[dict]:
-    """Runs batch predictions at conf 0.01 over test split to build evaluation database."""
-    test_pos_dir = test_dir / "RAW_POSITIVES"
-    test_neg_dir = test_dir / "RAW_NEGATIVES"
+def run_dataset_predictions_db(
+    model: YOLO,
+    split_dir: Path,
+    imgsz: int = 1280,
+    *,
+    collection_conf: float,
+) -> list[dict]:
+    """Collect predictions from split_dir using collection_conf as the minimum confidence."""
+    pos_dir = split_dir / "RAW_POSITIVES"
+    neg_dir = split_dir / "RAW_NEGATIVES"
     
     test_images = []
     for ext in ["*.jpg", "*.png", "*.jpeg"]:
-        if test_pos_dir.exists():
-            test_images.extend([(p, True) for p in test_pos_dir.glob(ext)])
-        if test_neg_dir.exists():
-            test_images.extend([(p, False) for p in test_neg_dir.glob(ext)])
+        if pos_dir.exists():
+            test_images.extend([(p, True) for p in pos_dir.glob(ext)])
+        if neg_dir.exists():
+            test_images.extend([(p, False) for p in neg_dir.glob(ext)])
             
-    log.info(f"Found {len(test_images)} test images to process.")
+    log.info(f"Found {len(test_images)} images to process.")
     
     raw_database = []
     
@@ -265,7 +271,7 @@ def run_dataset_predictions_db(model: YOLO, test_dir: Path, imgsz: int = 1280) -
                             gt_boxes.append([x_min, y_min, x_max, y_max])
 
         device = 0 if torch.cuda.is_available() else "cpu"
-        results = model.predict(img, imgsz=imgsz, verbose=False, device=device)[0]
+        results = model.predict(img, imgsz=imgsz, conf=collection_conf, verbose=False, device=device)[0]
         pred_boxes = []
         for box in results.boxes:
             coords = box.xyxy[0].cpu().numpy()
