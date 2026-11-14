@@ -252,23 +252,38 @@ def run_dataset_predictions_db(
     for img_path, is_positive in tqdm(test_images, desc="Running Evaluation Inference"):
         img = cv2.imread(str(img_path))
         if img is None:
-            continue
+            raise ValueError(f"Unreadable evaluation image: {img_path}")
+
         h_orig, w_orig = img.shape[:2]
-        
         gt_boxes = []
+
         if is_positive:
             txt_path = img_path.with_suffix(".txt")
-            if txt_path.exists():
-                with open(txt_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) == 5:
-                            x_c, y_c, w, h = map(float, parts[1:5])
-                            x_min = (x_c - w / 2.0) * w_orig
-                            y_min = (y_c - h / 2.0) * h_orig
-                            x_max = (x_c + w / 2.0) * w_orig
-                            y_max = (y_c + h / 2.0) * h_orig
-                            gt_boxes.append([x_min, y_min, x_max, y_max])
+
+            with txt_path.open(encoding="utf-8") as labels:
+                for line_no, line in enumerate(labels, start=1):
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    if len(parts) != 5:
+                        raise ValueError(f"{txt_path}:{line_no}: expected 5 YOLO fields")
+
+                    try:
+                        x_c, y_c, w, h = map(float, parts[1:])
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{txt_path}:{line_no}: invalid box coordinates"
+                        ) from exc
+
+                    gt_boxes.append([
+                        (x_c - w / 2) * w_orig,
+                        (y_c - h / 2) * h_orig,
+                        (x_c + w / 2) * w_orig,
+                        (y_c + h / 2) * h_orig,
+                    ])
+
+            if not gt_boxes:
+                raise ValueError(f"Positive image has no annotated boxes: {txt_path}")
 
         device = 0 if torch.cuda.is_available() else "cpu"
         results = model.predict(img, imgsz=imgsz, conf=collection_conf, verbose=False, device=device)[0]

@@ -71,3 +71,47 @@ def test_predictions_db_passes_collection_conf_to_model(tmp_path):
     model.predict.assert_called_once()
     assert model.predict.call_args.kwargs["conf"] == 0.07
     assert [row["filename"] for row in rows] == ["frame.png"]
+    assert rows[0]["gt_boxes"] == []
+
+
+
+@pytest.mark.parametrize("category", ["RAW_POSITIVES", "RAW_NEGATIVES"])
+def test_unreadable_image_stops_evaluation(tmp_path, category):
+    folder = tmp_path / category
+    folder.mkdir()
+    image = folder / "broken.png"
+    image.write_bytes(b"broken")
+    model = Mock()
+
+    with pytest.raises(ValueError) as error:
+        run_dataset_predictions_db(model, tmp_path, collection_conf=0.07)
+
+    assert str(image) in str(error.value)
+    model.predict.assert_not_called()
+
+
+@pytest.mark.parametrize(("content", "error_type"), [
+    (None, FileNotFoundError),
+    ("", ValueError),
+    ("0 0.5 0.5 0.2 0.2\n0 0.5", ValueError),
+    ("0 x 0.5 0.2 0.2", ValueError),
+])
+def test_invalid_positive_label_stops_evaluation(tmp_path, content, error_type):
+    folder = tmp_path / "RAW_POSITIVES"
+    folder.mkdir()
+    image = folder / "frame.png"
+    assert cv2.imwrite(str(image), np.zeros((8, 8, 3), dtype=np.uint8))
+
+    label = image.with_suffix(".txt")
+    if content is not None:
+        label.write_text(content, encoding="utf-8")
+
+    model = Mock()
+    with pytest.raises(error_type) as error:
+        run_dataset_predictions_db(model, tmp_path, collection_conf=0.07)
+
+    if isinstance(error.value, FileNotFoundError):
+        assert error.value.filename == str(label)
+    else:
+        assert str(label) in str(error.value)
+    model.predict.assert_not_called()
