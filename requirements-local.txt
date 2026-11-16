@@ -22,7 +22,6 @@ google-genai==2.9.0
 # Diagnostics & Plotting
 matplotlib==3.11.0            
 seaborn==0.13.2               
-grad-cam==1.5.5              
 
 # Utilities & Development
 python-dotenv==1.2.2         

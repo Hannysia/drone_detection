@@ -35,7 +35,6 @@ ml = [
     "torch>=2.6",
     "torchvision",
     "ultralytics",
-    "grad-cam",
     "accelerate",
     "transformers",
     "boxmot",
