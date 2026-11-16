@@ -2,7 +2,6 @@ import glob
 import os
 import json
 import shutil
-import zipfile
 import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -44,33 +43,6 @@ def read_yolo_bbox(label_path: Path) -> list[float]:
             raise ValueError(f"Label file is empty: {label_path}")
         parts = first_line.split()
     return list(map(float, parts[1:5]))
-
-
-def create_zip_archive(
-    split_name: str, 
-    source_dir: Path, 
-    output_zip_path: Path, 
-    subdirs: list[str]
-) -> bool:
-    """Archives specific format files (.jpg, .txt) from subdirs into a single ZIP file."""
-    log.info(f"[{split_name.upper()}] Archiving files...")
-    
-    file_count = 0
-    with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
-        for subdir in subdirs:
-            target_path = source_dir / subdir
-            if not target_path.exists():
-                log.warning(f"Directory {target_path} does not exist, skipping.")
-                continue
-                
-            for file_path in target_path.glob('*'):
-                if file_path.suffix in ['.jpg', '.txt']:
-                    arcname = Path(subdir) / file_path.name
-                    zipf.write(file_path, arcname)
-                    file_count += 1
-                    
-    log.info(f"[{split_name.upper()}] Archive created: {output_zip_path} ({file_count} files packed)")
-    return file_count > 0
 
 
 
