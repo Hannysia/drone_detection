@@ -77,6 +77,7 @@ def main() -> None:
             log.info("\n✅ Upload complete! Hugging Face now holds all three splits.")
         except Exception as e:
             log.error(f"❌ Failed to upload to Hugging Face: {e}")
+            sys.exit(1)
     else:
         log.warning("\n⚠️ Skipping Hugging Face upload: HF_TOKEN or REPO_ID is missing in .env.")
 

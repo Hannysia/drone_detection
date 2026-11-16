@@ -12,22 +12,28 @@ log = logging.getLogger(__name__)
 
 def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
     """Uploads model weights to Hugging Face repository under an isolated path."""
-    if REPO_ID and HF_TOKEN and weights_path.exists():
-        log.info(f"[HF UPLOAD] Uploading checkpoint for {run_name} to Hugging Face...")
-        try:
-            api = HfApi(token=HF_TOKEN)
-            api.upload_file(
-                path_or_fileobj=str(weights_path),
-                path_in_repo=f"models/yolo26n_{run_name}_best.pt",
-                repo_id=REPO_ID,
-                repo_type="dataset",
-                token=HF_TOKEN
-            )
-            log.info("[SUCCESS] Checkpoint successfully uploaded to Hugging Face.")
-        except Exception as e:
-            log.error(f"[WARNING] Hugging Face upload failed: {e}")
-    else:
-        log.info("[INFO] Hugging Face upload skipped: credentials or weights file missing.")
+    if not REPO_ID or not HF_TOKEN:
+        log.info("[INFO] Hugging Face upload skipped: credentials missing.")
+        return
+
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {weights_path}")
+
+    log.info(f"[HF UPLOAD] Uploading checkpoint for {run_name} to Hugging Face...")
+    try:
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=str(weights_path),
+            path_in_repo=f"models/yolo26n_{run_name}_best.pt",
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        log.info("[SUCCESS] Checkpoint successfully uploaded to Hugging Face.")
+    except Exception as exc:
+        log.error(f"Hugging Face upload failed for {run_name}: {exc}")
+        raise
+
 
 def run_yolo_training(
     yaml_path: Path, 

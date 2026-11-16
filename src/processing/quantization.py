@@ -102,21 +102,25 @@ def run_export_and_benchmark_pipeline(
         engine_path_str = model_fp32.export(
             format="engine",
             imgsz=imgsz,
-            half=True,       
+            half=True,
             workspace=4,
             dynamic=False
         )
-        
+
         trt_fp16_path = Path(engine_path_str)
+        if not trt_fp16_path.is_file():
+            raise FileNotFoundError(f"Exported TensorRT engine not found: {trt_fp16_path}")
+
         sizes["TRT FP16"] = get_file_size_mb(trt_fp16_path)
         print(f"  Size: {sizes['TRT FP16']:.1f} MB")
-        
+
         model_trt_fp16 = YOLO(str(trt_fp16_path), task="detect")
         results.append(benchmark_model(model_trt_fp16, "TRT FP16", dummy_img, n_warmup, n_benchmark))
         accuracies["TRT FP16"] = validate_model_accuracy(model_trt_fp16, "TRT FP16", dataset_yaml, imgsz)
 
-    except Exception as e:
-        print(f"  TRT FP16 export failed: {e}")
+    except Exception as exc:
+        log.error("TRT FP16 export failed: %s", exc)
+        raise
 
     # -------------------------------------------------
     # 3. Summary Table
@@ -139,19 +143,20 @@ def run_export_and_benchmark_pipeline(
     print("\n" + "=" * 50)
     print("4. Publication on Hugging Face")
     print("=" * 50)
+    if not trt_fp16_path or not trt_fp16_path.is_file():
+        raise FileNotFoundError(f"Engine file not found for HF upload: {trt_fp16_path}")
+
     try:
-        if trt_fp16_path and trt_fp16_path.exists():
-            print("  Uploading .engine...")
-            api = HfApi(token=HF_TOKEN)
-            api.upload_file(
-                path_or_fileobj=str(trt_fp16_path),
-                path_in_repo=f"models/{trt_fp16_path.name}",
-                repo_id=REPO_ID, 
-                token=HF_TOKEN, 
-                repo_type="dataset"
-            )
-            print("  ✅ Successfully saved to HF!")
-        else:
-            print("  ❌ Engine file not found. Skipping HF upload.")
-    except Exception as e:
-        print(f"  ❌ Upload to HF failed: {e}")
+        print("  Uploading .engine...")
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=str(trt_fp16_path),
+            path_in_repo=f"models/{trt_fp16_path.name}",
+            repo_id=REPO_ID,
+            token=HF_TOKEN,
+            repo_type="dataset"
+        )
+        print("  ✅ Successfully saved to HF!")
+    except Exception as exc:
+        log.error("Upload to HF failed: %s", exc)
+        raise

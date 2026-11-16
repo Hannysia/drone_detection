@@ -24,51 +24,23 @@ def find_sppf_layer(pytorch_model: torch.nn.Module) -> tuple[torch.nn.Module, in
     return pytorch_model.model[9], 9
 
 
-def run_eigencam_gradcam(
-    pytorch_model: torch.nn.Module, 
-    target_layer: torch.nn.Module, 
-    img_tensor: torch.Tensor
-) -> np.ndarray | None:
-    """EigenCAM implementation relying on pytorch-grad-cam library wrapper."""
-    try:
-        from pytorch_grad_cam import EigenCAM
-
-        class YOLOWrapper(torch.nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.model = model
-            def forward(self, x):
-                output = self.model(x)
-                if isinstance(output, (list, tuple)):
-                    preds = output[0] if isinstance(output[0], torch.Tensor) else output
-                    if preds.dim() == 3:
-                        return preds[:, :, 4:5].squeeze(-1)
-                    return preds
-                return output
-
-        wrapped = YOLOWrapper(pytorch_model)
-        cam = EigenCAM(model=wrapped, target_layers=[target_layer])
-        with torch.no_grad():
-            grayscale_cam = cam(input_tensor=img_tensor)
-        return grayscale_cam[0]
-    except Exception:
-        return None
-
 
 def manual_eigencam(
     pytorch_model: torch.nn.Module, 
     target_layer: torch.nn.Module, 
     img_tensor: torch.Tensor
 ) -> np.ndarray:
-    """Manual SVD-based EigenCAM fallback when third-party wrappers fail."""
+    """Computes normalized EigenCAM heatmap via a forward hook and SVD."""
     activations = {}
     def hook(model, input_hook, output_hook):
         activations["feat"] = output_hook.detach()
 
     handle = target_layer.register_forward_hook(hook)
-    with torch.no_grad():
-        _ = pytorch_model(img_tensor)
-    handle.remove()
+    try:
+        with torch.no_grad():
+            _ = pytorch_model(img_tensor)
+    finally:
+        handle.remove()
 
     feat = activations["feat"].cpu().squeeze(0).numpy()  # Shape: (C, H, W)
     reshaped = feat.reshape(feat.shape[0], -1)           # Shape: (C, H*W)
@@ -123,9 +95,7 @@ def analyze_single_image(
     if img_rgb is None:
         return None
 
-    cam_map = run_eigencam_gradcam(pytorch_model, target_layer, tensor)
-    if cam_map is None:
-        cam_map = manual_eigencam(pytorch_model, target_layer, tensor)
+    cam_map = manual_eigencam(pytorch_model, target_layer, tensor)
 
     overlay = overlay_heatmap(img_rgb, cam_map)
     boxes = get_detections_boxes(model, img_path, conf=conf_thresh)

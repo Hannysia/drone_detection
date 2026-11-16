@@ -59,15 +59,21 @@ def get_dataset_durations_metadata(source_dir: Path, video_extensions: list[str]
     for video_path in video_files:
         try:
             _, _, fps, length = get_video_metadata(str(video_path))
-            if fps > 0 and length > 0:
-                duration = length / fps
-                durations_data.append({
-                    'filename': video_path.name,
-                    'path': str(video_path),
-                    'duration_sec': duration
-                })
-        except Exception:
-            continue
+        except (OSError, cv2.error, ValueError, RuntimeError) as exc:
+            log.error("Failed to read video metadata for %s: %s", video_path, exc)
+            raise RuntimeError(f"Failed to read video metadata for {video_path}") from exc
+
+        if fps <= 0 or length <= 0:
+            raise ValueError(
+                f"Invalid video metadata for {video_path}: fps={fps}, length={length}"
+            )
+
+        duration = length / fps
+        durations_data.append({
+            'filename': video_path.name,
+            'path': str(video_path),
+            'duration_sec': duration
+        })
             
     return durations_data
 
@@ -320,23 +326,38 @@ def gather_all_splits_geometry(
             try:
                 with Image.open(img_path) as img:
                     w, h = img.size
-            except Exception:
-                continue
+            except (OSError, ValueError) as exc:
+                log.error("Failed to read image header %s: %s", img_path, exc)
+                raise ValueError(f"Unreadable image header: {img_path}") from exc
 
-            try:
-                with open(lbl_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) == 5:
-                            _, _, _, nw, nh = map(float, parts)
-                            w_px = nw * w
-                            h_px = nh * h
-                            widths_px.append(w_px)
-                            heights_px.append(h_px)
-                            areas_px.append(w_px * h_px)
-                            aspect_ratios.append(w_px / h_px if h_px > 0 else 1.0)
-            except Exception:
-                continue
+            if w <= 0 or h <= 0:
+                raise ValueError(f"Invalid image dimensions for {img_path}: {w}x{h}")
+
+            with open(lbl_path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    if len(parts) != 5:
+                        raise ValueError(
+                            f"{lbl_path}:{line_no}: expected 5 YOLO fields"
+                        )
+                    try:
+                        _, _, _, nw, nh = map(float, parts)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{lbl_path}:{line_no}: invalid box coordinates"
+                        ) from exc
+                    if not (np.isfinite(nw) and np.isfinite(nh)) or nw <= 0 or nh <= 0:
+                        raise ValueError(
+                            f"{lbl_path}:{line_no}: non-positive box dimensions"
+                        )
+                    w_px = nw * w
+                    h_px = nh * h
+                    widths_px.append(w_px)
+                    heights_px.append(h_px)
+                    areas_px.append(w_px * h_px)
+                    aspect_ratios.append(w_px / h_px)
                 
     return pd.DataFrame({
         "pixel_width": widths_px,
@@ -611,21 +632,24 @@ def evaluate_theta_candidates(
 
 
     
-def load_and_verify_embeddings(repo_id: str, filename: str, token: str | None = None) -> dict | None:
+def load_and_verify_embeddings(repo_id: str, filename: str, token: str | None = None) -> dict:
     """Downloads, loads, and performs validation metrics on a PyTorch embeddings file."""
-    print(f"\n1. Downloading embeddings from Hugging Face...")
+    log.info("1. Downloading embeddings from Hugging Face...")
     try:
         file_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", token=token)
-    except Exception as e:
-        print(f"Error downloading file: {e}")
-        return None
+    except Exception as exc:
+        log.error("Failed to download embeddings %s from %s: %s", filename, repo_id, exc)
+        raise
 
-    print("\n2. Loading embeddings file into memory...")
+    log.info("2. Loading embeddings file into memory...")
     try:
-        embeddings = load_embedding_file(file_path)
-    except Exception as e:
-        print(f"Error loading PyTorch file: {e}")
-        return None
+        embeddings = load_embedding_file(Path(file_path))
+    except Exception as exc:
+        log.error("Failed to load embeddings file %s: %s", file_path, exc)
+        raise
+
+    if not embeddings:
+        raise ValueError(f"Embeddings dictionary is empty: {filename}")
 
     total_frames = len(embeddings)
     print(f"\n3. Analysis:")

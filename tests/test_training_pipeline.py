@@ -85,3 +85,30 @@ def test_pipeline_uses_explicit_dataset_root(tmp_path, monkeypatch):
     prepare.assert_called_once_with(root, training.WORKING_DIR, "example", False)
     train.assert_called_once_with(yaml_path, "example", epochs=25)
     assert result == weights
+
+
+
+def test_upload_checkpoint_to_hf_validates_and_propagates_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+    monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path))
+
+    from src.processing import training
+
+    weights = tmp_path / "best.pt"
+
+    monkeypatch.setattr(training, "REPO_ID", None)
+    monkeypatch.setattr(training, "HF_TOKEN", None)
+    training.upload_checkpoint_to_hf(weights, "run")
+
+    monkeypatch.setattr(training, "REPO_ID", "repo/test")
+    monkeypatch.setattr(training, "HF_TOKEN", "token-test")
+    with pytest.raises(FileNotFoundError, match="Checkpoint file not found"):
+        training.upload_checkpoint_to_hf(weights, "run")
+
+    weights.write_bytes(b"pt")
+    api = Mock()
+    api.upload_file.side_effect = RuntimeError("hf unreachable")
+    monkeypatch.setattr(training, "HfApi", Mock(return_value=api))
+
+    with pytest.raises(RuntimeError, match="hf unreachable"):
+        training.upload_checkpoint_to_hf(weights, "run")

@@ -184,3 +184,65 @@ def test_theta_evaluation_rejects_invalid_embeddings(vector):
             {"demo": [("a.jpg", vector)]},
             [0.1],
         )
+
+
+
+def test_get_dataset_durations_metadata_raises_on_broken_video(tmp_path, monkeypatch):
+    from src.processing import statistics
+
+    video = tmp_path / "broken.mp4"
+    video.write_bytes(b"bad")
+
+    monkeypatch.setattr(statistics, "get_video_metadata", lambda _: (0, 0, 0.0, 0))
+    with pytest.raises(ValueError, match="Invalid video metadata"):
+        statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
+
+    def fail_meta(_):
+        raise OSError("cannot open")
+
+    monkeypatch.setattr(statistics, "get_video_metadata", fail_meta)
+    with pytest.raises(RuntimeError, match="Failed to read video metadata"):
+        statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
+
+
+def test_gather_all_splits_geometry_raises_on_corrupt_image_or_label(tmp_path):
+    from PIL import Image
+    from src.processing.statistics import gather_all_splits_geometry
+
+    pos_dir = tmp_path / "train" / "RAW_POSITIVES"
+    pos_dir.mkdir(parents=True)
+    img_path = pos_dir / "wing_rgb_sky_001_f0001.jpg"
+    lbl_path = img_path.with_suffix(".txt")
+
+    img_path.write_bytes(b"not an image")
+    lbl_path.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unreadable image header"):
+        gather_all_splits_geometry(tmp_path, ["train"])
+
+    Image.new("RGB", (32, 32)).save(img_path)
+    lbl_path.write_text("0 0.5 0.5\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected 5 YOLO fields"):
+        gather_all_splits_geometry(tmp_path, ["train"])
+
+    lbl_path.write_text("0 a b c d\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid box coordinates"):
+        gather_all_splits_geometry(tmp_path, ["train"])
+
+
+def test_load_and_verify_embeddings_raises_on_error_or_empty(tmp_path, monkeypatch):
+    from src.processing import statistics
+
+    def fail_download(**kwargs):
+        raise OSError("network error")
+
+    monkeypatch.setattr(statistics, "hf_hub_download", fail_download)
+    with pytest.raises(OSError, match="network error"):
+        statistics.load_and_verify_embeddings("repo/id", "embs.pt")
+
+    dummy = tmp_path / "embs.pt"
+    dummy.write_bytes(b"pt")
+    monkeypatch.setattr(statistics, "hf_hub_download", lambda **kwargs: str(dummy))
+    monkeypatch.setattr(statistics, "load_embedding_file", lambda _: {})
+
+    with pytest.raises(ValueError, match="empty"):
+        statistics.load_and_verify_embeddings("repo/id", "embs.pt")

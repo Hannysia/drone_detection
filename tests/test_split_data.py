@@ -107,3 +107,46 @@ def test_split_script_exits_before_scanning_when_output_non_empty(tmp_path, monk
 
     assert exc.value.code == 1
     assert (output / "stale.mp4").read_bytes() == b"old"
+
+
+
+def test_split_script_exits_nonzero_when_hf_upload_fails(tmp_path, monkeypatch):
+    source = tmp_path / "renamed"
+    output = tmp_path / "splits"
+    source.mkdir()
+    names = ["wing_rgb_sky_001.mp4", "wing_rgb_sky_002.mp4", "wing_rgb_sky_003.mp4"]
+    for name in names:
+        (source / name).write_bytes(b"src")
+
+    monkeypatch.setenv("RENAMED_DIR", str(source))
+    monkeypatch.setenv("SPLIT_OUTPUT_DIR", str(output))
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "04_split_data.py"
+    spec = importlib.util.spec_from_file_location("split_script_upload_fail", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(module, "RENAMED_DIR", source)
+    monkeypatch.setattr(module, "SPLIT_OUTPUT_DIR", output)
+    monkeypatch.setattr(module, "HF_TOKEN", "token-test")
+    monkeypatch.setattr(module, "REPO_ID", "repo/test")
+    monkeypatch.setattr(module, "get_frame_count", lambda *_: 10)
+    monkeypatch.setattr(
+        module,
+        "perform_stratified_split",
+        lambda df: (df.iloc[:1], df.iloc[1:2], df.iloc[2:3]),
+    )
+
+    class FailingApi:
+        def __init__(self, token):
+            self.token = token
+
+        def upload_folder(self, **kwargs):
+            raise RuntimeError("upload error")
+
+    monkeypatch.setattr(module, "HfApi", FailingApi)
+
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+
+    assert exc.value.code == 1
