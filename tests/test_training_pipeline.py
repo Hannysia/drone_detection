@@ -58,3 +58,30 @@ def test_training_uses_current_checkpoint(tmp_path, monkeypatch):
     with pytest.raises(FileNotFoundError):
         training.run_yolo_training(yaml, "run")
     assert upload.call_count == 1
+
+
+
+def test_pipeline_uses_explicit_dataset_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+    monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path / "old_export"))
+
+    from src.processing import training
+
+    root = tmp_path / "curated_export"
+    root.mkdir()
+    yaml_path = tmp_path / "dataset.yaml"
+    weights = tmp_path / "best.pt"
+
+    prepare = Mock(return_value=yaml_path)
+    train = Mock(return_value=weights)
+    monkeypatch.setattr(training, "EXTRACTED_DATA_DIR", tmp_path / "old_export")
+    monkeypatch.setattr(training, "prepare_yolo_dataset", prepare)
+    monkeypatch.setattr(training, "run_yolo_training", train)
+
+    result = training.run_full_pipeline(
+        False, "example", dataset_root=root, epochs=25
+    )
+
+    prepare.assert_called_once_with(root, training.WORKING_DIR, "example", False)
+    train.assert_called_once_with(yaml_path, "example", epochs=25)
+    assert result == weights

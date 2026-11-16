@@ -95,13 +95,18 @@ def run_yolo_training(
     upload_checkpoint_to_hf(best_weights, run_name)
     return best_weights
 
-def run_full_pipeline(use_negatives: bool, run_name: str, **train_kwargs) -> Path:
-    """Prepares the dataset and returns the trained weights."""
-    
-    if not EXTRACTED_DATA_DIR.exists():
-        raise FileNotFoundError(f"Dataset path {EXTRACTED_DATA_DIR} does not exist.")
-        
-    yaml_path = prepare_yolo_dataset(EXTRACTED_DATA_DIR, WORKING_DIR, run_name, use_negatives)
-    best_weights = run_yolo_training(yaml_path, run_name, **train_kwargs)
-    
-    return best_weights
+def run_full_pipeline(
+    use_negatives: bool,
+    run_name: str,
+    *,
+    dataset_root: Path | None = None,
+    **train_kwargs,
+) -> Path:
+    """Prepare the selected dataset and return the trained weights."""
+    root = EXTRACTED_DATA_DIR if dataset_root is None else dataset_root
+
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+
+    yaml_path = prepare_yolo_dataset(root, WORKING_DIR, run_name, use_negatives)
+    return run_yolo_training(yaml_path, run_name, **train_kwargs)
