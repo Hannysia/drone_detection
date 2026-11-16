@@ -1,4 +1,5 @@
 import logging
+import re
 import shutil
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ from src.processing.video import get_video_metadata
 from io import BytesIO
 from collections import Counter
 from tempfile import TemporaryDirectory
-
+from tqdm import tqdm
 from src.config import MANIFESTS_DIR, SPLITS
 from src.processing.manifests import CATEGORY_DIRS, read_manifest
 
@@ -21,6 +22,45 @@ TRASH_FOLDER_NAMES = {
     "uniform": "uniform_sample_{type}",
     "iou":     "iou_dedup_{type}",
 }
+
+
+_FRAME_SUFFIX_RE = re.compile(r"_f\d+$")
+
+
+def _extract_metadata_fields(
+    filename: str,
+    *,
+    normalize_background: bool = False,
+) -> tuple[str | None, str | None, str | None]:
+    """Parses shape, camera, and background fields from a video or frame filename."""
+    stem = _FRAME_SUFFIX_RE.sub("", Path(filename).stem)
+    if not stem:
+        return None, None, None
+
+    parts = stem.split("_")
+    if len(parts) >= 2 and parts[0] == "no" and parts[1] == "drone":
+        shape = "no_drone"
+        rest = parts[2:]
+    else:
+        shape = parts[0]
+        rest = parts[1:]
+
+    if not shape or shape.isdigit():
+        return None, None, None
+
+    camera = rest[0] if len(rest) >= 1 and rest[0] and not rest[0].isdigit() else None
+    background = (
+        rest[1]
+        if camera is not None and len(rest) >= 2 and rest[1] and not rest[1].isdigit()
+        else None
+    )
+
+    if normalize_background and background == "forest":
+        background = "complex"
+
+    return shape, camera, background
+
+
 
 def rename_dataset_videos_safely(source_dir: Path, dest_dir: Path, video_extensions: list[str]) -> None:
     """Safely copies and renames classified videos into a sequential final dataset."""
@@ -37,12 +77,9 @@ def rename_dataset_videos_safely(source_dir: Path, dest_dir: Path, video_extensi
     
     global_counter = 1
     for filepath in videos:
-        old_name = filepath.stem
-        parts = old_name.split('_')
-        
-        if len(parts) >= 3:
-            prefix = f"{parts[0]}_{parts[1]}_{parts[2]}"
-            
+        prefix = parse_filename(filepath.name)
+
+        if prefix is not None:
             new_filename = f"{prefix}_{global_counter:03d}{filepath.suffix}"
             new_filepath = dest_dir / new_filename
             
@@ -57,11 +94,10 @@ def rename_dataset_videos_safely(source_dir: Path, dest_dir: Path, video_extensi
 
 def parse_filename(filename: str) -> str | None:
     """Extracts 'class_camera_background' prefix from the filename."""
-    name_no_ext = filename.split('.')[0]
-    parts = name_no_ext.split('_')
-    if len(parts) >= 3:
-        return f"{parts[0]}_{parts[1]}_{parts[2]}"
-    return None
+    meta = extract_metadata_from_filename(filename)
+    if meta is None:
+        return None
+    return "_".join(meta)
 
 def perform_stratified_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -95,6 +131,48 @@ def perform_stratified_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
     
     train_df = pd.concat([train_safe, df_rare], ignore_index=True)
     return train_df, val_df, test_df 
+
+
+def ensure_empty_split_output_dir(output_dir: Path) -> None:
+    """Validates that output_dir does not exist or is an empty directory."""
+    if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
+        raise FileExistsError(f"Split output path must be a directory: {output_dir}")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"Split output directory is not empty: {output_dir}")
+
+
+def copy_split_videos(
+    source_dir: Path,
+    output_dir: Path,
+    splits: dict[str, pd.DataFrame],
+    *,
+    show_progress: bool = False,
+) -> None:
+    """Copies split videos atomically into an empty or new output directory."""
+    ensure_empty_split_output_dir(output_dir)
+    created_output = not output_dir.exists()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with TemporaryDirectory(dir=output_dir) as tmp:
+            staged = Path(tmp)
+            for split_name, split_data in splits.items():
+                split_dir = staged / split_name
+                split_dir.mkdir(parents=True, exist_ok=True)
+                filenames = split_data["filename"].tolist()
+                for filename in tqdm(
+                    filenames,
+                    desc=f"Copying {split_name.upper()}",
+                    disable=not show_progress,
+                ):
+                    shutil.copy2(source_dir / filename, split_dir / filename)
+
+            for split_name in splits:
+                (staged / split_name).rename(output_dir / split_name)
+    except Exception:
+        if created_output and output_dir.exists() and not any(output_dir.iterdir()):
+            output_dir.rmdir()
+        raise
 
 
 def prepare_trackeval_sequence(
@@ -316,25 +394,11 @@ def verify_filename_syntax(
 
 def extract_metadata_from_filename(filename: str) -> tuple[str, str, str] | None:
     """Extracts (shape, camera, background) from a valid dataset filename."""
-    name_without_ext = filename.split('.')[0]
-    parts = name_without_ext.split('_')
-    
-    if len(parts) >= 2 and parts[0] == 'no' and parts[1] == 'drone':
-        shape = 'no_drone'
-        if len(parts) >= 4:
-            camera = parts[2]
-            bg = parts[3]
-        else:
-            return None
-    else:
-        if len(parts) >= 4:
-            shape = parts[0]
-            camera = parts[1]
-            bg = parts[2]
-        else:
-            return None
-            
-    return shape, camera, bg
+    shape, camera, background = _extract_metadata_fields(filename)
+    if shape is None or camera is None or background is None:
+        return None
+    return shape, camera, background
+
 
 
 def parse_frame_filename_logic(filename: str) -> dict:
@@ -342,30 +406,14 @@ def parse_frame_filename_logic(filename: str) -> dict:
     Parses a flat frame filename to extract metadata (shape, camera, background).
     Handles 'no_drone' negative files safely and maps 'forest' terrain to 'complex'.
     """
-    clean_name = filename.replace("no_drone", "nodrone")
-    parts = clean_name.split('_')
-    
-    if parts[0] == "nodrone":
-        shape = "no_drone"
-        camera = parts[1] if len(parts) > 1 else "unknown"
-        if len(parts) > 2:
-            background = "unknown" if parts[2].isdigit() else parts[2]
-        else:
-            background = "unknown"
-    else:
-        shape = parts[0]
-        camera = parts[1] if len(parts) > 1 else "unknown"
-        background = parts[2] if len(parts) > 2 else "unknown"
-        
-    if background == "forest":
-        background = "complex"
-        
+    shape, camera, background = _extract_metadata_fields(
+        filename, normalize_background=True
+    )
     return {
-        "shape": shape,
-        "camera": camera,
-        "background": background
+        "shape": shape or "unknown",
+        "camera": camera or "unknown",
+        "background": background or "unknown",
     }
-
 
 
 def compile_kaggle_mot_dataset(local_hf_dir: Path, mot_dataset_dir: Path, seqmaps_dir: Path, video_extensions: tuple[str]) -> None:
