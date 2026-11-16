@@ -483,16 +483,14 @@ def plot_false_positive_inline(
     device: torch.device
 ) -> None:
     """Generates EigenCAM attention overlay and plots the False Positive side-by-side inside the notebook."""
-    from src.processing.yolo import manual_eigencam, run_eigencam_gradcam, preprocess_image_tensor
-    
+    from src.processing.yolo import manual_eigencam, preprocess_image_tensor
+  
     img_path = str(fp["path"])
     img_rgb, _, tensor = preprocess_image_tensor(img_path, device)
     if img_rgb is None:
         return
 
-    cam_map = run_eigencam_gradcam(pytorch_model, target_layer, tensor)
-    if cam_map is None:
-        cam_map = manual_eigencam(pytorch_model, target_layer, tensor)
+    cam_map = manual_eigencam(pytorch_model, target_layer, tensor)
 
     overlay = overlay_heatmap(img_rgb, cam_map)
     overlay_boxes = overlay.copy()
