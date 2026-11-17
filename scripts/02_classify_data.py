@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -7,7 +8,7 @@ from pathlib import Path
 from google import genai
 from tqdm import tqdm
 
-from src.config import SOURCE_ROOT, CLASSIFIED_DIR, SAVE_DEBUG_FRAMES, VIDEO_EXTENSIONS, KEY_JSON_PATH
+from src.config import SOURCE_ROOT, CLASSIFIED_DIR, VIDEO_EXTENSIONS, KEY_JSON_PATH
 from src.processing.video import extract_keyframes_from_video
 from src.processing.classifier import classify_single_video
 
@@ -16,7 +17,7 @@ os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", str(KEY_JSON_PATH))
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)
 
-def main() -> None:
+def main(debug: bool = False) -> None:
     with open(KEY_JSON_PATH, "r", encoding="utf-8") as f:
 
         key_data = json.load(f)
@@ -64,7 +65,7 @@ def main() -> None:
                 error_count += 1
                 continue
                 
-            if SAVE_DEBUG_FRAMES:
+            if debug:
                 debug_dir = Path("debug_frames") / file_name_clean
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 for i, pil_img in enumerate(frames):
@@ -99,4 +100,13 @@ def main() -> None:
     log.info("="*40)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Classify raw videos using Gemini API.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save extracted keyframes to debug_frames/.",
+    )
+    args = parser.parse_args()
+    main(debug=args.debug)

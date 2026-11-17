@@ -49,8 +49,6 @@ else:
         "LOCAL_BASE_DIR": "LOCAL_BASE_DIR",
         "EMBEDDINGS_DIR": "EMBEDDINGS_DIR",
         "EXTRACTED_DATA_DIR": "EXTRACTED_DATA_PATH",
-        "TRASH_DIR": "TRASH_DIR",
-        "MT_TRASH_DIR": "MT_TRASH_DIR",
         "SOURCE_ROOT": "SOURCE_ROOT",
         "CLASSIFIED_DIR": "CLASSIFIED_DIR",
         "KEY_JSON_PATH": "KEY_JSON_PATH",
@@ -65,8 +63,6 @@ else:
         "FRAME_BASELINE_DIR": "frame_baseline",
         "WORKING_DIR": "working",
         "OUTPUT_DIR": "extracted_dataset",
-        "LOG_FILE": "processed_videos.log",
-        "TMP_DIR": "tmp",
     }
 
     def __getattr__(name: str) -> Path:
@@ -87,8 +83,6 @@ else:
     HF_TOKEN = os.getenv("HF_TOKEN")
 
     HASH_THRESHOLD = 5
-    SAVE_DEBUG_FRAMES = False
-    FORCE_CLASS_ID = os.getenv("FORCE_CLASS_ID", "0")
 
     CVAT_HOST = os.getenv("CVAT_HOST", "localhost")
     CVAT_PORT = os.getenv("CVAT_PORT", "8080")
