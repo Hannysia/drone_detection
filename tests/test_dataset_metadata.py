@@ -6,7 +6,7 @@ from src.processing.dataset import (
     parse_frame_filename_logic,
     rename_dataset_videos_safely,
 )
-from src.processing.statistics import get_splits_metadata_df
+from src.processing.dataset_statistics import get_splits_metadata_df
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from src.processing.statistics import (
+from src.processing.dataset_statistics import (
     calculate_dataset_local_contrast,
     gather_all_splits_geometry,
     gather_dataset_frame_metadata_df,

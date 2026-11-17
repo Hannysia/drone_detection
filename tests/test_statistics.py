@@ -1,12 +1,12 @@
 import pytest
 import numpy as np
 from pathlib import Path
-from src.processing.statistics import (
-    pairwise_distances, 
-    group_embeddings_by_video, 
-    filter_active_embeddings, 
-    analyze_video_formats,
-    evaluate_theta_candidates
+from src.processing.dataset_statistics import analyze_video_formats
+from src.processing.embedding_statistics import (
+    evaluate_theta_candidates,
+    filter_active_embeddings,
+    group_embeddings_by_video,
+    pairwise_distances,
 )
 
 def test_pairwise_distances_orthogonal():
@@ -188,26 +188,26 @@ def test_theta_evaluation_rejects_invalid_embeddings(vector):
 
 
 def test_get_dataset_durations_metadata_raises_on_broken_video(tmp_path, monkeypatch):
-    from src.processing import statistics
+    from src.processing import dataset_statistics
 
     video = tmp_path / "broken.mp4"
     video.write_bytes(b"bad")
 
-    monkeypatch.setattr(statistics, "get_video_metadata", lambda _: (0, 0, 0.0, 0))
+    monkeypatch.setattr(dataset_statistics, "get_video_metadata", lambda _: (0, 0, 0.0, 0))
     with pytest.raises(ValueError, match="Invalid video metadata"):
-        statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
+        dataset_statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
 
     def fail_meta(_):
         raise OSError("cannot open")
 
-    monkeypatch.setattr(statistics, "get_video_metadata", fail_meta)
+    monkeypatch.setattr(dataset_statistics, "get_video_metadata", fail_meta)
     with pytest.raises(RuntimeError, match="Failed to read video metadata"):
-        statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
+        dataset_statistics.get_dataset_durations_metadata(tmp_path, [".mp4"])
 
 
 def test_gather_all_splits_geometry_raises_on_corrupt_image_or_label(tmp_path):
     from PIL import Image
-    from src.processing.statistics import gather_all_splits_geometry
+    from src.processing.dataset_statistics import gather_all_splits_geometry
 
     pos_dir = tmp_path / "train" / "RAW_POSITIVES"
     pos_dir.mkdir(parents=True)
@@ -230,19 +230,19 @@ def test_gather_all_splits_geometry_raises_on_corrupt_image_or_label(tmp_path):
 
 
 def test_load_and_verify_embeddings_raises_on_error_or_empty(tmp_path, monkeypatch):
-    from src.processing import statistics
+    from src.processing import embedding_statistics
 
     def fail_download(**kwargs):
         raise OSError("network error")
 
-    monkeypatch.setattr(statistics, "hf_hub_download", fail_download)
+    monkeypatch.setattr(embedding_statistics, "hf_hub_download", fail_download)
     with pytest.raises(OSError, match="network error"):
-        statistics.load_and_verify_embeddings("repo/id", "embs.pt")
+        embedding_statistics.load_and_verify_embeddings("repo/id", "embs.pt")
 
     dummy = tmp_path / "embs.pt"
     dummy.write_bytes(b"pt")
-    monkeypatch.setattr(statistics, "hf_hub_download", lambda **kwargs: str(dummy))
-    monkeypatch.setattr(statistics, "load_embedding_file", lambda _: {})
+    monkeypatch.setattr(embedding_statistics, "hf_hub_download", lambda **kwargs: str(dummy))
+    monkeypatch.setattr(embedding_statistics, "load_embedding_file", lambda _: {})
 
     with pytest.raises(ValueError, match="empty"):
-        statistics.load_and_verify_embeddings("repo/id", "embs.pt")
+        embedding_statistics.load_and_verify_embeddings("repo/id", "embs.pt")
