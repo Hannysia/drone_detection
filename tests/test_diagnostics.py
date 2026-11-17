@@ -53,3 +53,9 @@ def test_manual_eigencam_computes_normalized_map_and_removes_hook():
     assert cam_map.min() >= 0.0
     assert cam_map.max() <= 1.0
     assert len(net.conv._forward_hooks) == 0
+
+
+def test_diagnostics_reuses_evaluation_get_detections_boxes():
+    from src.processing import diagnostics, evaluation
+
+    assert diagnostics.get_detections_boxes is evaluation.get_detections_boxes

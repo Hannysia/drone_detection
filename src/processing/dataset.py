@@ -1,5 +1,4 @@
 import logging
-import re
 import shutil
 import os
 from pathlib import Path
@@ -14,6 +13,7 @@ from tempfile import TemporaryDirectory
 from tqdm import tqdm
 from src.config import MANIFESTS_DIR, SPLITS
 from src.processing.manifests import CATEGORY_DIRS, read_manifest
+from src.utils.io import parse_video_id
 
 log = logging.getLogger(__name__)
 
@@ -23,17 +23,13 @@ TRASH_FOLDER_NAMES = {
     "iou":     "iou_dedup_{type}",
 }
 
-
-_FRAME_SUFFIX_RE = re.compile(r"_f\d+$")
-
-
 def _extract_metadata_fields(
     filename: str,
     *,
     normalize_background: bool = False,
 ) -> tuple[str | None, str | None, str | None]:
     """Parses shape, camera, and background fields from a video or frame filename."""
-    stem = _FRAME_SUFFIX_RE.sub("", Path(filename).stem)
+    stem = parse_video_id(filename)
     if not stem:
         return None, None, None
 

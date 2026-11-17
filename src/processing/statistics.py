@@ -8,7 +8,8 @@ from src.processing.video import get_video_metadata
 from src.processing.dataset import extract_metadata_from_filename, parse_frame_filename_logic
 from src.utils.visualization import plot_theta_analysis_dashboard
 from src.processing.clustering import k_center_greedy_threshold
-from src.utils.embedding_io import load_embedding_file
+from src.utils.embedding_io import load_embedding_file, validate_embedding_matrix
+from src.utils.io import parse_video_id
 from pathlib import Path
 from PIL import Image
 import cv2
@@ -481,8 +482,7 @@ def group_embeddings_by_video(embeddings_dict: dict) -> dict[str, list]:
     """Groups frames by unique video source ID."""
     groups = defaultdict(list)
     for filename, emb in embeddings_dict.items():
-        stem = Path(filename).stem  
-        video_id = "_".join(stem.split("_")[:-1])  
+        video_id = parse_video_id(filename)
         groups[video_id].append((filename, emb))
     return dict(groups)
 
@@ -575,20 +575,7 @@ def evaluate_theta_candidates(
             embedding for _, embedding in frames
         ])
 
-        if (
-            matrix.ndim != 2
-            or matrix.shape[1] == 0
-            or not np.isfinite(matrix).all()
-            or not np.allclose(
-                np.linalg.norm(matrix, axis=1),
-                1.0,
-                rtol=1e-5,
-                atol=1e-6,
-            )
-        ):
-            raise ValueError(
-                f"Expected finite, L2-normalized embeddings for {video_id}",
-            )
+        validate_embedding_matrix(matrix, video_id)
 
         matrices.append(matrix)
 
@@ -696,8 +683,7 @@ def group_filtered_by_video_regex(embeddings_dict: dict) -> dict[str, list]:
     """Groups filtered embeddings by their parsed regex video ID."""
     groups = defaultdict(list)
     for filename, emb in embeddings_dict.items():
-        stem = Path(filename).stem
-        video_id = re.sub(r'_f\d+$', '', stem)
+        video_id = parse_video_id(filename)
         groups[video_id].append(emb)
 
     print(f"Grouped into {len(groups):,} unique videos")
@@ -740,8 +726,7 @@ def diagnose_embeddings_contents(embeddings_dict: dict, suspect_videos: list[str
 
     video_groups = defaultdict(list)
     for filename in embeddings_dict.keys():
-        stem = Path(filename).stem
-        video_id = re.sub(r'_f\d+$', '', stem)
+        video_id = parse_video_id(filename)
         video_groups[video_id].append(filename)
 
     print(f"Unique videos found in dictionary: {len(video_groups):,}")

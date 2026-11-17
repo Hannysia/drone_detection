@@ -1,4 +1,4 @@
-import re
+from src.utils.io import parse_video_id
 from pathlib import Path
 import itertools
 import logging
@@ -10,7 +10,7 @@ def group_labels_by_video(labels: list[Path]) -> dict[str, list[Path]]:
     """Groups label file paths by their video identifier."""
     groups = {}
     for lbl in labels:
-        video_id = "_f".join(lbl.stem.split("_f")[:-1])
+        video_id = parse_video_id(lbl)
         groups.setdefault(video_id, []).append(lbl)
     
     for video_id in groups:
@@ -22,7 +22,7 @@ def group_files_by_video(files: list[Path]) -> dict[str, list[Path]]:
     """Groups file paths by their video identifier using regex."""
     groups = {}
     for filepath in files:
-        v_id = re.sub(r'_f\d+$', '', filepath.stem)
+        v_id = parse_video_id(filepath)
         groups.setdefault(v_id, []).append(filepath)
         
     for v_id in groups:

@@ -36,3 +36,27 @@ def load_embedding_file(path: Path) -> dict[str, np.ndarray]:
         vectors[name] = value
 
     return vectors
+
+
+def validate_embedding_matrix(
+    matrix: np.ndarray,
+    context: str | None = None,
+) -> None:
+    if (
+        not isinstance(matrix, np.ndarray)
+        or matrix.ndim != 2
+        or not matrix.shape[0]
+        or not matrix.shape[1]
+        or not np.issubdtype(matrix.dtype, np.floating)
+        or not np.isfinite(matrix).all()
+        or not np.allclose(
+            np.linalg.norm(matrix, axis=1),
+            1.0,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    ):
+        detail = f" for {context}" if context else ""
+        raise ValueError(
+            f"Expected finite, L2-normalized embeddings{detail}"
+        )

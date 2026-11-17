@@ -1,13 +1,12 @@
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 from src.processing.clustering import k_center_greedy_threshold
-
+from src.utils.embedding_io import validate_embedding_matrix
+from src.utils.io import parse_frame_name
 
 def frame_number(filename):
-    return int(Path(filename).stem.rsplit("_f", 1)[1])
+    return parse_frame_name(filename)[1]
 
 
 def pair_distance_distributions(groups):
@@ -92,32 +91,14 @@ def nearest_cross_video_frames(embeddings, *, batch_size=256):
         raise ValueError("No embeddings to analyze")
 
     filenames = sorted(embeddings)
-    video_ids = []
-
-    for name in filenames:
-        frame_number(name)
-        video_ids.append(Path(name).stem.rsplit("_f", 1)[0])
-
-    video_ids = np.array(video_ids)
+    video_ids = np.array([parse_frame_name(name)[0] for name in filenames])
 
     if len(set(video_ids)) < 2:
         raise ValueError("Expected frames from at least two videos")
 
     matrix = np.stack([embeddings[name] for name in filenames])
 
-    if (
-        matrix.ndim != 2
-        or not matrix.shape[1]
-        or not np.issubdtype(matrix.dtype, np.floating)
-        or not np.isfinite(matrix).all()
-        or not np.allclose(
-            np.linalg.norm(matrix, axis=1),
-            1,
-            rtol=1e-5,
-            atol=1e-6,
-        )
-    ):
-        raise ValueError("Expected finite, L2-normalized embeddings")
+    validate_embedding_matrix(matrix)
 
     records = []
 
@@ -141,7 +122,6 @@ def nearest_cross_video_frames(embeddings, *, batch_size=256):
     return pd.DataFrame(records)
 
 
-
 def cross_video_candidate_pairs(embeddings, max_theta, *, batch_size=256):
     if not np.isfinite(max_theta) or max_theta < 0:
         raise ValueError("max_theta must be finite and nonnegative")
@@ -153,29 +133,11 @@ def cross_video_candidate_pairs(embeddings, max_theta, *, batch_size=256):
         raise ValueError("No embeddings to analyze")
 
     names = np.array(sorted(embeddings))
-    videos = np.array([
-        Path(name).stem.rsplit("_f", 1)[0]
-        for name in names
-    ])
-
-    for name in names:
-        frame_number(name)
+    videos = np.array([parse_frame_name(name)[0] for name in names])
 
     matrix = np.stack([embeddings[name] for name in names])
 
-    if (
-        matrix.ndim != 2
-        or not matrix.shape[1]
-        or not np.issubdtype(matrix.dtype, np.floating)
-        or not np.isfinite(matrix).all()
-        or not np.allclose(
-            np.linalg.norm(matrix, axis=1),
-            1,
-            rtol=1e-5,
-            atol=1e-6,
-        )
-    ):
-        raise ValueError("Expected finite, L2-normalized embeddings")
+    validate_embedding_matrix(matrix)
 
     parts = []
 
@@ -213,7 +175,7 @@ def select_cross_video_frames(embeddings, pairs, theta):
     groups = {}
 
     for name in sorted(embeddings):
-        video = Path(name).stem.rsplit("_f", 1)[0]
+        video, _ = parse_frame_name(name)
         groups.setdefault(video, []).append(name)
 
     neighbors = {}
@@ -242,8 +204,8 @@ def select_cross_video_frames(embeddings, pairs, theta):
         if a not in kept or b not in kept:
             continue
 
-        video_a = Path(a).stem.rsplit("_f", 1)[0]
-        video_b = Path(b).stem.rsplit("_f", 1)[0]
+        video_a, _ = parse_frame_name(a)
+        video_b, _ = parse_frame_name(b)
 
         if video_a == video_b:
             raise ValueError("Candidate pair belongs to the same video")

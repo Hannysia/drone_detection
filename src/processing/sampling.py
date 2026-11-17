@@ -1,4 +1,4 @@
-from pathlib import Path
+from src.utils.io import parse_frame_name
 import numpy as np
 import pandas as pd
 
@@ -39,24 +39,9 @@ def collect_frame_runs(rows: list[dict[str, str]], category: str) -> pd.DataFram
         ):
             continue
 
-        video_id, separator, number = (
-            Path(row["filename"]).stem.rpartition("_f")
-        )
-
-        if (
-            not video_id
-            or not separator
-            or not number.isdecimal()
-            or int(number) < 1
-        ):
-            raise ValueError(
-                f"Invalid frame filename: {row['filename']}"
-            )
-
+        video_id, number = parse_frame_name(row["filename"])
         key = (row["split"], video_id)
-        groups.setdefault(key, []).append(
-            (int(number), row["filename"])
-        )
+        groups.setdefault(key, []).append((number, row["filename"]))
 
     records = []
 

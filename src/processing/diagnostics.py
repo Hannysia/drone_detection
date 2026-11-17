@@ -10,7 +10,7 @@ from ultralytics import YOLO
 
 from src.config import REPO_ID, HF_TOKEN, WORKING_DIR
 from src.utils.visualization import overlay_heatmap, plot_eigencam_results, plot_detections_summary
-from src.processing.evaluation import load_eval_model
+from src.processing.evaluation import get_detections_boxes, load_eval_model
 
 log = logging.getLogger(__name__)
 
@@ -67,18 +67,6 @@ def preprocess_image_tensor(img_path: str, device: torch.device) -> tuple[np.nda
     tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
     tensor = tensor.unsqueeze(0).to(device)
     return img_rgb, img_resized, tensor
-
-
-def get_detections_boxes(model: YOLO, img_path: str, conf: float) -> list[tuple[int, int, int, int, float]]:
-    """Executes standard YOLO inference to retrieve bounding boxes."""
-    results = model(img_path, conf=conf, verbose=False)
-    boxes = []
-    if results and results[0].boxes is not None:
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf_val = float(box.conf[0])
-            boxes.append((int(x1), int(y1), int(x2), int(y2), conf_val))
-    return boxes
 
 
 def analyze_single_image(

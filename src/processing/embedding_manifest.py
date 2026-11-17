@@ -9,7 +9,8 @@ import numpy as np
 
 from src.processing.clustering import k_center_greedy_threshold
 from src.processing.manifests import CATEGORY_DIRS, read_manifest, write_manifest
-
+from src.utils.embedding_io import validate_embedding_matrix
+from src.utils.io import parse_frame_name
 
 def build_embedding_manifest(rows, embeddings_by_category, thresholds):
     if set(thresholds) != set(CATEGORY_DIRS):
@@ -42,18 +43,8 @@ def build_embedding_manifest(rows, embeddings_by_category, thresholds):
         groups = defaultdict(list)
 
         for row in active:
-            name = row["filename"]
-            video_id, separator, number = Path(name).stem.rpartition("_f")
-
-            if (
-                not video_id
-                or not separator
-                or not number.isdecimal()
-                or int(number) < 1
-            ):
-                raise ValueError(f"Invalid frame filename: {name}")
-
-            groups[video_id].append((int(number), row))
+            video_id, number = parse_frame_name(row["filename"])
+            groups[video_id].append((number, row))
 
         for video_id in sorted(groups):
             frames = sorted(groups[video_id], key=lambda item: item[0])
@@ -66,19 +57,7 @@ def build_embedding_manifest(rows, embeddings_by_category, thresholds):
                 for _, row in frames
             ])
 
-            if (
-                matrix.ndim != 2
-                or not matrix.shape[1]
-                or not np.issubdtype(matrix.dtype, np.floating)
-                or not np.isfinite(matrix).all()
-                or not np.allclose(
-                    np.linalg.norm(matrix, axis=1),
-                    1,
-                    rtol=1e-5,
-                    atol=1e-6,
-                )
-            ):
-                raise ValueError(f"Invalid normalized embeddings for {video_id}")
+            validate_embedding_matrix(matrix, video_id)
 
             selected = set(
                 k_center_greedy_threshold(matrix, thresholds[category])

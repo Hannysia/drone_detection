@@ -1,6 +1,7 @@
 import glob
 import os
 import json
+import re
 import shutil
 import logging
 from pathlib import Path
@@ -44,6 +45,26 @@ def read_yolo_bbox(label_path: Path) -> list[float]:
         parts = first_line.split()
     return list(map(float, parts[1:5]))
 
+
+_FRAME_SUFFIX_RE = re.compile(r"_f\d+$")
+
+
+def parse_video_id(filename: str | Path) -> str:
+    """Extracts video identifier from a frame or video filename."""
+    return _FRAME_SUFFIX_RE.sub("", Path(filename).stem)
+
+
+def parse_frame_name(filename: str | Path) -> tuple[str, int]:
+    """Parses '<video_id>_f<number>' into (video_id, frame_number)."""
+    video_id, separator, number = Path(filename).stem.rpartition("_f")
+    if (
+        not video_id
+        or not separator
+        or not number.isdecimal()
+        or int(number) < 1
+    ):
+        raise ValueError(f"Invalid frame filename: {filename}")
+    return video_id, int(number)
 
 
 def get_extraction_paths(
