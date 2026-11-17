@@ -5,7 +5,7 @@ from huggingface_hub import HfApi
 from src.config import (
     OUTPUT_DIR, REPO_ID, HF_TOKEN, WORKING_DIR, EXTRACTED_DATA_DIR
 )
-from src.processing.dataset import prepare_yolo_dataset
+from src.processing.yolo_dataset import prepare_yolo_dataset
 
 log = logging.getLogger(__name__)
 

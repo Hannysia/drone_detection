@@ -3,8 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from src.processing.dataset import prepare_yolo_dataset
-
+from src.processing.yolo_dataset import prepare_yolo_dataset
 
 @pytest.fixture
 def inputs(tmp_path):

@@ -2,7 +2,7 @@ import logging
 import sys
 
 from src.config import EXTRACTED_DATA_DIR, FORCE_CLASS_ID, SPLITS
-from src.processing.dataset import unify_labels_logic
+from src.processing.dataset_maintenance import unify_labels_logic
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)

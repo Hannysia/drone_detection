@@ -2,7 +2,7 @@ import logging
 import sys
 
 from src.config import LABELS_DIR, TRACKEVAL_DIR, VIDEO_EXTENSIONS
-from src.processing.dataset import prepare_trackeval_sequence
+from src.processing.trackeval_dataset import prepare_trackeval_sequence
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)

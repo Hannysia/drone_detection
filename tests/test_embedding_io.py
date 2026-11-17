@@ -36,15 +36,30 @@ def test_validate_embedding_matrix_accepts_unit_float_rows():
 @pytest.mark.parametrize(
     "matrix",
     [
+        [[1.0, 0.0]],
         np.array([1.0, 0.0]),
+        np.array([[[1.0, 0.0]]], dtype=np.float32),
         np.empty((1, 0), dtype=np.float32),
         np.empty((0, 2), dtype=np.float32),
         np.array([[1, 0]]),
         np.array([[np.nan, 0.0]]),
         np.array([[np.inf, 0.0]]),
+        np.array([[-np.inf, 0.0]]),
+        np.array([[0.0, 0.0]], dtype=np.float32),
         np.array([[2.0, 0.0]]),
+        np.array([[1.0, 0.0], [2.0, 0.0]], dtype=np.float32),
     ],
 )
 def test_validate_embedding_matrix_rejects_invalid_inputs(matrix):
     with pytest.raises(ValueError, match="L2-normalized embeddings for ctx"):
         validate_embedding_matrix(matrix, "ctx")
+
+
+def test_validate_embedding_matrix_without_context_omits_detail():
+    validate_embedding_matrix(np.array([[0.6, 0.8]], dtype=np.float64))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Expected finite, L2-normalized embeddings$",
+    ):
+        validate_embedding_matrix(np.array([[0.0, 0.0]], dtype=np.float32))

@@ -3,7 +3,7 @@ import logging
 import sys
 
 from src.config import EXTRACTED_DATA_DIR, TRASH_DIR
-from src.processing.dataset import list_trash_folders_logic, restore_from_trash_logic
+from src.processing.dataset_maintenance import list_trash_folders_logic, restore_from_trash_logic
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)
