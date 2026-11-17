@@ -2,13 +2,12 @@ import zipfile
 
 import pytest
 
-from src.processing import dataset
-
+from src.processing import trackeval_dataset
 
 @pytest.fixture
 def sequence(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        dataset,
+        trackeval_dataset,
         "get_video_metadata",
         lambda _: (640, 480, 25, 3),
     )
@@ -33,7 +32,7 @@ def test_sequence_accepts_present_gt(sequence, contents):
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("gt/gt.txt", contents)
 
-    dataset.prepare_trackeval_sequence(video, archive, folder, info)
+    trackeval_dataset.prepare_trackeval_sequence(video, archive, folder, info)
 
     expected = "1,1,2.00,3.00,4.00,5.00,1,1,1.00\n" if contents.strip() else ""
     assert (folder / "gt.txt").read_text() == expected
@@ -47,7 +46,7 @@ def test_sequence_rejects_missing_gt(sequence):
         output.writestr("not_gt.txt", b"")
 
     with pytest.raises(ValueError, match="expected exactly one gt.txt, found 0"):
-        dataset.prepare_trackeval_sequence(video, archive, folder, info)
+        trackeval_dataset.prepare_trackeval_sequence(video, archive, folder, info)
 
     assert not (folder / "gt.txt").exists()
     assert not info.exists()

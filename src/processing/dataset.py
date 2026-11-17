@@ -1,27 +1,26 @@
 import logging
-import shutil
-import os
 from pathlib import Path
-import pandas as pd
-import zipfile
-import numpy as np
-import yaml
-from src.processing.video import get_video_metadata
-from io import BytesIO
-from collections import Counter
+import shutil
 from tempfile import TemporaryDirectory
+
+import pandas as pd
 from tqdm import tqdm
-from src.config import MANIFESTS_DIR, SPLITS
-from src.processing.manifests import CATEGORY_DIRS, read_manifest
+
+from src.processing.dataset_maintenance import (
+    TRASH_FOLDER_NAMES,
+    list_trash_folders_logic,
+    restore_from_trash_logic,
+    unify_labels_logic,
+)
+from src.processing.trackeval_dataset import (
+    compile_kaggle_mot_dataset,
+    prepare_trackeval_sequence,
+)
+from src.processing.yolo_dataset import prepare_yolo_dataset, safe_symlink
 from src.utils.io import parse_video_id
 
 log = logging.getLogger(__name__)
 
-TRASH_FOLDER_NAMES = {
-    "kcenter": "local_kcenter_{type}",
-    "uniform": "uniform_sample_{type}",
-    "iou":     "iou_dedup_{type}",
-}
 
 def _extract_metadata_fields(
     filename: str,
@@ -171,197 +170,6 @@ def copy_split_videos(
         raise
 
 
-def prepare_trackeval_sequence(
-    video_path: Path, 
-    zip_path: Path, 
-    seq_gt_dir: Path, 
-    seqinfo_path: Path
-) -> None:
-    """Extracts ground truth from zip, standardizes category ID to 1, and writes metadata."""
-    width, height, fps, length = get_video_metadata(str(video_path))
-    
-    seq_name = video_path.stem
-    seqinfo_content = (
-        f"[Sequence]\nname={seq_name}\nimDir=img1\n"
-        f"frameRate={int(fps)}\nseqLength={length}\n"
-        f"imWidth={width}\nimHeight={height}\nimExt=.jpg\n"
-    )
-    
-    with zipfile.ZipFile(zip_path) as archive:
-        entries = [
-            entry
-            for entry in archive.infolist()
-            if not entry.is_dir() and Path(entry.filename).name == "gt.txt"
-        ]
-        if len(entries) != 1:
-            raise ValueError(
-                f"{zip_path}: expected exactly one gt.txt, found {len(entries)}"
-            )
-        contents = archive.read(entries[0])
-
-    target = seq_gt_dir / "gt.txt"
-
-    if contents.strip():
-        data = np.loadtxt(BytesIO(contents), delimiter=",", ndmin=2)
-        if data.shape[1] != 9:
-            raise ValueError(f"{zip_path}: expected 9 columns in gt.txt")
-
-        data[:, 7] = 1
-        np.savetxt(
-            target,
-            data,
-            fmt="%d,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f",
-        )
-    else:
-        target.write_bytes(b"")
-
-    seqinfo_path.write_text(seqinfo_content, encoding="utf-8")
-
-def list_trash_folders_logic(trash_dir: Path) -> None:
-    """Lists all available trash folders and file counts."""
-    if not trash_dir.exists():
-        log.error(f"TRASH_DIR does not exist: {trash_dir}")
-        return
-
-    log.info(f"\nAll trash folders in {trash_dir}:")
-    log.info("=" * 60)
-
-    found = False
-    for split_dir in sorted(trash_dir.iterdir()):
-        if not split_dir.is_dir():
-            continue
-        for trash_subdir in sorted(split_dir.iterdir()):
-            if not trash_subdir.is_dir():
-                continue
-            jpg_count = len(list(trash_subdir.glob("*.jpg")))
-            txt_count = len(list(trash_subdir.glob("*.txt")))
-            log.info(f"  {split_dir.name}/{trash_subdir.name}/")
-            log.info(f"    .jpg: {jpg_count}  .txt: {txt_count}")
-            found = True
-
-    if not found:
-        log.info("  (empty)")
-
-def restore_from_trash_logic(
-    split: str, 
-    embedding_type: str, 
-    stage: str, 
-    trash_base_dir: Path, 
-    extracted_data_dir: Path,
-    dry_run: bool = False
-) -> None:
-    """Moves back deleted files from a specific trash stage to the working directory."""
-    is_positive = (embedding_type == "positives")
-    subdir_name = "RAW_POSITIVES" if is_positive else "RAW_NEGATIVES"
-
-    folder_template = TRASH_FOLDER_NAMES.get(stage)
-    if folder_template is None:
-        log.error(f"Unknown stage: {stage}. Available: {list(TRASH_FOLDER_NAMES.keys())}")
-        return
-
-    trash_folder_name = folder_template.replace("{type}", embedding_type)
-    trash_dir = trash_base_dir / split / trash_folder_name
-    target_data_dir = extracted_data_dir / split / subdir_name
-
-    if not trash_dir.exists():
-        log.error(f"Trash directory not found: {trash_dir}")
-        return
-
-    if not target_data_dir.exists():
-        log.error(f"Target directory not found: {target_data_dir}")
-        return
-
-    trash_files = sorted(list(trash_dir.glob("*.jpg")))
-    total = len(trash_files)
-
-    if total == 0:
-        log.info(f"Trash is empty: {trash_dir}")
-        return
-
-    log.info(f"\nRestore: {split.upper()} / {embedding_type.upper()} / stage={stage}")
-    log.info(f"  Source:      {trash_dir}")
-    log.info(f"  Destination: {target_data_dir}")
-    log.info(f"  Files .jpg:  {total}")
-
-    if dry_run:
-        log.info("\n[DRY RUN] Changes are not being applied. First 10 files:")
-        for f in trash_files[:10]:
-            log.info(f"  {f.name} → {target_data_dir / f.name}")
-        if total > 10:
-            log.info(f"  ... and {total - 10} more files")
-        return
-
-    restored_jpg = 0
-    restored_txt = 0
-    errors = 0
-
-    from tqdm.auto import tqdm
-    for jpg_path in tqdm(trash_files, desc=f"Restoring {split}/{embedding_type}"):
-        try:
-            dest_jpg = target_data_dir / jpg_path.name
-            shutil.move(str(jpg_path), dest_jpg)
-            restored_jpg += 1
-
-            if is_positive:
-                txt_path = trash_dir / jpg_path.with_suffix(".txt").name
-                if txt_path.exists():
-                    shutil.move(str(txt_path), target_data_dir / txt_path.name)
-                    restored_txt += 1
-
-        except OSError as e:
-            log.error(f"Error: {jpg_path.name}: {e}")
-            errors += 1
-
-    log.info(f"\n[{split.upper()}] Restore completed.")
-    log.info(f"  Restored .jpg: {restored_jpg}/{total}")
-    if is_positive:
-        log.info(f"  Restored .txt: {restored_txt}")
-    if errors:
-        log.warning(f"  Errors: {errors}")
-
-
-def unify_labels_logic(base_path: Path, splits: list[str], force_class_id: str) -> None:
-    """Goes through all label files and forces the category class ID to force_class_id."""
-    log.info(f"Starting label unification at: {base_path}")
-    total_updated = 0
-
-    for split in splits:
-        label_dir = base_path / split / "RAW_POSITIVES"
-        
-        if not label_dir.exists():
-            log.warning(f"Warning: Directory {label_dir} not found. Skipping {split}...")
-            continue
-
-        log.info(f"Processing split: {split}...")
-        
-        for label_file in label_dir.glob("*.txt"):
-            try:
-                with open(label_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                
-                if not lines:
-                    continue
-
-                updated_lines = []
-                for line in lines:
-                    parts = line.strip().split()
-                    if len(parts) == 5:
-                        parts[0] = force_class_id
-                        updated_lines.append(" ".join(parts) + "\n")
-                
-                with open(label_file, 'w', encoding='utf-8') as f:
-                    f.writelines(updated_lines)
-                
-                total_updated += 1
-            except Exception as e:
-                log.error(f"Failed to overwrite label {label_file.name}: {e}")
-
-    log.info("\n" + "="*50)
-    log.info("UNIFICATION COMPLETE")
-    log.info(f"Total files updated to Class ID {force_class_id}: {total_updated}")
-    log.info("="*50)
-
-
 
 def verify_filename_syntax(
     filename: str, 
@@ -396,7 +204,6 @@ def extract_metadata_from_filename(filename: str) -> tuple[str, str, str] | None
     return shape, camera, background
 
 
-
 def parse_frame_filename_logic(filename: str) -> dict:
     """
     Parses a flat frame filename to extract metadata (shape, camera, background).
@@ -410,129 +217,3 @@ def parse_frame_filename_logic(filename: str) -> dict:
         "camera": camera or "unknown",
         "background": background or "unknown",
     }
-
-
-def compile_kaggle_mot_dataset(local_hf_dir: Path, mot_dataset_dir: Path, seqmaps_dir: Path, video_extensions: tuple[str]) -> None:
-    """Compiles local Kaggle directories and extracts MOT labels to build TrackEval dataset."""
-    seqmaps_dir.mkdir(parents=True, exist_ok=True)
-    splits = ["test", "val"]
-
-    labels_root = local_hf_dir / "labels"
-    zip_files = {z.stem: z for z in labels_root.rglob("*.zip")}
-    print(f"Found {len(zip_files)} label archives in recursive search.")
-
-    for split in splits:
-        split_video_dir = local_hf_dir / split
-        trackeval_split_name = f"drone-{split}"
-        gt_dir = mot_dataset_dir / trackeval_split_name
-        gt_dir.mkdir(parents=True, exist_ok=True)
-        
-        videos = [f for f in split_video_dir.iterdir() if f.suffix.lower() in video_extensions]
-        matched_seqs = []
-        
-        for video_path in videos:
-            seq_name = video_path.stem
-            zip_path = zip_files.get(seq_name) or zip_files.get(f"{seq_name}_annotated")
-            
-            if zip_path:
-                matched_seqs.append(seq_name)
-                seq_gt_dir = gt_dir / seq_name / "gt"
-                seq_gt_dir.mkdir(parents=True, exist_ok=True)
-                seqinfo_path = gt_dir / seq_name / "seqinfo.ini"
-                
-                prepare_trackeval_sequence(video_path, zip_path, seq_gt_dir, seqinfo_path)
-            else:
-                print(f"Warning: No matching zip archive found for video {video_path.name}")
-                
-        with open(seqmaps_dir / f"{trackeval_split_name}.txt", "w", encoding="utf-8") as f:
-            f.write("name\n" + "\n".join(matched_seqs))
-            
-    print("Dataset compilation for TrackEval complete.")
-
-
-
-def safe_symlink(src: Path, dst: Path) -> None:
-    """Creates a symbolic link, safely unlinking any existing file or link at destination first."""
-    if dst.is_symlink() or dst.exists():
-        try:
-            dst.unlink()
-        except OSError:
-            return
-    try:
-        os.symlink(src, dst)
-    except FileExistsError:
-        pass
-
-
-
-def prepare_yolo_dataset(
-    IMG_DATASET_PATH: Path,
-    working_dir: Path,
-    run_name: str,
-    use_negatives: bool,
-    *,
-    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
-) -> Path:
-    root = IMG_DATASET_PATH.resolve()
-    output = working_dir / f"yolo_dataset_{run_name}"
-    yaml_path = working_dir / f"dataset_{run_name}.yaml"
-
-    if output.exists() or output.is_symlink() or yaml_path.exists() or yaml_path.is_symlink():
-        raise FileExistsError(f"Dataset output already exists for {run_name}")
-
-    rows = read_manifest(manifest_path)
-    working_dir.mkdir(parents=True, exist_ok=True)
-    counts = Counter()
-
-    with TemporaryDirectory(dir=working_dir) as tmp:
-        staged = Path(tmp) / "dataset"
-        for split in SPLITS:
-            for kind in ("images", "labels"):
-                (staged / kind / split).mkdir(parents=True)
-
-        for row in rows:
-            split, category = row["split"], row["category"]
-            if row["excluded_at"]:
-                continue
-            if split == "train" and category == "negative" and not use_negatives:
-                continue
-
-            image = root / split / CATEGORY_DIRS[category] / row["filename"]
-            files = [("images", image)]
-            if category == "positive":
-                files.append(("labels", image.with_suffix(".txt")))
-
-            for kind, source in files:
-                if not source.is_file():
-                    raise FileNotFoundError(f"Missing selected file: {source}")
-                destination = staged / kind / split / source.name
-                try:
-                    destination.symlink_to(source)
-                except OSError as exc:
-                    if getattr(exc, "winerror", None) != 1314:
-                        raise
-                    shutil.copy2(source, destination)
-
-            counts[split, category] += 1
-
-        config = {"path": str(output.resolve()), "names": {0: "drone"}}
-        config.update({split: f"images/{split}" for split in SPLITS})
-
-        staged_yaml = Path(tmp) / "dataset.yaml"
-        staged_yaml.write_text(yaml.safe_dump(config), encoding="utf-8")
-        staged.rename(output)
-        try:
-            os.link(staged_yaml, yaml_path)
-        except OSError:
-            shutil.rmtree(output)
-            raise
-
-    for split in SPLITS:
-        log.info(
-            "%s: %d positives, %d negatives",
-            split,
-            counts[split, "positive"],
-            counts[split, "negative"],
-        )
-
-    return yaml_path
