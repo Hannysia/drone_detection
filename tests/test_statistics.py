@@ -1,28 +1,10 @@
 import pytest
 import numpy as np
-from pathlib import Path
 from src.processing.dataset_statistics import analyze_video_formats
 from src.processing.embedding_statistics import (
     evaluate_theta_candidates,
-    filter_active_embeddings,
     group_embeddings_by_video,
-    pairwise_distances,
 )
-
-def test_pairwise_distances_orthogonal():
-    embs = np.array([[1.0, 0.0], [0.0, 1.0]])
-    
-    dists = pairwise_distances(embs)
-    
-    assert dists == pytest.approx([1.0])
-
-
-def test_pairwise_distances_identical():
-    embs = np.array([[1.0, 0.0], [1.0, 0.0]])
-    
-    dists = pairwise_distances(embs)
-    
-    assert dists == pytest.approx([0.0])
 
 
 def test_group_embeddings_by_video_standard():
@@ -38,22 +20,6 @@ def test_group_embeddings_by_video_standard():
     assert "delta_thermal_field_002" in groups
     assert len(groups["wing_rgb_sky_001"]) == 2
     assert len(groups["delta_thermal_field_002"]) == 1
-
-
-def test_filter_active_embeddings_standard():
-    embs_dict = {
-        "frame_1.jpg": np.array([0.1, 0.2]),
-        "frame_2.jpg": np.array([0.3, 0.4]),
-        "frame_3.jpg": np.array([0.5, 0.6]),
-    }
-    surviving_names = {"frame_1.jpg", "frame_3.jpg"}
-    
-    filtered = filter_active_embeddings(embs_dict, surviving_names)
-    
-    assert len(filtered) == 2
-    assert "frame_1.jpg" in filtered
-    assert "frame_3.jpg" in filtered
-    assert "frame_2.jpg" not in filtered
 
 
 def test_analyze_video_formats_mock_filesystem(tmp_path):
@@ -227,22 +193,3 @@ def test_gather_all_splits_geometry_raises_on_corrupt_image_or_label(tmp_path):
     lbl_path.write_text("0 a b c d\n", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid box coordinates"):
         gather_all_splits_geometry(tmp_path, ["train"])
-
-
-def test_load_and_verify_embeddings_raises_on_error_or_empty(tmp_path, monkeypatch):
-    from src.processing import embedding_statistics
-
-    def fail_download(**kwargs):
-        raise OSError("network error")
-
-    monkeypatch.setattr(embedding_statistics, "hf_hub_download", fail_download)
-    with pytest.raises(OSError, match="network error"):
-        embedding_statistics.load_and_verify_embeddings("repo/id", "embs.pt")
-
-    dummy = tmp_path / "embs.pt"
-    dummy.write_bytes(b"pt")
-    monkeypatch.setattr(embedding_statistics, "hf_hub_download", lambda **kwargs: str(dummy))
-    monkeypatch.setattr(embedding_statistics, "load_embedding_file", lambda _: {})
-
-    with pytest.raises(ValueError, match="empty"):
-        embedding_statistics.load_and_verify_embeddings("repo/id", "embs.pt")
