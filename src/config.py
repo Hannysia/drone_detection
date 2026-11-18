@@ -62,7 +62,7 @@ else:
     _BASE_CHILDREN = {
         "FRAME_BASELINE_DIR": "frame_baseline",
         "WORKING_DIR": "working",
-        "OUTPUT_DIR": "extracted_dataset",
+        "OUTPUT_DIR": Path("working") / "runs" / "detect",
     }
 
     def __getattr__(name: str) -> Path:

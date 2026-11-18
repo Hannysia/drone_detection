@@ -43,9 +43,11 @@ def test_configured_paths(local_config, monkeypatch, tmp_path):
     monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path / "frames"))
 
     assert local_config.FRAME_BASELINE_DIR == tmp_path / "frame_baseline"
+    assert local_config.WORKING_DIR == tmp_path / "working"
+    assert local_config.OUTPUT_DIR == local_config.WORKING_DIR / "runs" / "detect"
     assert local_config.EXTRACTED_DATA_DIR == tmp_path / "frames"
 
-
+    
 @pytest.mark.parametrize("attached", [True, False])
 def test_kaggle_selects_configured_dataset(monkeypatch, tmp_path, attached):
     owner = tmp_path / "datasets" / "hannusiaknysh"
