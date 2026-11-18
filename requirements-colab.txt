@@ -1,8 +1,6 @@
-torch
-torchvision
-ultralytics
-wandb
-huggingface_hub
-pyyaml
-python-dotenv
+ultralytics>=8.4.68,<=8.4.72
+wandb>=0.19,<1
+huggingface_hub>=0.24
+pyyaml>=6,<7
+python-dotenv>=1,<2
 kagglehub
