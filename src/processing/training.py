@@ -237,6 +237,13 @@ def _start_wandb_run(
     return wandb
 
 
+def _assert_gpu_available() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU is required for training; enable GPU accelerator before continuing"
+        )
+
+
 def run_yolo_training(
     yaml_path: Path,
     run_name: str,
@@ -245,10 +252,13 @@ def run_yolo_training(
     upload_to_hf: bool = True,
     use_wandb: bool | None = None,
     backup_every_n_epochs: int = 10,
+    require_gpu: bool = False,
     **train_kwargs,
 ) -> Path:
     """Runs YOLO training with pre-flight checks, monitoring curves, W&B logging, and HF upload."""
     validated_name = _validate_run_name(run_name)
+    if require_gpu:
+        _assert_gpu_available()
     if backup_every_n_epochs < 0:
         raise ValueError("backup_every_n_epochs must be non-negative")
     if not yaml_path.is_file():
@@ -381,10 +391,13 @@ def run_full_pipeline(
     use_wandb: bool | None = None,
     backup_every_n_epochs: int = 10,
     cleanup_dataset: bool = True,
+    require_gpu: bool = False,
     **train_kwargs,
 ) -> Path:
     """Prepares dataset, runs YOLO training with monitoring/uploads, and cleans staged data."""
     validated_name = _validate_run_name(run_name)
+    if require_gpu:
+        _assert_gpu_available()
     if not dataset_root.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_root}")
 

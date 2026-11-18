@@ -333,3 +333,49 @@ def test_periodic_hf_backup_snapshots_intervals_and_tolerates_errors(tmp_path, m
         ("runs/run_bk", "Backup YOLO run_bk at epoch 10", ["results.csv", "weights/best.pt", "weights/last.pt"]),
         ("runs/run_bk", "Backup YOLO run_bk at epoch 20", ["results.csv", "weights/best.pt", "weights/last.pt"]),
     ]
+
+
+def test_require_gpu_fails_fast_when_cuda_unavailable(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+    root = tmp_path / "curated"
+    root.mkdir()
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+    prepare = Mock()
+    yolo_cls = Mock()
+    monkeypatch.setattr(training, "prepare_yolo_dataset", prepare)
+    monkeypatch.setattr(training, "YOLO", yolo_cls)
+    monkeypatch.setattr(training.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA GPU is required"):
+        training.run_yolo_training(
+            yaml_path,
+            "run_gpu",
+            upload_to_hf=False,
+            require_gpu=True,
+        )
+    with pytest.raises(RuntimeError, match="CUDA GPU is required"):
+        training.run_full_pipeline(
+            False,
+            "run_gpu",
+            dataset_root=root,
+            upload_to_hf=False,
+            require_gpu=True,
+        )
+    prepare.assert_not_called()
+    yolo_cls.assert_not_called()
+    fit = Mock(return_value=tmp_path / "best.pt")
+    monkeypatch.setattr(training.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(training, "prepare_yolo_dataset", Mock(return_value=yaml_path))
+    monkeypatch.setattr(training, "run_yolo_training", fit)
+    monkeypatch.setattr(training, "cleanup_yolo_dataset", Mock())
+    assert (
+        training.run_full_pipeline(
+            False,
+            "run_gpu",
+            dataset_root=root,
+            upload_to_hf=False,
+            require_gpu=True,
+        )
+        == tmp_path / "best.pt"
+    )
+    fit.assert_called_once()
