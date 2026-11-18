@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 VIDEO_EXTENSIONS = ['.mp4', '.mov', '.m4v']
@@ -9,6 +10,11 @@ MANIFESTS_DIR = PROJECT_ROOT / "manifests"
 HISTORICAL_MANIFEST = MANIFESTS_DIR / "historical" / "final.csv"
 
 IS_KAGGLE = os.environ.get('KAGGLE_KERNEL_RUN_TYPE', '') != ''
+IS_COLAB = not IS_KAGGLE and (
+    os.environ.get('COLAB_RELEASE_TAG', '') != ''
+    or os.environ.get('COLAB_GPU', '') != ''
+    or 'google.colab' in sys.modules
+)
 
 EMBEDDING_MODEL_NAME = "dinov2_vitb14"
 EMBEDDING_MODEL_REVISION = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
@@ -20,40 +26,55 @@ def _clean_secret(value: object, default: str | None = None) -> str | None:
         stripped = value.strip()
         return stripped if stripped else default
     return default if value is None else value
-def _get_kaggle_secret(client, name: str, default: str | None = None) -> str | None:
+
+
+def _get_secret(getter, name: str, default: str | None = None) -> str | None:
     try:
-        value = client.get_secret(name)
+        value = getter(name)
     except Exception:
         value = os.getenv(name)
     return _clean_secret(value, default)
 
 
-if IS_KAGGLE:
-    from kaggle_secrets import UserSecretsClient
-    
-    user_secrets = UserSecretsClient()
-    REPO_ID = _get_kaggle_secret(user_secrets, "REPO_ID")
-    HF_TOKEN = _get_kaggle_secret(user_secrets, "HF_TOKEN")
-    WANDB_API_KEY = _get_kaggle_secret(user_secrets, "WANDB_API_KEY")
-    WANDB_PROJECT = _get_kaggle_secret(user_secrets, "WANDB_PROJECT", "drone-detection")
-    
-    KAGGLE_INPUT_DIR = Path("/kaggle/input")
-    IMG_DATASET_NAME = "uav-detection-dataset"
-    EXTRACTED_DATA_DIR = (
-        KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh"
-        / IMG_DATASET_NAME / "extracted_dataset"
-    )
-    WORKING_DIR = Path("/kaggle/working")
+if IS_KAGGLE or IS_COLAB:
+    if IS_KAGGLE:
+        from kaggle_secrets import UserSecretsClient
+
+        _secret_getter = UserSecretsClient().get_secret
+        KAGGLE_INPUT_DIR = Path("/kaggle/input")
+        IMG_DATASET_NAME = "uav-detection-dataset"
+        EXTRACTED_DATA_DIR = (
+            KAGGLE_INPUT_DIR / "datasets" / "hannusiaknysh"
+            / IMG_DATASET_NAME / "extracted_dataset"
+        )
+        WORKING_DIR = Path("/kaggle/working")
+    else:
+        from google.colab import userdata
+
+        _secret_getter = userdata.get
+        WORKING_DIR = Path("/content")
+        EXTRACTED_DATA_DIR = Path(
+            _get_secret(_secret_getter, "EXTRACTED_DATA_PATH")
+            or str(WORKING_DIR / "extracted_dataset")
+        )
+        for _kaggle_key in ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN"):
+            _secret_val = _get_secret(_secret_getter, _kaggle_key)
+            if _secret_val and not os.getenv(_kaggle_key):
+                os.environ[_kaggle_key] = _secret_val
+
+    REPO_ID = _get_secret(_secret_getter, "REPO_ID")
+    HF_TOKEN = _get_secret(_secret_getter, "HF_TOKEN")
+    WANDB_API_KEY = _get_secret(_secret_getter, "WANDB_API_KEY")
+    WANDB_PROJECT = _get_secret(_secret_getter, "WANDB_PROJECT", "drone-detection")
+
     FRAME_BASELINE_DIR = WORKING_DIR / "frame_baseline"
-    OUTPUT_DIR = WORKING_DIR / "runs" / "detect" 
-    EMBEDDINGS_DIR = Path("/kaggle/working/embeddings")
-    
+    OUTPUT_DIR = WORKING_DIR / "runs" / "detect"
+    EMBEDDINGS_DIR = WORKING_DIR / "embeddings"
     MOT_DATASET_DIR = WORKING_DIR / "drone_mot_dataset"
     SEQMAPS_DIR = MOT_DATASET_DIR / "seqmaps"
     YOLO_DETECTIONS_OUT = WORKING_DIR / "yolo_detections"
     YOLO_MODEL_PATH_PT = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.pt"
     YOLO_MODEL_PATH_ENGINE = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.engine"
-
     TRACKERS_OUT_DIR = WORKING_DIR / "trackers"
     LOCAL_HF_DATA_DIR = WORKING_DIR / "drone_dataset"
 

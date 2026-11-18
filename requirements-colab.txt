@@ -1,0 +1,8 @@
+torch
+torchvision
+ultralytics
+wandb
+huggingface_hub
+pyyaml
+python-dotenv
+kagglehub

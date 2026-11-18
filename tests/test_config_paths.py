@@ -11,6 +11,8 @@ import pytest
 @pytest.fixture
 def local_config(monkeypatch):
     monkeypatch.delenv("KAGGLE_KERNEL_RUN_TYPE", raising=False)
+    monkeypatch.delenv("COLAB_RELEASE_TAG", raising=False)
+    monkeypatch.delenv("COLAB_GPU", raising=False)
     monkeypatch.delenv("LOCAL_BASE_DIR", raising=False)
     monkeypatch.delenv("EXTRACTED_DATA_PATH", raising=False)
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
@@ -112,3 +114,43 @@ def test_wandb_secret_defaults_and_kaggle_fallback(local_config, monkeypatch):
     assert kaggle_loaded["HF_TOKEN"] == "secret-HF_TOKEN"
     assert kaggle_loaded["WANDB_API_KEY"] is None
     assert kaggle_loaded["WANDB_PROJECT"] == "drone-detection"
+
+
+def test_colab_config_uses_userdata_and_content_paths(monkeypatch):
+    config_file = Path(__file__).resolve().parents[1] / "src" / "config.py"
+    secrets = {
+        "REPO_ID": "user/repo",
+        "HF_TOKEN": "hf_colab",
+        "WANDB_API_KEY": "wb_colab",
+        "KAGGLE_USERNAME": "anna",
+        "KAGGLE_KEY": "k_secret",
+    }
+
+    def get_secret(name):
+        if name not in secrets:
+            raise LookupError(name)
+        return secrets[name]
+
+    fake_colab = SimpleNamespace(userdata=SimpleNamespace(get=get_secret))
+    monkeypatch.delenv("KAGGLE_KERNEL_RUN_TYPE", raising=False)
+    monkeypatch.setenv("COLAB_RELEASE_TAG", "release-test")
+    monkeypatch.setenv("KAGGLE_USERNAME", "")
+    monkeypatch.setenv("KAGGLE_KEY", "")
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(colab=fake_colab))
+    monkeypatch.setitem(sys.modules, "google.colab", fake_colab)
+
+    colab_loaded = runpy.run_path(str(config_file))
+
+    assert colab_loaded["IS_KAGGLE"] is False
+    assert colab_loaded["IS_COLAB"] is True
+    assert colab_loaded["WORKING_DIR"] == Path("/content")
+    assert colab_loaded["OUTPUT_DIR"] == Path("/content/runs/detect")
+    assert colab_loaded["REPO_ID"] == "user/repo"
+    assert colab_loaded["HF_TOKEN"] == "hf_colab"
+    assert colab_loaded["WANDB_API_KEY"] == "wb_colab"
+    assert colab_loaded["WANDB_PROJECT"] == "drone-detection"
+    assert colab_loaded["os"].environ["KAGGLE_USERNAME"] == "anna"
+    assert colab_loaded["os"].environ["KAGGLE_KEY"] == "k_secret"
