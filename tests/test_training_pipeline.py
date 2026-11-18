@@ -1,114 +1,250 @@
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
 
-def test_pipeline_returns_weights_without_test_evaluation(tmp_path, monkeypatch):
+
+def _load_training(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
     monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path))
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
 
     from src.processing import training
 
-    monkeypatch.setattr(training, "EXTRACTED_DATA_DIR", tmp_path)
+    monkeypatch.setattr(training, "WANDB_API_KEY", None)
+    monkeypatch.setattr(training, "_configure_ultralytics_wandb", Mock())
+    return training
 
+
+def test_pipeline_requires_explicit_dataset_root_and_cleans_up(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    root = tmp_path / "curated"
+    root.mkdir()
     yaml_path = tmp_path / "dataset.yaml"
     weights = tmp_path / "best.pt"
+
+    hf_check = Mock()
+    prepare = Mock(return_value=yaml_path)
     fit = Mock(return_value=weights)
+    cleanup = Mock()
     evaluate = Mock()
 
-    monkeypatch.setattr(
-        training, "prepare_yolo_dataset", Mock(return_value=yaml_path)
-    )
+    monkeypatch.setattr(training, "assert_hf_ready", hf_check)
+    monkeypatch.setattr(training, "prepare_yolo_dataset", prepare)
     monkeypatch.setattr(training, "run_yolo_training", fit)
+    monkeypatch.setattr(training, "cleanup_yolo_dataset", cleanup)
     monkeypatch.setitem(
         sys.modules,
         "src.processing.evaluation",
         SimpleNamespace(evaluate_model=evaluate),
     )
 
-    assert training.run_full_pipeline(False, "example") == weights
-    fit.assert_called_once_with(yaml_path, "example")
+    with pytest.raises(TypeError):
+        training.run_full_pipeline(False, "example")
+
+    assert training.run_full_pipeline(False, "example", dataset_root=root, epochs=25) == weights
+    hf_check.assert_called_once_with()
+    prepare.assert_called_once_with(
+        root,
+        training.WORKING_DIR,
+        "example",
+        False,
+        source_path=None,
+        overwrite=True,
+    )
+    fit.assert_called_once_with(
+        yaml_path,
+        "example",
+        model_type="yolo26n.pt",
+        upload_to_hf=True,
+        use_wandb=None,
+        epochs=25,
+    )
+    cleanup.assert_called_once_with(training.WORKING_DIR, "example")
     evaluate.assert_not_called()
 
 
-def test_training_uses_current_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
-    monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path))
-    from src.processing import training
+def test_pipeline_cleans_up_even_when_training_fails(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
 
-    current = tmp_path / "run10" / "weights" / "best.pt"
-    older = tmp_path / "run9" / "weights" / "best.pt"
-    for path in (current, older):
-        path.parent.mkdir(parents=True)
-        path.touch()
+    root = tmp_path / "curated"
+    root.mkdir()
+    cleanup = Mock()
+
+    monkeypatch.setattr(training, "prepare_yolo_dataset", Mock(return_value=tmp_path / "d.yaml"))
+    monkeypatch.setattr(training, "run_yolo_training", Mock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(training, "cleanup_yolo_dataset", cleanup)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        training.run_full_pipeline(True, "run", dataset_root=root, upload_to_hf=False)
+
+    cleanup.assert_called_once_with(training.WORKING_DIR, "run")
+
+
+def test_training_uses_safe_defaults_plots_curves_and_uploads_artifacts(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    run_dir = tmp_path / "run10"
+    current = run_dir / "weights" / "best.pt"
+    current.parent.mkdir(parents=True)
+    current.touch()
+
+    results_csv = run_dir / "results.csv"
+    results_csv.write_text(
+        "epoch,train/box_loss,train/cls_loss,val/box_loss,val/cls_loss,"
+        "metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "1,1.0,0.8,1.1,0.9,0.80,0.75,0.78,0.52\n",
+        encoding="utf-8",
+    )
 
     model = Mock()
     model.train.return_value = None
     model.trainer.best = current
-    upload = Mock()
+    model.trainer.save_dir = run_dir
+
+    hf_check = Mock()
+    upload_ckpt = Mock()
+    upload_dir = Mock()
     monkeypatch.setattr(training, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(training, "YOLO", Mock(return_value=model))
-    monkeypatch.setattr(training, "upload_checkpoint_to_hf", upload)
+    monkeypatch.setattr(training, "assert_hf_ready", hf_check)
+    monkeypatch.setattr(training, "upload_checkpoint_to_hf", upload_ckpt)
+    monkeypatch.setattr(training, "upload_run_artifacts_to_hf", upload_dir)
 
-    yaml = tmp_path / "dataset.yaml"
-    assert training.run_yolo_training(yaml, "run") == current
-    upload.assert_called_once_with(current, "run")
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+
+    assert training.run_yolo_training(yaml_path, "run") == current
+    hf_check.assert_called_once_with()
+    assert model.train.call_args.kwargs["cache"] is False
+    assert model.train.call_args.kwargs["rect"] is True
+    assert model.train.call_args.kwargs["imgsz"] == 1280
+    assert model.train.call_args.kwargs["batch"] == 8
+    assert model.train.call_args.kwargs["epochs"] == 50
+    assert model.train.call_args.kwargs["patience"] == 15
+    assert (run_dir / "training_curves_run.png").is_file()
+    upload_ckpt.assert_called_once_with(current, "run")
+    upload_dir.assert_called_once_with(run_dir, "run")
 
     current.unlink()
     with pytest.raises(FileNotFoundError):
-        training.run_yolo_training(yaml, "run")
-    assert upload.call_count == 1
+        training.run_yolo_training(yaml_path, "run")
+    assert upload_ckpt.call_count == 1
+    assert upload_dir.call_count == 1
 
 
+def test_training_fails_fast_before_yolo_when_hf_or_wandb_unready(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
 
-def test_pipeline_uses_explicit_dataset_root(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
-    monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path / "old_export"))
-
-    from src.processing import training
-
-    root = tmp_path / "curated_export"
-    root.mkdir()
     yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+    yolo_cls = Mock()
+    monkeypatch.setattr(training, "YOLO", yolo_cls)
+    monkeypatch.setattr(training, "REPO_ID", None)
+    monkeypatch.setattr(training, "HF_TOKEN", None)
+
+    with pytest.raises(ValueError, match="REPO_ID"):
+        training.run_yolo_training(yaml_path, "run", upload_to_hf=True)
+
+    with pytest.raises(ValueError, match="WANDB_API_KEY"):
+        training.run_yolo_training(yaml_path, "run", upload_to_hf=False, use_wandb=True)
+
+    yolo_cls.assert_not_called()
+
+
+def test_assert_hf_ready_validates_credentials_role_and_repo(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(training, "REPO_ID", " ")
+    monkeypatch.setattr(training, "HF_TOKEN", "tok")
+    with pytest.raises(ValueError, match="REPO_ID"):
+        training.assert_hf_ready()
+
+    api_read = Mock()
+    api_read.whoami.return_value = {"auth": {"accessToken": {"role": "read"}}}
+    monkeypatch.setattr(training, "REPO_ID", "user/repo")
+    monkeypatch.setattr(training, "HF_TOKEN", "hf_read")
+    monkeypatch.setattr(training, "HfApi", Mock(return_value=api_read))
+    with pytest.raises(PermissionError, match="read-only"):
+        training.assert_hf_ready()
+
+    api_write = Mock()
+    api_write.whoami.return_value = {"auth": {"accessToken": {"role": "write"}}}
+    monkeypatch.setattr(training, "HfApi", Mock(return_value=api_write))
+    assert training.assert_hf_ready() == ("user/repo", "hf_read")
+    api_write.repo_info.assert_called_once_with(repo_id="user/repo", repo_type="dataset")
+
+
+def test_upload_helpers_validate_and_propagate_errors(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
     weights = tmp_path / "best.pt"
-
-    prepare = Mock(return_value=yaml_path)
-    train = Mock(return_value=weights)
-    monkeypatch.setattr(training, "EXTRACTED_DATA_DIR", tmp_path / "old_export")
-    monkeypatch.setattr(training, "prepare_yolo_dataset", prepare)
-    monkeypatch.setattr(training, "run_yolo_training", train)
-
-    result = training.run_full_pipeline(
-        False, "example", dataset_root=root, epochs=25
-    )
-
-    prepare.assert_called_once_with(root, training.WORKING_DIR, "example", False)
-    train.assert_called_once_with(yaml_path, "example", epochs=25)
-    assert result == weights
-
-
-
-def test_upload_checkpoint_to_hf_validates_and_propagates_errors(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
-    monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path))
-
-    from src.processing import training
-
-    weights = tmp_path / "best.pt"
+    run_dir = tmp_path / "run_dir"
 
     monkeypatch.setattr(training, "REPO_ID", None)
     monkeypatch.setattr(training, "HF_TOKEN", None)
-    training.upload_checkpoint_to_hf(weights, "run")
+    with pytest.raises(ValueError, match="REPO_ID"):
+        training.upload_checkpoint_to_hf(weights, "run")
+    with pytest.raises(ValueError, match="REPO_ID"):
+        training.upload_run_artifacts_to_hf(run_dir, "run")
 
     monkeypatch.setattr(training, "REPO_ID", "repo/test")
     monkeypatch.setattr(training, "HF_TOKEN", "token-test")
     with pytest.raises(FileNotFoundError, match="Checkpoint file not found"):
         training.upload_checkpoint_to_hf(weights, "run")
+    with pytest.raises(FileNotFoundError, match="Training run directory not found"):
+        training.upload_run_artifacts_to_hf(run_dir, "run")
 
     weights.write_bytes(b"pt")
+    run_dir.mkdir()
     api = Mock()
-    api.upload_file.side_effect = RuntimeError("hf unreachable")
+    api.upload_file.side_effect = RuntimeError("hf upload_file error")
+    api.upload_folder.side_effect = RuntimeError("hf upload_folder error")
     monkeypatch.setattr(training, "HfApi", Mock(return_value=api))
 
-    with pytest.raises(RuntimeError, match="hf unreachable"):
+    with pytest.raises(RuntimeError, match="hf upload_file error"):
         training.upload_checkpoint_to_hf(weights, "run")
+    with pytest.raises(RuntimeError, match="hf upload_folder error"):
+        training.upload_run_artifacts_to_hf(run_dir, "run")
+
+
+def test_wandb_lifecycle_finishes_on_success_and_error(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+    best = tmp_path / "run_wb" / "weights" / "best.pt"
+    best.parent.mkdir(parents=True)
+    best.touch()
+
+    fake_wandb = SimpleNamespace(
+        run=object(),
+        login=Mock(return_value=True),
+        init=Mock(),
+        finish=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setattr(training, "WANDB_API_KEY", "wb-secret")
+    monkeypatch.setattr(training, "WANDB_PROJECT", "uav-proj")
+
+    ok_model = Mock()
+    ok_model.train.return_value = None
+    ok_model.trainer.best = best
+    monkeypatch.setattr(training, "YOLO", Mock(return_value=ok_model))
+
+    training.run_yolo_training(yaml_path, "run_wb", upload_to_hf=False, use_wandb=True)
+    fake_wandb.login.assert_called_once_with(key="wb-secret", relogin=True)
+    assert fake_wandb.init.call_args.kwargs["project"] == "uav-proj"
+    assert fake_wandb.init.call_args.kwargs["name"] == "run_wb"
+    fake_wandb.finish.assert_any_call(exit_code=0)
+
+    fake_wandb.finish.reset_mock()
+    bad_model = Mock()
+    bad_model.train.side_effect = RuntimeError("cuda oom")
+    monkeypatch.setattr(training, "YOLO", Mock(return_value=bad_model))
+
+    with pytest.raises(RuntimeError, match="cuda oom"):
+        training.run_yolo_training(yaml_path, "run_wb", upload_to_hf=False, use_wandb=True)
+    fake_wandb.finish.assert_any_call(exit_code=1)

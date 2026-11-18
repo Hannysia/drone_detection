@@ -78,3 +78,35 @@ def test_kaggle_selects_configured_dataset(monkeypatch, tmp_path, attached):
     config = runpy.run_path(str(config_file))
 
     assert config["EXTRACTED_DATA_DIR"] == kaggle_owner / expected.relative_to(owner)
+
+
+def test_wandb_secret_defaults_and_kaggle_fallback(local_config, monkeypatch):
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
+    assert local_config.WANDB_PROJECT == "drone-detection"
+
+    monkeypatch.setenv("WANDB_API_KEY", "  wb-key  ")
+    monkeypatch.setenv("WANDB_PROJECT", " custom-proj ")
+    config_file = Path(__file__).resolve().parents[1] / "src" / "config.py"
+    local_loaded = runpy.run_path(str(config_file))
+    assert local_loaded["WANDB_API_KEY"] == "wb-key"
+    assert local_loaded["WANDB_PROJECT"] == "custom-proj"
+
+    def get_secret(name):
+        if name.startswith("WANDB"):
+            raise RuntimeError("missing secret")
+        return f"secret-{name}"
+
+    monkeypatch.setenv("KAGGLE_KERNEL_RUN_TYPE", "Interactive")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "kaggle_secrets",
+        SimpleNamespace(UserSecretsClient=Mock(return_value=SimpleNamespace(get_secret=get_secret))),
+    )
+    kaggle_loaded = runpy.run_path(str(config_file))
+    assert kaggle_loaded["REPO_ID"] == "secret-REPO_ID"
+    assert kaggle_loaded["HF_TOKEN"] == "secret-HF_TOKEN"
+    assert kaggle_loaded["WANDB_API_KEY"] is None
+    assert kaggle_loaded["WANDB_PROJECT"] == "drone-detection"

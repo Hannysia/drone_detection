@@ -14,12 +14,28 @@ EMBEDDING_MODEL_NAME = "dinov2_vitb14"
 EMBEDDING_MODEL_REVISION = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
 EMBEDDING_BATCH_SIZE = 64
 
+
+def _clean_secret(value: object, default: str | None = None) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else default
+    return default if value is None else value
+def _get_kaggle_secret(client, name: str, default: str | None = None) -> str | None:
+    try:
+        value = client.get_secret(name)
+    except Exception:
+        value = os.getenv(name)
+    return _clean_secret(value, default)
+
+
 if IS_KAGGLE:
     from kaggle_secrets import UserSecretsClient
     
     user_secrets = UserSecretsClient()
-    REPO_ID = user_secrets.get_secret("REPO_ID")
-    HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
+    REPO_ID = _get_kaggle_secret(user_secrets, "REPO_ID")
+    HF_TOKEN = _get_kaggle_secret(user_secrets, "HF_TOKEN")
+    WANDB_API_KEY = _get_kaggle_secret(user_secrets, "WANDB_API_KEY")
+    WANDB_PROJECT = _get_kaggle_secret(user_secrets, "WANDB_PROJECT", "drone-detection")
     
     KAGGLE_INPUT_DIR = Path("/kaggle/input")
     IMG_DATASET_NAME = "uav-detection-dataset"
@@ -79,8 +95,10 @@ else:
         path = Path(value)
         return path / child if child is not None else path
 
-    REPO_ID = os.getenv("REPO_ID")
-    HF_TOKEN = os.getenv("HF_TOKEN")
+    REPO_ID = _clean_secret(os.getenv("REPO_ID"))
+    HF_TOKEN = _clean_secret(os.getenv("HF_TOKEN"))
+    WANDB_API_KEY = _clean_secret(os.getenv("WANDB_API_KEY"))
+    WANDB_PROJECT = _clean_secret(os.getenv("WANDB_PROJECT"), "drone-detection")
 
     HASH_THRESHOLD = 5
 

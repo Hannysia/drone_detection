@@ -1,72 +1,195 @@
 import logging
+import os
 from pathlib import Path
-from ultralytics import YOLO
+
+import torch
 from huggingface_hub import HfApi
+from ultralytics import YOLO
+
 from src.config import (
-    OUTPUT_DIR, REPO_ID, HF_TOKEN, WORKING_DIR, EXTRACTED_DATA_DIR
+    HF_TOKEN,
+    OUTPUT_DIR,
+    REPO_ID,
+    WANDB_API_KEY,
+    WANDB_PROJECT,
+    WORKING_DIR,
 )
-from src.processing.yolo_dataset import prepare_yolo_dataset
+from src.processing.yolo_dataset import (
+    _validate_run_name,
+    cleanup_yolo_dataset,
+    prepare_yolo_dataset,
+)
+from src.utils.visualization import plot_yolo_training_curves
 
 log = logging.getLogger(__name__)
 
 
-def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
-    """Uploads model weights to Hugging Face repository under an isolated path."""
-    if not REPO_ID or not HF_TOKEN:
-        log.info("[INFO] Hugging Face upload skipped: credentials missing.")
-        return
+def _require_hf_credentials(
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> tuple[str, str]:
+    target_repo = REPO_ID if repo_id is None else repo_id
+    target_token = HF_TOKEN if token is None else token
+    if not isinstance(target_repo, str) or not target_repo.strip():
+        raise ValueError("REPO_ID is required for Hugging Face operations")
+    if not isinstance(target_token, str) or not target_token.strip():
+        raise ValueError("HF_TOKEN is required for Hugging Face operations")
+    return target_repo.strip(), target_token.strip()
 
+
+def assert_hf_ready(
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> tuple[str, str]:
+    """Validates Hugging Face credentials, token write role, and repository access."""
+    target_repo, target_token = _require_hf_credentials(repo_id, token)
+    api = HfApi(token=target_token)
+    identity = api.whoami()
+    if isinstance(identity, dict):
+        token_info = (identity.get("auth") or {}).get("accessToken") or {}
+        if isinstance(token_info, dict) and token_info.get("role") == "read":
+            raise PermissionError("HF_TOKEN has read-only access; a write token is required")
+    api.repo_info(repo_id=target_repo, repo_type="dataset")
+    return target_repo, target_token
+
+
+def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
+    """Uploads best model weights to Hugging Face under the canonical models path."""
+    validated_name = _validate_run_name(run_name)
+    repo_id, token = _require_hf_credentials()
     if not weights_path.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {weights_path}")
 
-    log.info(f"[HF UPLOAD] Uploading checkpoint for {run_name} to Hugging Face...")
+    log.info("Uploading checkpoint for %s to Hugging Face...", validated_name)
+    api = HfApi(token=token)
+    api.upload_file(
+        path_or_fileobj=str(weights_path),
+        path_in_repo=f"models/yolo26n_{validated_name}_best.pt",
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Upload YOLO checkpoint for {validated_name}",
+    )
+    log.info("Uploaded checkpoint for %s to Hugging Face.", validated_name)
+
+
+def upload_run_artifacts_to_hf(run_dir: Path, run_name: str) -> None:
+    """Uploads full YOLO training directory (weights, CSV, YAML, plots) to Hugging Face."""
+    validated_name = _validate_run_name(run_name)
+    repo_id, token = _require_hf_credentials()
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Training run directory not found: {run_dir}")
+
+    log.info("Uploading run artifacts for %s to Hugging Face...", validated_name)
+    api = HfApi(token=token)
+    api.upload_folder(
+        folder_path=str(run_dir),
+        path_in_repo=f"runs/{validated_name}",
+        repo_id=repo_id,
+        repo_type="dataset",
+        ignore_patterns=["*.cache", "__pycache__/*"],
+        commit_message=f"Upload YOLO training artifacts for {validated_name}",
+    )
+    log.info("Uploaded run artifacts for %s to Hugging Face.", validated_name)
+
+
+def _resolve_wandb_key(api_key: str | None = None) -> str | None:
+    candidate = WANDB_API_KEY if api_key is None else api_key
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    env_value = os.getenv("WANDB_API_KEY")
+    return env_value.strip() if env_value and env_value.strip() else None
+
+
+def _configure_ultralytics_wandb(enabled: bool) -> None:
+    from ultralytics import settings
+
+    if settings.get("wandb") != enabled:
+        settings.update({"wandb": enabled})
+
+
+def assert_wandb_ready(
+    api_key: str | None = None,
+    project: str | None = None,
+) -> tuple[object, str, str]:
+    """Validates Weights & Biases credentials, project name, and client authentication."""
+    resolved_key = _resolve_wandb_key(api_key)
+    if not resolved_key:
+        raise ValueError("WANDB_API_KEY is required when Weights & Biases is enabled")
+
+    target_project = WANDB_PROJECT if project is None else project
+    if not isinstance(target_project, str) or not target_project.strip():
+        raise ValueError("WANDB_PROJECT is required when Weights & Biases is enabled")
+
     try:
-        api = HfApi(token=HF_TOKEN)
-        api.upload_file(
-            path_or_fileobj=str(weights_path),
-            path_in_repo=f"models/yolo26n_{run_name}_best.pt",
-            repo_id=REPO_ID,
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        log.info("[SUCCESS] Checkpoint successfully uploaded to Hugging Face.")
-    except Exception as exc:
-        log.error(f"Hugging Face upload failed for {run_name}: {exc}")
-        raise
+        import wandb
+    except ImportError as exc:
+        raise ImportError("wandb package is required when Weights & Biases is enabled") from exc
+
+    if not wandb.login(key=resolved_key, relogin=True):
+        raise RuntimeError("Weights & Biases login failed")
+
+    return wandb, target_project.strip(), resolved_key
+
+
+def _start_wandb_run(
+    run_name: str,
+    config: dict,
+    use_wandb: bool | None,
+) -> object | None:
+    enabled = _resolve_wandb_key() is not None if use_wandb is None else use_wandb
+    if not enabled:
+        _configure_ultralytics_wandb(False)
+        return None
+
+    wandb, target_project, resolved_key = assert_wandb_ready()
+    os.environ["WANDB_API_KEY"] = resolved_key
+    os.environ["WANDB_PROJECT"] = target_project
+    _configure_ultralytics_wandb(True)
+    if getattr(wandb, "run", None) is not None:
+        wandb.finish()
+    wandb.init(
+        project=target_project,
+        name=run_name,
+        job_type="train",
+        config=config,
+        reinit=True,
+    )
+    return wandb
 
 
 def run_yolo_training(
-    yaml_path: Path, 
+    yaml_path: Path,
     run_name: str,
     model_type: str = "yolo26n.pt",
-    **train_kwargs
+    *,
+    upload_to_hf: bool = True,
+    use_wandb: bool | None = None,
+    **train_kwargs,
 ) -> Path:
-    """Initializes and runs the training pipeline with custom train kwargs."""
-    log.info("\n" + "="*80)
-    log.info(f"STARTING YOLO TRAINING RUN: {run_name.upper()}")
-    log.info("="*80)
-    log.info(f"Loading weights: {model_type}")
-
-    model = YOLO(model_type)
+    """Runs YOLO training with pre-flight checks, monitoring curves, W&B logging, and HF upload."""
+    validated_name = _validate_run_name(run_name)
+    if not yaml_path.is_file():
+        raise FileNotFoundError(f"Dataset YAML not found: {yaml_path}")
+    if upload_to_hf:
+        assert_hf_ready()
 
     default_args = {
         "epochs": 50,
         "imgsz": 1280,
         "batch": 8,
         "patience": 15,
-        "device": 0,
+        "device": 0 if torch.cuda.is_available() else "cpu",
         "optimizer": "auto",
         "rect": True,
-        "cache": "disk",
+        "cache": False,
         "workers": 2,
         "seed": 42,
         "deterministic": True,
         "project": str(OUTPUT_DIR),
-        "name": run_name,
+        "name": validated_name,
         "exist_ok": True,
         "save": True,
         "plots": True,
-        
         "mosaic": 0.0,
         "mixup": 0.0,
         "copy_paste": 0.0,
@@ -79,40 +202,117 @@ def run_yolo_training(
         "hsv_s": 0.0,
         "hsv_v": 0.0,
     }
-
     default_args.update(train_kwargs)
-    results = model.train(data=str(yaml_path), **default_args)
 
-    best_weights = Path(model.trainer.best)
-    if not best_weights.is_file():
-        raise FileNotFoundError(f"Checkpoint missing after training: {best_weights}")
+    wb = _start_wandb_run(
+        validated_name,
+        {**default_args, "data": str(yaml_path), "model": model_type},
+        use_wandb,
+    )
 
-    if results is not None and hasattr(results, "results_dict"):
-        metrics = results.results_dict
-        log.info("\n" + "="*50)
-        log.info(f"METRICS REPORT ({run_name.upper()})")
-        log.info("="*50)
-        log.info(f"Precision (P):   {metrics.get('metrics/precision(B)', 0.0):.4f}")
-        log.info(f"Recall (R):      {metrics.get('metrics/recall(B)', 0.0):.4f}")
-        log.info(f"mAP50:           {metrics.get('metrics/mAP50(B)', 0.0):.4f}")
-        log.info(f"mAP50-95:        {metrics.get('metrics/mAP50-95(B)', 0.0):.4f}")
-        log.info("="*50)
+    failed = False
+    try:
+        log.info("Starting YOLO training run: %s (model=%s)", validated_name, model_type)
+        model = YOLO(model_type)
+        results = model.train(data=str(yaml_path), **default_args)
 
-    upload_checkpoint_to_hf(best_weights, run_name)
+        best_weights = Path(model.trainer.best)
+        if not best_weights.is_file():
+            raise FileNotFoundError(f"Checkpoint missing after training: {best_weights}")
+
+        raw_save_dir = getattr(model.trainer, "save_dir", None)
+        run_dir = (
+            Path(raw_save_dir)
+            if isinstance(raw_save_dir, (str, Path))
+            else best_weights.parent.parent
+        )
+
+        if results is not None and hasattr(results, "results_dict"):
+            metrics = results.results_dict
+            log.info(
+                "Metrics (%s): P=%.4f R=%.4f mAP50=%.4f mAP50-95=%.4f",
+                validated_name,
+                metrics.get("metrics/precision(B)", 0.0),
+                metrics.get("metrics/recall(B)", 0.0),
+                metrics.get("metrics/mAP50(B)", 0.0),
+                metrics.get("metrics/mAP50-95(B)", 0.0),
+            )
+
+        results_csv = run_dir / "results.csv"
+        if results_csv.is_file():
+            curves_path = run_dir / f"training_curves_{validated_name}.png"
+            summary = plot_yolo_training_curves(
+                results_csv,
+                validated_name,
+                save_path=curves_path,
+                show=False,
+            )
+            log.info(
+                "Training monitoring (%s): best_epoch=%s/%s mAP50=%s mAP50-95=%s gap=%s status=%s",
+                validated_name,
+                summary["best_epoch"],
+                summary["last_epoch"],
+                summary["best_map50"],
+                summary["best_map50_95"],
+                summary["val_train_loss_gap"],
+                summary["fit_status"],
+            )
+    except Exception:
+        failed = True
+        raise
+    finally:
+        if wb is not None and getattr(wb, "run", None) is not None:
+            wb.finish(exit_code=1 if failed else 0)
+
+    if upload_to_hf:
+        upload_checkpoint_to_hf(best_weights, validated_name)
+        upload_run_artifacts_to_hf(run_dir, validated_name)
+
     return best_weights
+
 
 def run_full_pipeline(
     use_negatives: bool,
     run_name: str,
     *,
-    dataset_root: Path | None = None,
+    dataset_root: Path,
+    source_path: Path | None = None,
+    overwrite: bool = True,
+    model_type: str = "yolo26n.pt",
+    upload_to_hf: bool = True,
+    use_wandb: bool | None = None,
+    cleanup_dataset: bool = True,
     **train_kwargs,
 ) -> Path:
-    """Prepare the selected dataset and return the trained weights."""
-    root = EXTRACTED_DATA_DIR if dataset_root is None else dataset_root
+    """Prepares dataset, runs YOLO training with monitoring/uploads, and cleans staged data."""
+    validated_name = _validate_run_name(run_name)
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_root}")
 
-    if not root.is_dir():
-        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    if upload_to_hf:
+        assert_hf_ready()
 
-    yaml_path = prepare_yolo_dataset(root, WORKING_DIR, run_name, use_negatives)
-    return run_yolo_training(yaml_path, run_name, **train_kwargs)
+    enabled_wandb = _resolve_wandb_key() is not None if use_wandb is None else use_wandb
+    if enabled_wandb:
+        assert_wandb_ready()
+
+    yaml_path = prepare_yolo_dataset(
+        dataset_root,
+        WORKING_DIR,
+        validated_name,
+        use_negatives,
+        source_path=source_path,
+        overwrite=overwrite,
+    )
+    try:
+        return run_yolo_training(
+            yaml_path,
+            validated_name,
+            model_type=model_type,
+            upload_to_hf=upload_to_hf,
+            use_wandb=use_wandb,
+            **train_kwargs,
+        )
+    finally:
+        if cleanup_dataset:
+            cleanup_yolo_dataset(WORKING_DIR, validated_name)
