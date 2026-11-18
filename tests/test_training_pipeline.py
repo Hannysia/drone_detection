@@ -9,6 +9,7 @@ def _load_training(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
     monkeypatch.setenv("EXTRACTED_DATA_PATH", str(tmp_path))
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
 
     from src.processing import training
 
@@ -60,6 +61,7 @@ def test_pipeline_requires_explicit_dataset_root_and_cleans_up(tmp_path, monkeyp
         model_type="yolo26n.pt",
         upload_to_hf=True,
         use_wandb=None,
+        backup_every_n_epochs=10,
         epochs=25,
     )
     cleanup.assert_called_once_with(training.WORKING_DIR, "example")
@@ -125,7 +127,7 @@ def test_training_uses_safe_defaults_plots_curves_and_uploads_artifacts(tmp_path
     assert model.train.call_args.kwargs["epochs"] == 50
     assert model.train.call_args.kwargs["patience"] == 15
     assert (run_dir / "training_curves_run.png").is_file()
-    upload_ckpt.assert_called_once_with(current, "run")
+    upload_ckpt.assert_called_once_with(current, "run", model_type="yolo26n.pt")
     upload_dir.assert_called_once_with(run_dir, "run")
 
     current.unlink()
@@ -209,6 +211,10 @@ def test_upload_helpers_validate_and_propagate_errors(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="hf upload_folder error"):
         training.upload_run_artifacts_to_hf(run_dir, "run")
 
+    api.upload_file.side_effect = None
+    training.upload_checkpoint_to_hf(weights, "run", model_type="yolo26s.pt")
+    assert api.upload_file.call_args.kwargs["path_in_repo"] == "models/yolo26s_run_best.pt"
+
 
 def test_wandb_lifecycle_finishes_on_success_and_error(tmp_path, monkeypatch):
     training = _load_training(tmp_path, monkeypatch)
@@ -248,3 +254,82 @@ def test_wandb_lifecycle_finishes_on_success_and_error(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="cuda oom"):
         training.run_yolo_training(yaml_path, "run_wb", upload_to_hf=False, use_wandb=True)
     fake_wandb.finish.assert_any_call(exit_code=1)
+
+
+class _InlineExecutor:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+        done = Mock()
+        done.done.return_value = True
+        return done
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def test_periodic_hf_backup_snapshots_intervals_and_tolerates_errors(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+
+    run_dir = tmp_path / "run_bk"
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True)
+    best = weights_dir / "best.pt"
+    last = weights_dir / "last.pt"
+    best.write_bytes(b"best")
+    last.write_bytes(b"last")
+    (run_dir / "results.csv").write_text("epoch,train/box_loss\n1,1.0\n", encoding="utf-8")
+
+    callbacks = {}
+    uploaded_snapshots = []
+
+    api = Mock()
+    api.whoami.return_value = {"auth": {"accessToken": {"role": "write"}}}
+
+    def fake_upload_folder(**kwargs):
+        folder = training.Path(kwargs["folder_path"])
+        files = sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
+        uploaded_snapshots.append((kwargs["path_in_repo"], kwargs["commit_message"], files))
+        if "epoch 10" in kwargs["commit_message"]:
+            raise RuntimeError("transient blip")
+
+    api.upload_folder.side_effect = fake_upload_folder
+    monkeypatch.setattr(training, "ThreadPoolExecutor", _InlineExecutor)
+    monkeypatch.setattr(training, "HfApi", Mock(return_value=api))
+    monkeypatch.setattr(training, "REPO_ID", "user/repo")
+    monkeypatch.setattr(training, "HF_TOKEN", "hf_tok")
+    monkeypatch.setattr(training, "upload_checkpoint_to_hf", Mock())
+    monkeypatch.setattr(training, "upload_run_artifacts_to_hf", Mock())
+    
+    model = Mock()
+    model.trainer.best = best
+    model.trainer.save_dir = run_dir
+    model.add_callback.side_effect = lambda event, fn: callbacks.__setitem__(event, fn)
+
+    def fake_train(**kwargs):
+        cb = callbacks["on_train_epoch_end"]
+        cb(SimpleNamespace(epoch=1, epochs=30, save_dir=run_dir))
+        cb(SimpleNamespace(epoch=9, epochs=30, save_dir=run_dir))
+        cb(SimpleNamespace(epoch=19, epochs=30, save_dir=run_dir))
+        cb(SimpleNamespace(epoch=29, epochs=30, save_dir=run_dir))
+
+    model.train.side_effect = fake_train
+    monkeypatch.setattr(training, "YOLO", Mock(return_value=model))
+
+    result = training.run_yolo_training(
+        yaml_path,
+        "run_bk",
+        upload_to_hf=True,
+        backup_every_n_epochs=10,
+    )
+
+    assert result == best
+    assert uploaded_snapshots == [
+        ("runs/run_bk", "Backup YOLO run_bk at epoch 10", ["results.csv", "weights/best.pt", "weights/last.pt"]),
+        ("runs/run_bk", "Backup YOLO run_bk at epoch 20", ["results.csv", "weights/best.pt", "weights/last.pt"]),
+    ]

@@ -1,6 +1,9 @@
 import logging
 import os
+import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from tempfile import mkdtemp
 
 import torch
 from huggingface_hub import HfApi
@@ -53,9 +56,14 @@ def assert_hf_ready(
     return target_repo, target_token
 
 
-def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
+def upload_checkpoint_to_hf(
+    weights_path: Path,
+    run_name: str,
+    model_type: str = "yolo26n.pt",
+) -> None:
     """Uploads best model weights to Hugging Face under the canonical models path."""
     validated_name = _validate_run_name(run_name)
+    model_prefix = _validate_run_name(Path(model_type).stem)
     repo_id, token = _require_hf_credentials()
     if not weights_path.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {weights_path}")
@@ -64,13 +72,12 @@ def upload_checkpoint_to_hf(weights_path: Path, run_name: str) -> None:
     api = HfApi(token=token)
     api.upload_file(
         path_or_fileobj=str(weights_path),
-        path_in_repo=f"models/yolo26n_{validated_name}_best.pt",
+        path_in_repo=f"models/{model_prefix}_{validated_name}_best.pt",
         repo_id=repo_id,
         repo_type="dataset",
-        commit_message=f"Upload YOLO checkpoint for {validated_name}",
+        commit_message=f"Upload {model_prefix} checkpoint for {validated_name}",
     )
     log.info("Uploaded checkpoint for %s to Hugging Face.", validated_name)
-
 
 def upload_run_artifacts_to_hf(run_dir: Path, run_name: str) -> None:
     """Uploads full YOLO training directory (weights, CSV, YAML, plots) to Hugging Face."""
@@ -90,6 +97,79 @@ def upload_run_artifacts_to_hf(run_dir: Path, run_name: str) -> None:
         commit_message=f"Upload YOLO training artifacts for {validated_name}",
     )
     log.info("Uploaded run artifacts for %s to Hugging Face.", validated_name)
+
+
+def _snapshot_run_files(save_dir: Path, snapshot_dir: Path) -> bool:
+    copied = False
+    for relative in (
+        Path("weights") / "last.pt",
+        Path("weights") / "best.pt",
+        Path("results.csv"),
+        Path("args.yaml"),
+    ):
+        source = save_dir / relative
+        if source.is_file():
+            target = snapshot_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied = True
+    return copied
+def _register_hf_backup_callback(
+    model: YOLO,
+    executor: ThreadPoolExecutor,
+    run_name: str,
+    repo_id: str,
+    token: str,
+    every_n_epochs: int,
+) -> None:
+    pending: Future | None = None
+    def _upload_snapshot(snapshot_dir: Path, epoch_num: int) -> None:
+        try:
+            api = HfApi(token=token)
+            api.upload_folder(
+                folder_path=str(snapshot_dir),
+                path_in_repo=f"runs/{run_name}",
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=f"Backup YOLO {run_name} at epoch {epoch_num}",
+            )
+            log.info("Backed up %s snapshot (epoch %d) to Hugging Face.", run_name, epoch_num)
+        except Exception as exc:
+            log.warning(
+                "Periodic HF backup failed at epoch %d for %s: %s",
+                epoch_num,
+                run_name,
+                exc,
+            )
+        finally:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+    def _on_train_epoch_end(trainer) -> None:
+        nonlocal pending
+        epoch_num = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = getattr(trainer, "epochs", None)
+        if epoch_num <= 0 or epoch_num % every_n_epochs != 0:
+            return
+        if (
+            not isinstance(total_epochs, bool)
+            and isinstance(total_epochs, int)
+            and epoch_num >= total_epochs
+        ):
+            return
+        if pending is not None and not pending.done():
+            return
+        raw_dir = getattr(trainer, "save_dir", None)
+        if not isinstance(raw_dir, (str, Path)):
+            return
+        snapshot_dir = Path(mkdtemp(prefix=f"hf_backup_{run_name}_"))
+        try:
+            if not _snapshot_run_files(Path(raw_dir), snapshot_dir):
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
+                return
+            pending = executor.submit(_upload_snapshot, snapshot_dir, epoch_num)
+        except Exception:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+            raise
+    model.add_callback("on_train_epoch_end", _on_train_epoch_end)
 
 
 def _resolve_wandb_key(api_key: str | None = None) -> str | None:
@@ -164,14 +244,16 @@ def run_yolo_training(
     *,
     upload_to_hf: bool = True,
     use_wandb: bool | None = None,
+    backup_every_n_epochs: int = 10,
     **train_kwargs,
 ) -> Path:
     """Runs YOLO training with pre-flight checks, monitoring curves, W&B logging, and HF upload."""
     validated_name = _validate_run_name(run_name)
+    if backup_every_n_epochs < 0:
+        raise ValueError("backup_every_n_epochs must be non-negative")
     if not yaml_path.is_file():
         raise FileNotFoundError(f"Dataset YAML not found: {yaml_path}")
-    if upload_to_hf:
-        assert_hf_ready()
+    hf_creds = assert_hf_ready() if upload_to_hf else None
 
     default_args = {
         "epochs": 50,
@@ -210,10 +292,24 @@ def run_yolo_training(
         use_wandb,
     )
 
+    executor = (
+        ThreadPoolExecutor(max_workers=1)
+        if hf_creds is not None and backup_every_n_epochs > 0
+        else None
+    )
     failed = False
     try:
         log.info("Starting YOLO training run: %s (model=%s)", validated_name, model_type)
         model = YOLO(model_type)
+        if executor is not None and isinstance(hf_creds, tuple) and len(hf_creds) == 2:
+            _register_hf_backup_callback(
+                model,
+                executor,
+                validated_name,
+                hf_creds[0],
+                hf_creds[1],
+                backup_every_n_epochs,
+            )
         results = model.train(data=str(yaml_path), **default_args)
 
         best_weights = Path(model.trainer.best)
@@ -261,11 +357,13 @@ def run_yolo_training(
         failed = True
         raise
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
         if wb is not None and getattr(wb, "run", None) is not None:
             wb.finish(exit_code=1 if failed else 0)
 
     if upload_to_hf:
-        upload_checkpoint_to_hf(best_weights, validated_name)
+        upload_checkpoint_to_hf(best_weights, validated_name, model_type=model_type)
         upload_run_artifacts_to_hf(run_dir, validated_name)
 
     return best_weights
@@ -281,6 +379,7 @@ def run_full_pipeline(
     model_type: str = "yolo26n.pt",
     upload_to_hf: bool = True,
     use_wandb: bool | None = None,
+    backup_every_n_epochs: int = 10,
     cleanup_dataset: bool = True,
     **train_kwargs,
 ) -> Path:
@@ -311,6 +410,7 @@ def run_full_pipeline(
             model_type=model_type,
             upload_to_hf=upload_to_hf,
             use_wandb=use_wandb,
+            backup_every_n_epochs=backup_every_n_epochs,
             **train_kwargs,
         )
     finally:

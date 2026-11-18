@@ -13,6 +13,8 @@ def local_config(monkeypatch):
     monkeypatch.delenv("KAGGLE_KERNEL_RUN_TYPE", raising=False)
     monkeypatch.delenv("LOCAL_BASE_DIR", raising=False)
     monkeypatch.delenv("EXTRACTED_DATA_PATH", raising=False)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
     monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
 
     path = Path(__file__).resolve().parents[1] / "src" / "config.py"
