@@ -43,8 +43,8 @@ def prepare_yolo_dataset(
     use_negatives: bool,
     *,
     manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
-    source_path: Path | None = MANIFESTS_DIR / "sources" / "hf.json",
-    overwrite: bool = True,
+    source_path: Path | None = None,
+    overwrite: bool = False,
 ) -> Path:
     validated_name = _validate_run_name(run_name)
     root = IMG_DATASET_PATH.resolve()
