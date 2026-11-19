@@ -10,6 +10,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from src import config
 from src.config import MANIFESTS_DIR, OUTPUT_DIR
+from src.processing.dataset import parse_frame_filename_logic
 from src.processing.manifests import select_manifest_frames
 from src.processing.yolo_dataset import (
     _validate_run_name,
@@ -231,16 +232,15 @@ def get_detections_boxes(
     return boxes
 
 
-def evaluate_predictions(
+def _match_predictions_with_details(
     gt_boxes: list,
     pred_boxes: list,
     iou_threshold: float = 0.5,
-) -> tuple[list[int], list[int], list[int]]:
-    """Greedy IoU matching returning indices relative to the input pred_boxes list."""
+) -> tuple[list[int], list[int], list[int], dict[int, float], set[int]]:
     if len(pred_boxes) == 0:
-        return [], [], list(range(len(gt_boxes)))
+        return [], [], list(range(len(gt_boxes))), {}, set()
     if len(gt_boxes) == 0:
-        return [], list(range(len(pred_boxes))), []
+        return [], list(range(len(pred_boxes))), [], {}, set()
 
     ordered_preds = sorted(
         enumerate(pred_boxes),
@@ -248,9 +248,10 @@ def evaluate_predictions(
         reverse=True,
     )
 
-    matched_gts = set()
-    tp_indices = []
-    fp_indices = []
+    matched_gts: set[int] = set()
+    matched_gt_ious: dict[int, float] = {}
+    tp_indices: list[int] = []
+    fp_indices: list[int] = []
 
     for orig_idx, pred in ordered_preds:
         best_iou = -1.0
@@ -266,11 +267,26 @@ def evaluate_predictions(
 
         if best_iou >= iou_threshold:
             matched_gts.add(best_gt_idx)
+            matched_gt_ious[best_gt_idx] = float(best_iou)
             tp_indices.append(orig_idx)
         else:
             fp_indices.append(orig_idx)
 
     fn_indices = [i for i in range(len(gt_boxes)) if i not in matched_gts]
+    return tp_indices, fp_indices, fn_indices, matched_gt_ious, matched_gts
+
+
+def evaluate_predictions(
+    gt_boxes: list,
+    pred_boxes: list,
+    iou_threshold: float = 0.5,
+) -> tuple[list[int], list[int], list[int]]:
+    """Greedy IoU matching returning indices relative to the input pred_boxes list."""
+    tp_indices, fp_indices, fn_indices, _, _ = _match_predictions_with_details(
+        gt_boxes,
+        pred_boxes,
+        iou_threshold=iou_threshold,
+    )
     return tp_indices, fp_indices, fn_indices
 
 
@@ -578,3 +594,237 @@ def evaluate_runs_on_test(
         cleanup_yolo_dataset(working_dir, "eval_v1")
 
     return pd.DataFrame(rows)
+
+
+def _classify_bbox_scale(box: list[float]) -> str:
+    area = max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+    if area < 32 * 32:
+        return "small"
+    if area < 96 * 96:
+        return "medium"
+    return "large"
+
+
+def _classify_spatial_region(
+    box: list[float],
+    width: int,
+    height: int,
+    center_radius: float,
+) -> str:
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Expected positive frame dimensions, got {width}x{height}")
+    cx_norm = ((float(box[0]) + float(box[2])) / 2.0) / width
+    cy_norm = ((float(box[1]) + float(box[3])) / 2.0) / height
+    if abs(cx_norm - 0.5) <= center_radius and abs(cy_norm - 0.5) <= center_radius:
+        return "Center"
+    return "Off-center"
+
+
+def _aggregate_gt_bucket_table(
+    records: list[dict],
+    group_key: str,
+    col_label: str,
+    ordered_groups: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    df = pd.DataFrame(records)
+    groups = ordered_groups if ordered_groups is not None else tuple(sorted(df[group_key].unique()))
+    rows = []
+    for name in groups:
+        sub = df[df[group_key] == name] if not df.empty else df
+        gt_count = int(len(sub))
+        tp_count = int(sub["matched"].sum()) if gt_count else 0
+        fn_count = gt_count - tp_count
+        ious = sub.loc[sub["matched"], "iou"].dropna().tolist() if tp_count else []
+        rows.append({
+            col_label: name,
+            "GT": gt_count,
+            "TP": tp_count,
+            "FN": fn_count,
+            "Recall": tp_count / gt_count if gt_count else np.nan,
+            "Median TP IoU": float(np.median(ious)) if ious else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def _aggregate_metadata_table(frame_records: list[dict], key: str) -> pd.DataFrame:
+    df = pd.DataFrame(frame_records)
+    rows = []
+    for group_value in sorted(df[key].unique()):
+        sub = df[df[key] == group_value]
+        pos_sub = sub[sub["is_positive"]]
+        neg_sub = sub[~sub["is_positive"]]
+        pos_gt = int(pos_sub["gt_count"].sum())
+        tp_count = int(pos_sub["tp_count"].sum())
+        fn_count = int(pos_sub["fn_count"].sum())
+        pos_fp = int(pos_sub["fp_count"].sum())
+        neg_frames = int(len(neg_sub))
+        neg_fa_frames = int((neg_sub["fp_count"] > 0).sum())
+        rows.append({
+            "Group": group_value,
+            "Frames": int(len(sub)),
+            "Pos GT": pos_gt,
+            "TP": tp_count,
+            "FN": fn_count,
+            "Recall": tp_count / pos_gt if pos_gt else np.nan,
+            "Pos FP": pos_fp,
+            "Neg Frames": neg_frames,
+            "Neg FA Frames": neg_fa_frames,
+            "Neg FA Rate (%)": round(neg_fa_frames / neg_frames * 100, 2) if neg_frames else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def analyze_model_errors(
+    raw_database: list[dict],
+    *,
+    conf_threshold: float,
+    iou_threshold: float = 0.5,
+    loc_iou_threshold: float = 0.1,
+    center_radius: float = 0.15,
+    top_k: int = 6,
+) -> dict[str, object]:
+    """Computes stratified error analysis across target scale, metadata, position, and error modes."""
+    if not raw_database:
+        raise ValueError("Evaluation database is empty")
+    if not 0.0 <= conf_threshold <= 1.0:
+        raise ValueError(f"Invalid conf_threshold: {conf_threshold}")
+    if not 0.0 <= loc_iou_threshold <= iou_threshold <= 1.0:
+        raise ValueError("Expected 0 <= loc_iou_threshold <= iou_threshold <= 1")
+    if not 0.0 < center_radius <= 0.5:
+        raise ValueError("center_radius must be in (0, 0.5]")
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+
+    error_counts = {
+        "TP": 0,
+        "Background FP": 0,
+        "Localization FP": 0,
+        "Duplicate FP": 0,
+        "Threshold Miss FN": 0,
+        "Blind Miss FN": 0,
+    }
+    gt_records: list[dict] = []
+    frame_records: list[dict] = []
+    fp_cases: list[dict] = []
+    fn_cases: list[dict] = []
+
+    for entry in raw_database:
+        gt_boxes = entry["gt_boxes"]
+        preds_above = [pred for pred in entry["pred_boxes"] if pred[4] >= conf_threshold]
+        preds_below = [pred for pred in entry["pred_boxes"] if pred[4] < conf_threshold]
+        tp_idx, fp_idx, fn_idx, matched_gt_ious, matched_gts = _match_predictions_with_details(
+            gt_boxes,
+            preds_above,
+            iou_threshold=iou_threshold,
+        )
+        error_counts["TP"] += len(tp_idx)
+
+        for idx in fp_idx:
+            pred_box = preds_above[idx][:4]
+            best_any = max((calculate_iou_xyxy(pred_box, gt) for gt in gt_boxes), default=0.0)
+            best_matched = max(
+                (calculate_iou_xyxy(pred_box, gt_boxes[g]) for g in matched_gts),
+                default=0.0,
+            )
+            if not gt_boxes or best_any < loc_iou_threshold:
+                error_counts["Background FP"] += 1
+            elif best_matched >= iou_threshold:
+                error_counts["Duplicate FP"] += 1
+            else:
+                error_counts["Localization FP"] += 1
+
+        width = int(entry.get("width", 0))
+        height = int(entry.get("height", 0))
+        for gt_idx, gt_box in enumerate(gt_boxes):
+            is_matched = gt_idx in matched_gts
+            if not is_matched:
+                has_subthresh = any(
+                    calculate_iou_xyxy(pred[:4], gt_box) >= iou_threshold
+                    for pred in preds_below
+                )
+                if has_subthresh:
+                    error_counts["Threshold Miss FN"] += 1
+                else:
+                    error_counts["Blind Miss FN"] += 1
+
+            gt_records.append({
+                "scale": _classify_bbox_scale(gt_box),
+                "region": _classify_spatial_region(gt_box, width, height, center_radius),
+                "matched": is_matched,
+                "iou": matched_gt_ious.get(gt_idx, np.nan),
+            })
+
+        meta = parse_frame_filename_logic(entry["filename"])
+        frame_records.append({
+            "is_positive": bool(entry["is_positive"]),
+            "background": meta["background"],
+            "camera": meta["camera"],
+            "shape": meta["shape"] if entry["is_positive"] else "no_drone",
+            "gt_count": len(gt_boxes),
+            "tp_count": len(tp_idx),
+            "fn_count": len(fn_idx),
+            "fp_count": len(fp_idx),
+        })
+
+        entry_path = Path(entry.get("path", entry["filename"]))
+        if fp_idx:
+            fp_boxes = [preds_above[i] for i in fp_idx]
+            fp_cases.append({
+                "path": entry_path,
+                "filename": entry["filename"],
+                "is_positive": bool(entry["is_positive"]),
+                "n_fps": len(fp_boxes),
+                "max_conf": max(float(b[4]) for b in fp_boxes),
+                "fp_boxes": fp_boxes,
+                "gt_boxes": gt_boxes,
+            })
+
+        if fn_idx:
+            missed_boxes = [gt_boxes[i] for i in fn_idx]
+            max_area = max(
+                max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1]))
+                for b in missed_boxes
+            )
+            subthresh_hits = [
+                pred
+                for pred in preds_below
+                if any(calculate_iou_xyxy(pred[:4], gt) >= iou_threshold for gt in missed_boxes)
+            ]
+            fn_cases.append({
+                "path": entry_path,
+                "filename": entry["filename"],
+                "n_fns": len(missed_boxes),
+                "max_missed_area": max_area,
+                "fn_boxes": missed_boxes,
+                "subthresh_boxes": subthresh_hits,
+            })
+
+    fp_cases.sort(key=lambda item: (item["max_conf"], item["n_fps"]), reverse=True)
+    fn_cases.sort(key=lambda item: (item["n_fns"], item["max_missed_area"]), reverse=True)
+
+    error_types_df = pd.DataFrame([
+        {"Type": name, "Count": count}
+        for name, count in error_counts.items()
+    ])
+
+    return {
+        "conf_threshold": float(conf_threshold),
+        "error_types": error_types_df,
+        "by_size": _aggregate_gt_bucket_table(
+            gt_records,
+            "scale",
+            "Scale",
+            ordered_groups=("small", "medium", "large"),
+        ),
+        "by_position": _aggregate_gt_bucket_table(
+            gt_records,
+            "region",
+            "Region",
+            ordered_groups=("Center", "Off-center"),
+        ),
+        "by_background": _aggregate_metadata_table(frame_records, "background"),
+        "by_camera": _aggregate_metadata_table(frame_records, "camera"),
+        "by_shape": _aggregate_metadata_table(frame_records, "shape"),
+        "worst_fps": fp_cases[:top_k],
+        "worst_fns": fn_cases[:top_k],
+    }

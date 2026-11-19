@@ -2,7 +2,9 @@ import inspect
 import matplotlib
 matplotlib.use("Agg")
 
+import cv2
 import numpy as np
+import pandas as pd
 import pytest
 
 from src.utils import visualization
@@ -11,13 +13,14 @@ from src.utils.visualization import (
     overlay_heatmap,
     plot_detections_summary,
     plot_eigencam_pair_comparison,
+    plot_error_analysis_dashboard,
+    plot_error_gallery,
     plot_false_positive_results,
     plot_unified_calibration_curves,
     plot_yolo_runs_comparison,
     plot_yolo_training_curves,
     summarize_yolo_training,
 )
-
 
 def _write_results_csv(path, rows, *, with_dfl=True, spaced_headers=False):
     headers = [
@@ -256,3 +259,71 @@ def test_plot_eigencam_pair_comparison_and_calibration_save_png(tmp_path):
     )
     assert cal_png.is_file()
     assert cal_png.stat().st_size > 0
+
+
+def test_plot_error_analysis_dashboard_and_galleries_save_pngs(tmp_path):
+    img_path = tmp_path / "sample.jpg"
+    assert cv2.imwrite(str(img_path), np.zeros((48, 64, 3), dtype=np.uint8))
+
+    report = {
+        "conf_threshold": 0.725,
+        "error_types": pd.DataFrame([
+            {"Type": "TP", "Count": 10},
+            {"Type": "Background FP", "Count": 2},
+            {"Type": "Localization FP", "Count": 1},
+            {"Type": "Duplicate FP", "Count": 0},
+            {"Type": "Threshold Miss FN", "Count": 1},
+            {"Type": "Blind Miss FN", "Count": 2},
+        ]),
+        "by_size": pd.DataFrame([
+            {"Scale": "small", "GT": 5, "TP": 3, "FN": 2, "Recall": 0.6},
+            {"Scale": "medium", "GT": 4, "TP": 4, "FN": 0, "Recall": 1.0},
+            {"Scale": "large", "GT": 2, "TP": 1, "FN": 1, "Recall": 0.5},
+        ]),
+        "by_background": pd.DataFrame([
+            {"Group": "sky", "Recall": 0.9, "Neg FA Rate (%)": 1.0},
+            {"Group": "complex", "Recall": 0.7, "Neg FA Rate (%)": 4.0},
+        ]),
+        "by_position": pd.DataFrame([
+            {"Region": "Center", "GT": 8, "TP": 7, "FN": 1, "Recall": 0.875},
+            {"Region": "Off-center", "GT": 3, "TP": 1, "FN": 2, "Recall": 0.333},
+        ]),
+    }
+
+    dash_png = tmp_path / "dashboard.png"
+    plot_error_analysis_dashboard(report, save_path=dash_png, show=False)
+    assert dash_png.is_file()
+    assert dash_png.stat().st_size > 0
+
+    fp_png = tmp_path / "fp_gallery.png"
+    plot_error_gallery(
+        [{
+            "path": img_path,
+            "filename": "sample.jpg",
+            "n_fps": 1,
+            "max_conf": 0.81,
+            "fp_boxes": [[5.0, 5.0, 25.0, 25.0, 0.81]],
+            "gt_boxes": [],
+        }],
+        kind="fp",
+        save_path=fp_png,
+        show=False,
+    )
+    assert fp_png.is_file()
+    assert fp_png.stat().st_size > 0
+
+    fn_png = tmp_path / "fn_gallery.png"
+    plot_error_gallery(
+        [{
+            "path": img_path,
+            "filename": "sample.jpg",
+            "n_fns": 1,
+            "fn_boxes": [[10.0, 10.0, 30.0, 30.0]],
+            "subthresh_boxes": [[12.0, 12.0, 30.0, 30.0, 0.45]],
+        }],
+        kind="fn",
+        save_path=fn_png,
+        show=False,
+    )
+    assert fn_png.is_file()
+    assert fn_png.stat().st_size > 0

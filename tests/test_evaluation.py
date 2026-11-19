@@ -5,6 +5,7 @@ import pytest
 
 from src.processing import evaluation
 from src.processing.evaluation import (
+    analyze_model_errors,
     calibrate_confidence_thresholds,
     download_yolo_run_artifacts,
     evaluate_model,
@@ -332,3 +333,73 @@ def test_evaluate_runs_on_test_stages_evaluates_and_cleans_up(tmp_path, monkeypa
     assert mock_eval.call_count == 3
     assert mock_eval.call_args_list[2].kwargs["conf"] == pytest.approx(0.72)
     assert not (working / "yolo_dataset_eval_v1").exists()
+
+
+def test_analyze_model_errors_breaks_down_scales_positions_metadata_and_modes():
+    raw_database = [
+        {
+            "filename": "quad_rgb_sky_001_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [
+                [490.0, 490.0, 510.0, 510.0],
+                [50.0, 50.0, 200.0, 200.0],
+            ],
+            "pred_boxes": [
+                [490.0, 490.0, 510.0, 510.0, 0.90],
+                [490.0, 490.0, 510.0, 510.0, 0.80],
+                [50.0, 50.0, 200.0, 200.0, 0.40],
+                [10.0, 10.0, 30.0, 30.0, 0.85],
+            ],
+        },
+        {
+            "filename": "fixed_thermal_forest_002_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [[100.0, 100.0, 160.0, 160.0]],
+            "pred_boxes": [[115.0, 115.0, 175.0, 175.0, 0.75]],
+        },
+        {
+            "filename": "no_drone_rgb_sky_003_f0001.jpg",
+            "is_positive": False,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [],
+            "pred_boxes": [[10.0, 10.0, 30.0, 30.0, 0.72]],
+        },
+    ]
+
+    report = analyze_model_errors(raw_database, conf_threshold=0.70, top_k=2)
+
+    modes = dict(zip(report["error_types"]["Type"], report["error_types"]["Count"]))
+    assert modes == {
+        "TP": 1,
+        "Background FP": 2,
+        "Localization FP": 1,
+        "Duplicate FP": 1,
+        "Threshold Miss FN": 1,
+        "Blind Miss FN": 1,
+    }
+
+    by_size = report["by_size"].set_index("Scale")
+    assert by_size.loc["small", "TP"] == 1
+    assert by_size.loc["medium", "FN"] == 1
+    assert by_size.loc["large", "FN"] == 1
+
+    by_pos = report["by_position"].set_index("Region")
+    assert by_pos.loc["Center", "Recall"] == pytest.approx(1.0)
+    assert by_pos.loc["Off-center", "Recall"] == pytest.approx(0.0)
+
+    by_bg = report["by_background"].set_index("Group")
+    assert by_bg.loc["complex", "FN"] == 1
+    assert by_bg.loc["sky", "Neg FA Rate (%)"] == pytest.approx(100.0)
+
+    assert len(report["worst_fps"]) == 2
+    assert len(report["worst_fns"]) == 2
+    assert report["worst_fns"][0]["filename"] == "quad_rgb_sky_001_f0001.jpg"
+    assert len(report["worst_fns"][0]["subthresh_boxes"]) == 1
+
+    with pytest.raises(ValueError, match="empty"):
+        analyze_model_errors([], conf_threshold=0.5)

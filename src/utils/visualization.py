@@ -913,3 +913,156 @@ def plot_yolo_runs_comparison(
 
     _finalize_figure(fig, save_path, show)
     return comparison_df
+
+
+def plot_error_analysis_dashboard(
+    error_report: dict[str, object],
+    *,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots 2x2 residual error diagnostics across size, background, position, and error modes."""
+    required = {"error_types", "by_size", "by_background", "by_position"}
+    if not required.issubset(error_report):
+        raise ValueError(f"Missing error report keys: {sorted(required - error_report.keys())}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    conf_th = float(error_report.get("conf_threshold", 0.0))
+    fig.suptitle(f"Residual Error Analysis (conf={conf_th:.4f})", fontsize=14, fontweight="bold")
+
+    size_df = error_report["by_size"]
+    ax_size = axes[0, 0]
+    size_vals = [float(v) if pd.notna(v) else 0.0 for v in size_df["Recall"]]
+    bars = ax_size.bar(size_df["Scale"], size_vals, color="#2563eb", width=0.55)
+    for bar, row in zip(bars, size_df.itertuples(index=False)):
+        val = float(row.Recall) if pd.notna(row.Recall) else 0.0
+        ax_size.text(
+            bar.get_x() + bar.get_width() / 2,
+            val + 0.02,
+            f"{val:.2f}\n({int(row.TP)}/{int(row.GT)})",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    ax_size.set_title("Recall by Target Scale (COCO Area)", fontweight="bold")
+    ax_size.set_ylim(0, 1.18)
+    ax_size.set_ylabel("Recall")
+    ax_size.grid(axis="y", alpha=0.25)
+
+    bg_df = error_report["by_background"]
+    ax_bg = axes[0, 1]
+    x_bg = np.arange(len(bg_df))
+    bg_recall = [float(v) if pd.notna(v) else 0.0 for v in bg_df["Recall"]]
+    bg_fa = [float(v) / 100.0 if pd.notna(v) else 0.0 for v in bg_df["Neg FA Rate (%)"]]
+    ax_bg.bar(x_bg - 0.18, bg_recall, width=0.36, color="#059669", label="Positive Recall")
+    ax_bg.bar(x_bg + 0.18, bg_fa, width=0.36, color="#dc2626", label="Negative FA Rate (frac)")
+    ax_bg.set_xticks(x_bg)
+    ax_bg.set_xticklabels(bg_df["Group"], rotation=20, ha="right")
+    ax_bg.set_ylim(0, 1.15)
+    ax_bg.set_ylabel("Rate")
+    ax_bg.set_title("Recall & False Alarm Rate by Background", fontweight="bold")
+    ax_bg.legend(loc="best")
+    ax_bg.grid(axis="y", alpha=0.25)
+
+    pos_df = error_report["by_position"]
+    ax_pos = axes[1, 0]
+    pos_vals = [float(v) if pd.notna(v) else 0.0 for v in pos_df["Recall"]]
+    pos_bars = ax_pos.bar(pos_df["Region"], pos_vals, color=["#7c3aed", "#f59e0b"], width=0.45)
+    for bar, row in zip(pos_bars, pos_df.itertuples(index=False)):
+        val = float(row.Recall) if pd.notna(row.Recall) else 0.0
+        ax_pos.text(
+            bar.get_x() + bar.get_width() / 2,
+            val + 0.02,
+            f"{val:.2f}\n({int(row.TP)}/{int(row.GT)})",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    ax_pos.set_title("Spatial Bias Check: Center vs Off-center Recall", fontweight="bold")
+    ax_pos.set_ylim(0, 1.18)
+    ax_pos.set_ylabel("Recall")
+    ax_pos.grid(axis="y", alpha=0.25)
+
+    err_df = error_report["error_types"]
+    err_sub = err_df[err_df["Type"] != "TP"]
+    ax_err = axes[1, 1]
+    colors = ["#dc2626" if "FP" in t else "#ea580c" for t in err_sub["Type"]]
+    ax_err.barh(err_sub["Type"], err_sub["Count"], color=colors)
+    for idx, count in enumerate(err_sub["Count"]):
+        ax_err.text(int(count) + 0.2, idx, str(int(count)), va="center", fontsize=9, fontweight="bold")
+    ax_err.set_title("Error Composition (FP & FN Breakdown)", fontweight="bold")
+    ax_err.set_xlabel("Count")
+    ax_err.grid(axis="x", alpha=0.25)
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+def _draw_gallery_box(
+    image: np.ndarray,
+    box: list[float],
+    label: str,
+    color: tuple[int, int, int],
+) -> None:
+    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(
+        image,
+        label,
+        (x1, max(y1 - 5, 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        color,
+        1,
+    )
+
+
+def plot_error_gallery(
+    cases: list[dict],
+    *,
+    kind: str,
+    title: str | None = None,
+    max_items: int = 6,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots a grid of worst False Positive or False Negative frames with annotations."""
+    if kind not in ("fp", "fn"):
+        raise ValueError(f"Expected kind 'fp' or 'fn', got {kind!r}")
+    if not cases:
+        log.info("No %s error cases to plot.", kind.upper())
+        return
+
+    items = cases[:max_items]
+    ncols = min(3, len(items))
+    nrows = int(np.ceil(len(items) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows))
+    fig.suptitle(title or f"Worst {kind.upper()} Error Cases", fontsize=13, fontweight="bold")
+    flat_axes = np.atleast_1d(axes).ravel()
+
+    for ax, item in zip(flat_axes, items):
+        img = cv2.imread(str(item["path"]))
+        if img is None:
+            raise ValueError(f"Unreadable gallery image: {item['path']}")
+        canvas = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        if kind == "fp":
+            for gt in item.get("gt_boxes", []):
+                _draw_gallery_box(canvas, gt, "GT", (0, 220, 0))
+            for fp in item["fp_boxes"]:
+                _draw_gallery_box(canvas, fp, f"FP {float(fp[4]):.2f}", (255, 0, 0))
+            subtitle = f"{item['filename']}\nFP={item['n_fps']} max_conf={item['max_conf']:.2f}"
+        else:
+            for gt in item["fn_boxes"]:
+                _draw_gallery_box(canvas, gt, "MISSED", (0, 255, 0))
+            for sub in item.get("subthresh_boxes", []):
+                _draw_gallery_box(canvas, sub, f"sub {float(sub[4]):.2f}", (255, 180, 0))
+            subtitle = f"{item['filename']}\nMissed={item['n_fns']}"
+
+        ax.imshow(canvas)
+        ax.set_title(subtitle, fontsize=9)
+        ax.axis("off")
+
+    for ax in flat_axes[len(items):]:
+        ax.axis("off")
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
