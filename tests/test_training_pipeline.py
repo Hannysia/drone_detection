@@ -121,7 +121,7 @@ def test_training_uses_safe_defaults_plots_curves_and_uploads_artifacts(tmp_path
     assert training.run_yolo_training(yaml_path, "run") == current
     hf_check.assert_called_once_with()
     assert model.train.call_args.kwargs["cache"] is False
-    assert model.train.call_args.kwargs["rect"] is True
+    assert model.train.call_args.kwargs["rect"] is False
     assert model.train.call_args.kwargs["imgsz"] == 1280
     assert model.train.call_args.kwargs["batch"] == 8
     assert model.train.call_args.kwargs["epochs"] == 50

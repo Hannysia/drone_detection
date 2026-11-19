@@ -272,7 +272,7 @@ def run_yolo_training(
         "patience": 15,
         "device": 0 if torch.cuda.is_available() else "cpu",
         "optimizer": "auto",
-        "rect": True,
+        "rect": False,
         "cache": False,
         "workers": 2,
         "seed": 42,
