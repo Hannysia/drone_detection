@@ -14,6 +14,7 @@ from src.config import HF_TOKEN, MANIFESTS_DIR, REPO_ID
 from src.processing.evaluation import get_detections_boxes, load_eval_model
 from src.processing.manifests import select_manifest_frames
 from src.processing.yolo_dataset import _validate_run_name
+from src.utils.io import parse_video_id
 from src.utils.visualization import (
     overlay_heatmap,
     plot_detections_summary,
@@ -263,6 +264,41 @@ def _resolve_weights_path(weights_path: Path, run_name: str) -> Path:
     raise FileNotFoundError(f"No checkpoint found for run {run_name!r}")
 
 
+def _select_diverse_video_frames(
+    candidates: list[Path],
+    limit: int,
+    *,
+    rng: random.Random | None = None,
+) -> list[Path]:
+    """Selects up to limit frames while maximizing distinct source videos first."""
+    if limit <= 0 or not candidates:
+        return []
+    by_video: dict[str, list[Path]] = {}
+    seen_paths: set[Path] = set()
+    for path in candidates:
+        if path not in seen_paths:
+            seen_paths.add(path)
+            by_video.setdefault(parse_video_id(path), []).append(path)
+
+    video_ids = list(by_video.keys())
+    if rng is not None:
+        rng.shuffle(video_ids)
+        for paths in by_video.values():
+            rng.shuffle(paths)
+
+    selected: list[Path] = []
+    while len(selected) < limit and by_video:
+        for video_id in list(video_ids):
+            bucket = by_video[video_id]
+            selected.append(bucket.pop(0))
+            if not bucket:
+                del by_video[video_id]
+                video_ids.remove(video_id)
+            if len(selected) >= limit:
+                break
+    return selected
+
+
 def run_shortcut_analysis(
     weights_path: str | Path,
     dataset_root: str | Path,
@@ -277,6 +313,7 @@ def run_shortcut_analysis(
     source_path: Path | None = None,
     imgsz: int = 1280,
     show: bool = True,
+    seed: int | None = 42,
 ) -> None:
     """Executes model diagnostics by projecting CAM maps onto manifest-selected frames."""
     validated_name = _validate_run_name(run_name)
@@ -303,9 +340,12 @@ def run_shortcut_analysis(
     model, pytorch_model = load_eval_model(str(resolved_weights_path), device)
     target_layer, _ = find_sppf_layer(pytorch_model)
 
-    rng = random.Random(42)
     candidates = [path for path, _ in selected_rows]
-    selected_images = rng.sample(candidates, min(n_images, len(candidates)))
+    selected_images = _select_diverse_video_frames(
+        candidates,
+        n_images,
+        rng=random.Random(seed),
+    )
     log.info("[INFO] Sampling %d frames for analysis from %s/%s.", len(selected_images), split, category)
 
     detection_counts = []
@@ -442,6 +482,7 @@ def compare_models_shortcut_learning(
     imgsz: int = 1280,
     show_negatives: bool = True,
     show_positives: bool = True,
+    seed: int | None = 42,
 ) -> dict[str, object]:
     """Runs manifest-based FP mining and 1x3 side-by-side EigenCAM comparison for two runs."""
     if len(runs) != 2:
@@ -495,14 +536,14 @@ def compare_models_shortcut_learning(
     model_left, pt_left, layer_left = loaded_models[left_label]
     model_right, pt_right, layer_right = loaded_models[right_label]
 
+    rng = random.Random(seed)
     hard_paths = [item["path"] for item in fp_by_label[left_label]]
     for item in fp_by_label[right_label]:
         if item["path"] not in hard_paths:
             hard_paths.append(item["path"])
-    neg_targets = hard_paths[:n_negative_pairs]
-    if not neg_targets and n_negative_pairs > 0:
-        all_negs = [path for path, _ in val_negatives]
-        neg_targets = random.Random(42).sample(all_negs, min(n_negative_pairs, len(all_negs)))
+    extra_negs = [path for path, _ in val_negatives]
+    rng.shuffle(extra_negs)
+    neg_targets = _select_diverse_video_frames(hard_paths + extra_negs, n_negative_pairs)
 
     for idx, img_path in enumerate(neg_targets):
         fp_left = fp_lookup_by_label[left_label].get(img_path)
@@ -530,9 +571,10 @@ def compare_models_shortcut_learning(
                 source_path=source_path,
             )
         ]
-        pos_targets = random.Random(42).sample(
+        pos_targets = _select_diverse_video_frames(
             val_positives,
-            min(n_positive_pairs, len(val_positives)),
+            n_positive_pairs,
+            rng=rng,
         )
         for idx, img_path in enumerate(pos_targets):
             boxes_left = get_detections_boxes(model_left, str(img_path), conf=conf_thresh, imgsz=imgsz)

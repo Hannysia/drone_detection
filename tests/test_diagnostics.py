@@ -283,3 +283,85 @@ def test_compare_models_shortcut_learning_generates_1x3_pairs(tmp_path, monkeypa
 
     with pytest.raises(ValueError, match="exactly 2"):
         compare_models_shortcut_learning({"Only One": w_pos}, root, out_dir, manifest_path=manifest_path)
+
+
+def test_compare_models_shortcut_learning_picks_unique_videos_first(tmp_path, monkeypatch):
+    root = tmp_path / "curated"
+    rows = [
+        {"filename": "vidA_001_f0001.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "vidA_001_f0002.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "vidA_001_f0003.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "vidB_002_f0001.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "vidC_003_f0001.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "posA_010_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "posA_010_f0002.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "posB_011_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(folder / item["filename"]), np.zeros((64, 64, 3), dtype=np.uint8))
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path)
+
+    w_left = tmp_path / "left.pt"
+    w_right = tmp_path / "right.pt"
+    w_left.write_bytes(b"pt")
+    w_right.write_bytes(b"pt")
+
+    fp_confs = {
+        "vidA_001_f0001.jpg": 0.95,
+        "vidA_001_f0002.jpg": 0.90,
+        "vidA_001_f0003.jpg": 0.85,
+        "vidB_002_f0001.jpg": 0.70,
+    }
+
+    def _make_boxes(conf_val):
+        box = Mock()
+        box.__len__ = Mock(return_value=1)
+        box.conf = torch.tensor([conf_val])
+        box.xyxy = torch.tensor([[5.0, 5.0, 20.0, 20.0]])
+        return box
+
+    def _model_left(path, **kwargs):
+        for fname, conf_val in fp_confs.items():
+            if str(path).endswith(fname):
+                return [Mock(boxes=_make_boxes(conf_val))]
+        return [Mock(boxes=[])]
+
+    def _model_right(path, **kwargs):
+        return [Mock(boxes=[])]
+
+    fake_pt = DummyPyTorchModel([SPPFLayer()])
+    fake_left = Mock(side_effect=_model_left)
+    fake_right = Mock(side_effect=_model_right)
+    monkeypatch.setattr(
+        diagnostics,
+        "load_eval_model",
+        lambda p, d: (fake_left, fake_pt) if str(p).endswith("left.pt") else (fake_right, fake_pt),
+    )
+    monkeypatch.setattr(diagnostics, "manual_eigencam", lambda m, l, t: np.ones((8, 8), dtype=np.float32))
+
+    out_dir = tmp_path / "diverse_out"
+    compare_models_shortcut_learning(
+        {"Left": w_left, "Right": w_right},
+        root,
+        out_dir,
+        n_negative_pairs=3,
+        n_positive_pairs=2,
+        manifest_path=manifest_path,
+        show_negatives=False,
+        show_positives=False,
+    )
+
+    neg_names = sorted(p.name for p in (out_dir / "negatives_pairs").glob("*.png"))
+    pos_names = sorted(p.name for p in (out_dir / "positives_pairs").glob("*.png"))
+    assert len(neg_names) == 3
+    assert any("vidA_001_f0001" in n for n in neg_names)
+    assert not any("vidA_001_f0002" in n or "vidA_001_f0003" in n for n in neg_names)
+    assert any("vidB_002_f0001" in n for n in neg_names)
+    assert any("vidC_003_f0001" in n for n in neg_names)
+    assert len(pos_names) == 2
+    assert any("posA_010" in n for n in pos_names)
+    assert any("posB_011" in n for n in pos_names)
