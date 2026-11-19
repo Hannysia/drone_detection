@@ -6,7 +6,8 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from src.config import OUTPUT_DIR
+from src.config import MANIFESTS_DIR, OUTPUT_DIR
+from src.processing.manifests import select_manifest_frames
 from src.utils.geometry import calculate_iou_xyxy
 
 log = logging.getLogger(__name__)
@@ -134,39 +135,63 @@ def find_and_display_best_configs(
 
 
 
-def evaluate_model(weights_path: Path, yaml_path: Path, run_name: str) -> None:
-    """Evaluates the trained model on the 'test' split and prints metrics."""
-    log.info("\n" + "="*80)
-    log.info(f"STARTING YOLO EVALUATION ON TEST DATA: {run_name.upper()}")
-    log.info("="*80)
-    log.info(f"Loading weights from: {weights_path.resolve()}")
-    
+def evaluate_model(
+    weights_path: Path,
+    yaml_path: Path,
+    run_name: str,
+    *,
+    split: str = "test",
+    imgsz: int = 1280,
+    batch: int = 16,
+    conf: float | None = None,
+    plots: bool = True,
+) -> dict[str, float]:
+    """Evaluates the trained model on the target split and returns metrics."""
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Weights file not found: {weights_path}")
+    if not yaml_path.is_file():
+        raise FileNotFoundError(f"Dataset YAML not found: {yaml_path}")
+
+    device = 0 if torch.cuda.is_available() else "cpu"
+    log.info("\n" + "=" * 80)
+    log.info("STARTING YOLO EVALUATION ON %s DATA: %s", split.upper(), run_name.upper())
+    log.info("=" * 80)
+    log.info("Loading weights from: %s", weights_path.resolve())
+
     model = YOLO(str(weights_path))
-    
-    metrics = model.val(
-        data=str(yaml_path),
-        split="test",
-        imgsz=1280,
-        batch=8,
-        device=0,
-        rect=True,
-        project=str(OUTPUT_DIR),
-        name=f"{run_name}_test_evaluation",
-        exist_ok=True,
-        save=True,
-        plots=True
+    val_kwargs = {
+        "data": str(yaml_path),
+        "split": split,
+        "imgsz": imgsz,
+        "batch": batch,
+        "device": device,
+        "rect": False,
+        "project": str(OUTPUT_DIR),
+        "name": f"{run_name}_{split}_evaluation",
+        "exist_ok": True,
+        "save": True,
+        "plots": plots,
+    }
+    if conf is not None:
+        val_kwargs["conf"] = conf
+
+    metrics = model.val(**val_kwargs)
+    metrics_dict = (
+        dict(metrics.results_dict)
+        if metrics is not None and hasattr(metrics, "results_dict")
+        else {}
     )
-    
-    if metrics is not None and hasattr(metrics, 'results_dict'):
-        metrics_dict = metrics.results_dict
-        log.info("\n" + "="*50)
-        log.info(f"TEST DATA METRICS REPORT ({run_name.upper()})")
-        log.info("="*50)
-        log.info(f"Precision (P):              {metrics_dict.get('metrics/precision(B)', 0.0):.4f}")
-        log.info(f"Recall (R):                 {metrics_dict.get('metrics/recall(B)', 0.0):.4f}")
-        log.info(f"mAP50:                      {metrics_dict.get('metrics/mAP50(B)', 0.0):.4f}")
-        log.info(f"mAP50-95:                   {metrics_dict.get('metrics/mAP50-95(B)', 0.0):.4f}")
-        log.info("="*50)
+    if metrics_dict:
+        log.info("\n" + "=" * 50)
+        log.info("%s DATA METRICS REPORT (%s)", split.upper(), run_name.upper())
+        log.info("=" * 50)
+        log.info("Precision (P):              %.4f", metrics_dict.get("metrics/precision(B)", 0.0))
+        log.info("Recall (R):                 %.4f", metrics_dict.get("metrics/recall(B)", 0.0))
+        log.info("mAP50:                      %.4f", metrics_dict.get("metrics/mAP50(B)", 0.0))
+        log.info("mAP50-95:                   %.4f", metrics_dict.get("metrics/mAP50-95(B)", 0.0))
+        log.info("=" * 50)
+
+    return metrics_dict
 
 
 def load_eval_model(weights_path: str, device: torch.device) -> tuple[YOLO, torch.nn.Module]:
@@ -197,23 +222,31 @@ def get_detections_boxes(
     return boxes
 
 
-def evaluate_predictions(gt_boxes: list, pred_boxes: list, iou_threshold: float = 0.5) -> tuple[list[int], list[int], list[int]]:
-    """Greedy IoU matching between ground truths and predicted bounding boxes."""
+def evaluate_predictions(
+    gt_boxes: list,
+    pred_boxes: list,
+    iou_threshold: float = 0.5,
+) -> tuple[list[int], list[int], list[int]]:
+    """Greedy IoU matching returning indices relative to the input pred_boxes list."""
     if len(pred_boxes) == 0:
         return [], [], list(range(len(gt_boxes)))
     if len(gt_boxes) == 0:
         return [], list(range(len(pred_boxes))), []
 
-    pred_boxes = sorted(pred_boxes, key=lambda x: x[4], reverse=True)
-    
+    ordered_preds = sorted(
+        enumerate(pred_boxes),
+        key=lambda item: item[1][4],
+        reverse=True,
+    )
+
     matched_gts = set()
     tp_indices = []
     fp_indices = []
-    
-    for pred_idx, pred in enumerate(pred_boxes):
+
+    for orig_idx, pred in ordered_preds:
         best_iou = -1.0
         best_gt_idx = -1
-        
+
         for gt_idx, gt in enumerate(gt_boxes):
             if gt_idx in matched_gts:
                 continue
@@ -221,40 +254,44 @@ def evaluate_predictions(gt_boxes: list, pred_boxes: list, iou_threshold: float 
             if iou > best_iou:
                 best_iou = iou
                 best_gt_idx = gt_idx
-                
+
         if best_iou >= iou_threshold:
             matched_gts.add(best_gt_idx)
-            tp_indices.append(pred_idx)
+            tp_indices.append(orig_idx)
         else:
-            fp_indices.append(pred_idx)
-            
+            fp_indices.append(orig_idx)
+
     fn_indices = [i for i in range(len(gt_boxes)) if i not in matched_gts]
     return tp_indices, fp_indices, fn_indices
 
 
 def run_dataset_predictions_db(
     model: YOLO,
-    split_dir: Path,
+    dataset_root: Path,
     imgsz: int = 1280,
     *,
     collection_conf: float,
+    split: str = "val",
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    allowed_splits: tuple[str, ...] = ("val", "test"),
 ) -> list[dict]:
-    """Collect predictions from split_dir using collection_conf as the minimum confidence."""
-    pos_dir = split_dir / "RAW_POSITIVES"
-    neg_dir = split_dir / "RAW_NEGATIVES"
-    
-    test_images = []
-    for ext in ["*.jpg", "*.png", "*.jpeg"]:
-        if pos_dir.exists():
-            test_images.extend([(p, True) for p in pos_dir.glob(ext)])
-        if neg_dir.exists():
-            test_images.extend([(p, False) for p in neg_dir.glob(ext)])
-            
-    log.info(f"Found {len(test_images)} images to process.")
-    
+    """Collects predictions for manifest-selected frames using collection_conf."""
+    selected_frames = select_manifest_frames(
+        Path(dataset_root),
+        split=split,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        allowed_splits=allowed_splits,
+    )
+
+    log.info("Found %d active manifest images for split %r.", len(selected_frames), split)
+
+    device = 0 if torch.cuda.is_available() else "cpu"
     raw_database = []
-    
-    for img_path, is_positive in tqdm(test_images, desc="Running Evaluation Inference"):
+
+    for img_path, category in tqdm(selected_frames, desc="Running Evaluation Inference"):
+        is_positive = category == "positive"
         img = cv2.imread(str(img_path))
         if img is None:
             raise ValueError(f"Unreadable evaluation image: {img_path}")
@@ -290,14 +327,13 @@ def run_dataset_predictions_db(
             if not gt_boxes:
                 raise ValueError(f"Positive image has no annotated boxes: {txt_path}")
 
-        device = 0 if torch.cuda.is_available() else "cpu"
         results = model.predict(img, imgsz=imgsz, conf=collection_conf, verbose=False, device=device)[0]
         pred_boxes = []
         for box in results.boxes:
             coords = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0].cpu().numpy())
             pred_boxes.append([coords[0], coords[1], coords[2], coords[3], conf])
-            
+
         raw_database.append({
             "filename": img_path.name,
             "path": img_path,
@@ -305,7 +341,7 @@ def run_dataset_predictions_db(
             "width": w_orig,
             "height": h_orig,
             "gt_boxes": gt_boxes,
-            "pred_boxes": pred_boxes
+            "pred_boxes": pred_boxes,
         })
-        
+
     return raw_database
