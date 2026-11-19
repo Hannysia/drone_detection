@@ -127,6 +127,7 @@ def test_training_uses_safe_defaults_plots_curves_and_uploads_artifacts(tmp_path
     assert model.train.call_args.kwargs["batch"] == 8
     assert model.train.call_args.kwargs["epochs"] == 50
     assert model.train.call_args.kwargs["patience"] == 15
+    assert model.train.call_args.kwargs["erasing"] == 0.0
     assert (run_dir / "training_curves_run.png").is_file()
     upload_ckpt.assert_called_once_with(current, "run", model_type="yolo26n.pt")
     upload_dir.assert_called_once_with(run_dir, "run")

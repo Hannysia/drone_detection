@@ -293,6 +293,7 @@ def run_yolo_training(
         "hsv_h": 0.0,
         "hsv_s": 0.0,
         "hsv_v": 0.0,
+        "erasing": 0.0,
     }
     default_args.update(train_kwargs)
 
