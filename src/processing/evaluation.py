@@ -1,14 +1,23 @@
+from collections.abc import Iterable
 import logging
 from pathlib import Path
-import pandas as pd
-from tqdm import tqdm
 import cv2
+from huggingface_hub import hf_hub_download
 import numpy as np
+import pandas as pd
 import torch
+from tqdm import tqdm
 from ultralytics import YOLO
+from src import config
 from src.config import MANIFESTS_DIR, OUTPUT_DIR
 from src.processing.manifests import select_manifest_frames
+from src.processing.yolo_dataset import (
+    _validate_run_name,
+    cleanup_yolo_dataset,
+    prepare_yolo_dataset,
+)
 from src.utils.geometry import calculate_iou_xyxy
+from src.utils.visualization import plot_unified_calibration_curves
 
 log = logging.getLogger(__name__)
 
@@ -345,3 +354,227 @@ def run_dataset_predictions_db(
         })
 
     return raw_database
+
+
+def download_yolo_run_artifacts(
+    run_names: Iterable[str],
+    *,
+    cache_dir: Path | None = None,
+    model_prefix: str = "yolo26n",
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> dict[str, dict[str, Path]]:
+    """Downloads best weights and results.csv for YOLO training runs from Hugging Face."""
+    target_repo = config.REPO_ID if repo_id is None else repo_id
+    target_token = config.HF_TOKEN if token is None else token
+    if not isinstance(target_repo, str) or not target_repo.strip():
+        raise ValueError("REPO_ID is required for Hugging Face operations")
+    if not isinstance(target_token, str) or not target_token.strip():
+        raise ValueError("HF_TOKEN is required for Hugging Face operations")
+
+    validated_prefix = _validate_run_name(model_prefix)
+    local_dir = Path(cache_dir) if cache_dir is not None else config.WORKING_DIR / "hf_artifacts"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts = {}
+    for run_name in run_names:
+        validated_name = _validate_run_name(run_name)
+        weights = Path(hf_hub_download(
+            repo_id=target_repo.strip(),
+            filename=f"models/{validated_prefix}_{validated_name}_best.pt",
+            repo_type="dataset",
+            token=target_token.strip(),
+            local_dir=local_dir,
+        ))
+        results_csv = Path(hf_hub_download(
+            repo_id=target_repo.strip(),
+            filename=f"runs/{validated_name}/results.csv",
+            repo_type="dataset",
+            token=target_token.strip(),
+            local_dir=local_dir,
+        ))
+        artifacts[validated_name] = {"weights": weights, "results_csv": results_csv}
+
+    if not artifacts:
+        raise ValueError("Expected at least one run name to download")
+    return artifacts
+
+
+def calibrate_confidence_thresholds(
+    raw_database: list[dict],
+    *,
+    thresholds: np.ndarray | None = None,
+    iou_threshold: float = 0.5,
+    plot: bool = True,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> dict[str, object]:
+    """Sweeps confidence thresholds on a validation DB to maximize F0.5 and F1."""
+    if not raw_database:
+        raise ValueError("Calibration database is empty")
+
+    grid = np.linspace(0.05, 0.95, 37) if thresholds is None else np.asarray(thresholds, dtype=float)
+    if grid.size == 0:
+        raise ValueError("Threshold grid must not be empty")
+
+    precision_curve, recall_curve, f1_curve, f05_curve, neg_fa_rate = [], [], [], [], []
+    for threshold in grid:
+        tps_count, fps_count, fns_count = 0, 0, 0
+        total_negatives, negatives_with_false_alarms = 0, 0
+
+        for entry in raw_database:
+            filtered_preds = [pred for pred in entry["pred_boxes"] if pred[4] >= threshold]
+            tp, fp, fn = evaluate_predictions(
+                entry["gt_boxes"],
+                filtered_preds,
+                iou_threshold=iou_threshold,
+            )
+            tps_count += len(tp)
+            fps_count += len(fp)
+            fns_count += len(fn)
+
+            if not entry["is_positive"]:
+                total_negatives += 1
+                if filtered_preds:
+                    negatives_with_false_alarms += 1
+
+        precision = tps_count / (tps_count + fps_count) if (tps_count + fps_count) > 0 else 1.0
+        recall = tps_count / (tps_count + fns_count) if (tps_count + fns_count) > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        f05 = 1.25 * (precision * recall) / (0.25 * precision + recall) if (0.25 * precision + recall) > 0 else 0.0
+        fa_rate = (negatives_with_false_alarms / total_negatives * 100) if total_negatives > 0 else 0.0
+
+        precision_curve.append(precision)
+        recall_curve.append(recall)
+        f1_curve.append(f1)
+        f05_curve.append(f05)
+        neg_fa_rate.append(fa_rate)
+
+    opt_f05_idx = int(np.argmax(f05_curve))
+    opt_f1_idx = int(np.argmax(f1_curve))
+    opt_threshold_f05 = float(grid[opt_f05_idx])
+    opt_threshold_f1 = float(grid[opt_f1_idx])
+
+    summary_df = pd.DataFrame([
+        {
+            "Target": "Max F0.5 (Homing)",
+            "Threshold": round(opt_threshold_f05, 4),
+            "Precision": round(precision_curve[opt_f05_idx], 4),
+            "Recall": round(recall_curve[opt_f05_idx], 4),
+            "Score": round(f05_curve[opt_f05_idx], 4),
+            "Neg FA Rate (%)": round(neg_fa_rate[opt_f05_idx], 2),
+        },
+        {
+            "Target": "Max F1 (Balanced)",
+            "Threshold": round(opt_threshold_f1, 4),
+            "Precision": round(precision_curve[opt_f1_idx], 4),
+            "Recall": round(recall_curve[opt_f1_idx], 4),
+            "Score": round(f1_curve[opt_f1_idx], 4),
+            "Neg FA Rate (%)": round(neg_fa_rate[opt_f1_idx], 2),
+        },
+    ])
+
+    if plot:
+        plot_unified_calibration_curves(
+            grid,
+            precision_curve,
+            recall_curve,
+            f1_curve,
+            f05_curve,
+            neg_fa_rate,
+            opt_threshold_f1,
+            opt_threshold_f05,
+            save_path=save_path,
+            show=show,
+        )
+
+    return {
+        "opt_threshold_f05": opt_threshold_f05,
+        "opt_threshold_f1": opt_threshold_f1,
+        "summary": summary_df,
+        "thresholds": grid,
+        "precision": precision_curve,
+        "recall": recall_curve,
+        "f1": f1_curve,
+        "f05": f05_curve,
+        "neg_fa_rate": neg_fa_rate,
+    }
+
+
+def evaluate_runs_on_test(
+    runs: dict[str, Path],
+    dataset_root: Path,
+    *,
+    calibrated_run: str | None = None,
+    calibrated_conf: float | None = None,
+    imgsz: int = 1280,
+    batch: int = 16,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    plots: bool = True,
+) -> pd.DataFrame:
+    """Stages manifest-curated data and evaluates multiple runs on the locked test split."""
+    if not runs:
+        raise ValueError("Expected at least one run to evaluate")
+    if (calibrated_run is None) != (calibrated_conf is None):
+        raise ValueError("Provide both calibrated_run and calibrated_conf together")
+    if calibrated_run is not None and calibrated_run not in runs:
+        raise ValueError(f"Unknown calibrated_run: {calibrated_run!r}")
+
+    working_dir = config.WORKING_DIR
+    eval_yaml = prepare_yolo_dataset(
+        Path(dataset_root),
+        working_dir,
+        "eval_v1",
+        use_negatives=True,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        overwrite=True,
+    )
+
+    rows = []
+    try:
+        for run_name, weights_path in runs.items():
+            validated_name = _validate_run_name(run_name)
+            metrics = evaluate_model(
+                Path(weights_path),
+                eval_yaml,
+                validated_name,
+                split="test",
+                imgsz=imgsz,
+                batch=batch,
+                plots=plots,
+            )
+            rows.append({
+                "Run": validated_name,
+                "Conf": "default (mAP)",
+                "Precision": metrics.get("metrics/precision(B)", 0.0),
+                "Recall": metrics.get("metrics/recall(B)", 0.0),
+                "mAP50": metrics.get("metrics/mAP50(B)", 0.0),
+                "mAP50-95": metrics.get("metrics/mAP50-95(B)", 0.0),
+            })
+
+        if calibrated_run is not None and calibrated_conf is not None:
+            validated_cal = _validate_run_name(calibrated_run)
+            cal_metrics = evaluate_model(
+                Path(runs[calibrated_run]),
+                eval_yaml,
+                f"{validated_cal}_cal_f05",
+                split="test",
+                imgsz=imgsz,
+                batch=batch,
+                conf=float(calibrated_conf),
+                plots=plots,
+            )
+            rows.append({
+                "Run": validated_cal,
+                "Conf": f"F0.5 ({float(calibrated_conf):.4f})",
+                "Precision": cal_metrics.get("metrics/precision(B)", 0.0),
+                "Recall": cal_metrics.get("metrics/recall(B)", 0.0),
+                "mAP50": cal_metrics.get("metrics/mAP50(B)", 0.0),
+                "mAP50-95": cal_metrics.get("metrics/mAP50-95(B)", 0.0),
+            })
+    finally:
+        cleanup_yolo_dataset(working_dir, "eval_v1")
+
+    return pd.DataFrame(rows)

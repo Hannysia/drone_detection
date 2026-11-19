@@ -10,7 +10,9 @@ from src.utils.visualization import (
     load_yolo_training_history,
     overlay_heatmap,
     plot_detections_summary,
+    plot_eigencam_pair_comparison,
     plot_false_positive_results,
+    plot_unified_calibration_curves,
     plot_yolo_runs_comparison,
     plot_yolo_training_curves,
     summarize_yolo_training,
@@ -221,3 +223,36 @@ def test_plot_false_positive_results_saves_png(tmp_path):
     )
     assert out_png.is_file()
     assert out_png.stat().st_size > 0
+
+
+def test_plot_eigencam_pair_comparison_and_calibration_save_png(tmp_path):
+    img = np.zeros((32, 32, 3), dtype=np.uint8)
+    pair_png = tmp_path / "pair.png"
+    plot_eigencam_pair_comparison(
+        img,
+        img,
+        img,
+        "sample.jpg",
+        "Positives Only",
+        "With Negatives",
+        save_path=pair_png,
+        show=False,
+    )
+    assert pair_png.is_file()
+    assert pair_png.stat().st_size > 0
+
+    cal_png = tmp_path / "cal.png"
+    plot_unified_calibration_curves(
+        np.array([0.2, 0.5, 0.8]),
+        [0.7, 0.9, 0.95],
+        [0.9, 0.8, 0.5],
+        [0.78, 0.85, 0.65],
+        [0.73, 0.88, 0.81],
+        [10.0, 2.0, 0.0],
+        0.5,
+        0.5,
+        save_path=cal_png,
+        show=False,
+    )
+    assert cal_png.is_file()
+    assert cal_png.stat().st_size > 0

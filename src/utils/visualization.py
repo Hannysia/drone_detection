@@ -359,47 +359,76 @@ def plot_false_positive_results(
     )
 
 
+def plot_eigencam_pair_comparison(
+    img_rgb: np.ndarray,
+    left_panel: np.ndarray,
+    right_panel: np.ndarray,
+    filename: str,
+    left_title: str,
+    right_title: str,
+    save_path: Path | None = None,
+    *,
+    show: bool = True,
+) -> None:
+    """Plots original frame side-by-side with EigenCAM overlays from two compared runs."""
+    _render_eigencam_triptych(
+        img_rgb,
+        left_panel,
+        right_panel,
+        f"EigenCAM Comparison — {filename}",
+        ("Original Image", left_title, right_title),
+        save_path,
+        show=show,
+    )
+
+
 def plot_unified_calibration_curves(
-    thresholds: np.ndarray, 
-    precision: list[float], 
-    recall: list[float], 
-    f1: list[float], 
-    f05: list[float], 
+    thresholds: np.ndarray,
+    precision: list[float],
+    recall: list[float],
+    f1: list[float],
+    f05: list[float],
     neg_fa_rate: list[float],
     opt_th_f1: float,
-    opt_th_f05: float
+    opt_th_f05: float,
+    save_path: Path | None = None,
+    *,
+    show: bool = True,
 ) -> None:
     """Plots unified calibration curves (P, R, F1, F0.5 with indicators) and watermark FA rates."""
-    plt.figure(figsize=(15, 6))
-    
+    fig = plt.figure(figsize=(15, 6))
+
     plt.subplot(1, 2, 1)
-    plt.plot(thresholds, precision, 'g-', label='Precision (P)', linewidth=2)
-    plt.plot(thresholds, recall, 'b-', label='Recall (R)', linewidth=2)
-    plt.plot(thresholds, f1, 'y:', label='F1-Score', linewidth=2)
-    plt.plot(thresholds, f05, 'r-', label='F0.5-Score (Precision Weighted)', linewidth=3)
-    
-    plt.axvline(opt_th_f1, color='purple', linestyle='--', label=f'Max F1 Th ({opt_th_f1:.2f})')
-    plt.axvline(opt_th_f05, color='black', linestyle='-.', label=f'Max F0.5 Th ({opt_th_f05:.2f})')
-    
-    plt.xlabel('Confidence Threshold')
-    plt.ylabel('Score')
-    plt.title('YOLO Threshold Calibration Curves')
+    plt.plot(thresholds, precision, "g-", label="Precision (P)", linewidth=2)
+    plt.plot(thresholds, recall, "b-", label="Recall (R)", linewidth=2)
+    plt.plot(thresholds, f1, "y:", label="F1-Score", linewidth=2)
+    plt.plot(thresholds, f05, "r-", label="F0.5-Score (Precision Weighted)", linewidth=3)
+
+    plt.axvline(opt_th_f1, color="purple", linestyle="--", label=f"Max F1 Th ({opt_th_f1:.2f})")
+    plt.axvline(opt_th_f05, color="black", linestyle="-.", label=f"Max F0.5 Th ({opt_th_f05:.2f})")
+
+    plt.xlabel("Confidence Threshold")
+    plt.ylabel("Score")
+    plt.title("YOLO Threshold Calibration Curves")
     plt.legend(loc="lower left")
     plt.grid(True, alpha=0.3)
-    
+
     plt.subplot(1, 2, 2)
-    plt.plot(thresholds, neg_fa_rate, 'm-', linewidth=2, label='False Alarm Rate')
-    plt.axvline(opt_th_f1, color='purple', linestyle='--')
-    plt.axvline(opt_th_f05, color='black', linestyle='-.')
-    plt.xlabel('Confidence Threshold')
-    plt.ylabel('False Alarm Rate on Negatives (%)')
-    plt.title('Watermark / Background Noise Vulnerability Rate')
+    plt.plot(thresholds, neg_fa_rate, "m-", linewidth=2, label="False Alarm Rate")
+    plt.axvline(opt_th_f1, color="purple", linestyle="--")
+    plt.axvline(opt_th_f05, color="black", linestyle="-.")
+    plt.xlabel("Confidence Threshold")
+    plt.ylabel("False Alarm Rate on Negatives (%)")
+    plt.title("Watermark / Background Noise Vulnerability Rate")
     plt.grid(True, alpha=0.3)
     plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
-    plt.close()
+
+    _finalize_figure(
+        fig,
+        Path(save_path) if save_path is not None else None,
+        show,
+        tight_rect=None,
+    )
 
 
 def plot_theta_candidate_analysis(

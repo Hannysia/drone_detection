@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 from huggingface_hub import hf_hub_download
 import numpy as np
+import pandas as pd
 import torch
 from tqdm.auto import tqdm
 from ultralytics import YOLO
@@ -16,6 +17,7 @@ from src.processing.yolo_dataset import _validate_run_name
 from src.utils.visualization import (
     overlay_heatmap,
     plot_detections_summary,
+    plot_eigencam_pair_comparison,
     plot_eigencam_results,
     plot_false_positive_results,
 )
@@ -194,6 +196,15 @@ def analyze_single_image(
     return len(boxes)
 
 
+def _extract_fp_boxes(fp: dict | None) -> list[tuple[float, float, float, float, float]]:
+    if fp is None:
+        return []
+    return [
+        (float(x1), float(y1), float(x2), float(y2), float(conf))
+        for (x1, y1, x2, y2), conf in zip(fp["boxes"], fp["confs"])
+    ]
+
+
 def plot_false_positive_inline(
     fp: dict,
     pytorch_model: torch.nn.Module,
@@ -213,10 +224,7 @@ def plot_false_positive_inline(
         device,
         imgsz,
     )
-    boxes = [
-        (float(x1), float(y1), float(x2), float(y2), float(conf))
-        for (x1, y1, x2, y2), conf in zip(fp["boxes"], fp["confs"])
-    ]
+    boxes = _extract_fp_boxes(fp)
     overlay_boxes = _draw_detection_boxes(overlay, boxes, "FP", (255, 0, 0))
     plot_false_positive_results(
         img_rgb,
@@ -381,3 +389,168 @@ def run_false_positive_inference(
         log.info("  Min confidence: %.3f", false_positives[-1]["max_conf"])
 
     return false_positives
+
+
+
+def _render_model_pair_frame(
+    img_path: Path,
+    left_spec: tuple[torch.nn.Module, torch.nn.Module, list[tuple[float, float, float, float, float]], str],
+    right_spec: tuple[torch.nn.Module, torch.nn.Module, list[tuple[float, float, float, float, float]], str],
+    box_prefix: str,
+    box_color: tuple[int, int, int],
+    device: torch.device,
+    imgsz: int,
+    save_path: Path,
+    *,
+    show: bool,
+) -> None:
+    pt_left, layer_left, boxes_left, title_left = left_spec
+    pt_right, layer_right, boxes_right, title_right = right_spec
+    img_rgb, overlay_left = _compute_eigencam_overlay(pt_left, layer_left, img_path, device, imgsz)
+    _, overlay_right = _compute_eigencam_overlay(pt_right, layer_right, img_path, device, imgsz)
+    panel_left = _draw_detection_boxes(overlay_left, boxes_left, box_prefix, box_color)
+    panel_right = _draw_detection_boxes(overlay_right, boxes_right, box_prefix, box_color)
+    plot_eigencam_pair_comparison(
+        img_rgb,
+        panel_left,
+        panel_right,
+        img_path.name,
+        title_left,
+        title_right,
+        save_path=save_path,
+        show=show,
+    )
+
+
+def _format_fp_panel_title(label: str, fp_entry: dict | None) -> str:
+    if fp_entry is None or fp_entry["n_dets"] == 0:
+        return f"{label} (0 FP)"
+    return f"{label} (FP={fp_entry['n_dets']}, max={fp_entry['max_conf']:.2f})"
+
+
+def compare_models_shortcut_learning(
+    runs: dict[str, Path],
+    dataset_root: str | Path,
+    output_dir_path: str | Path,
+    *,
+    split: str = "val",
+    conf_thresh: float = 0.25,
+    n_negative_pairs: int = 5,
+    n_positive_pairs: int = 5,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    imgsz: int = 1280,
+    show_negatives: bool = True,
+    show_positives: bool = True,
+) -> dict[str, object]:
+    """Runs manifest-based FP mining and 1x3 side-by-side EigenCAM comparison for two runs."""
+    if len(runs) != 2:
+        raise ValueError("Expected exactly 2 runs to compare")
+    if n_negative_pairs < 0 or n_positive_pairs < 0:
+        raise ValueError("Pair counts must be non-negative")
+
+    root = Path(dataset_root)
+    output_dir = Path(output_dir_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    val_negatives = select_manifest_frames(
+        root,
+        split=split,
+        category="negative",
+        manifest_path=manifest_path,
+        source_path=source_path,
+    )
+    total_negatives = len(val_negatives)
+
+    loaded_models = {}
+    fp_by_label = {}
+    fp_lookup_by_label = {}
+    summary_rows = []
+
+    for label, weights_path in runs.items():
+        model, pytorch_model = load_eval_model(str(weights_path), device)
+        target_layer, _ = find_sppf_layer(pytorch_model)
+        fps = run_false_positive_inference(
+            model,
+            root,
+            conf_thresh=conf_thresh,
+            split=split,
+            manifest_path=manifest_path,
+            source_path=source_path,
+            imgsz=imgsz,
+        )
+        loaded_models[label] = (model, pytorch_model, target_layer)
+        fp_by_label[label] = fps
+        fp_lookup_by_label[label] = {item["path"]: item for item in fps}
+        summary_rows.append({
+            "Run": label,
+            "Val Negatives": total_negatives,
+            "FP Frames": len(fps),
+            "FP Rate (%)": round(len(fps) / total_negatives * 100, 2),
+            "Max FP Conf": round(fps[0]["max_conf"], 4) if fps else 0.0,
+        })
+
+    left_label, right_label = list(runs.keys())
+    model_left, pt_left, layer_left = loaded_models[left_label]
+    model_right, pt_right, layer_right = loaded_models[right_label]
+
+    hard_paths = [item["path"] for item in fp_by_label[left_label]]
+    for item in fp_by_label[right_label]:
+        if item["path"] not in hard_paths:
+            hard_paths.append(item["path"])
+    neg_targets = hard_paths[:n_negative_pairs]
+    if not neg_targets and n_negative_pairs > 0:
+        all_negs = [path for path, _ in val_negatives]
+        neg_targets = random.Random(42).sample(all_negs, min(n_negative_pairs, len(all_negs)))
+
+    for idx, img_path in enumerate(neg_targets):
+        fp_left = fp_lookup_by_label[left_label].get(img_path)
+        fp_right = fp_lookup_by_label[right_label].get(img_path)
+        _render_model_pair_frame(
+            img_path,
+            (pt_left, layer_left, _extract_fp_boxes(fp_left), _format_fp_panel_title(left_label, fp_left)),
+            (pt_right, layer_right, _extract_fp_boxes(fp_right), _format_fp_panel_title(right_label, fp_right)),
+            "FP",
+            (255, 0, 0),
+            device,
+            imgsz,
+            output_dir / "negatives_pairs" / f"pair_{idx:02d}_{img_path.stem}.png",
+            show=show_negatives,
+        )
+
+    if n_positive_pairs > 0:
+        val_positives = [
+            path
+            for path, _ in select_manifest_frames(
+                root,
+                split=split,
+                category="positive",
+                manifest_path=manifest_path,
+                source_path=source_path,
+            )
+        ]
+        pos_targets = random.Random(42).sample(
+            val_positives,
+            min(n_positive_pairs, len(val_positives)),
+        )
+        for idx, img_path in enumerate(pos_targets):
+            boxes_left = get_detections_boxes(model_left, str(img_path), conf=conf_thresh, imgsz=imgsz)
+            boxes_right = get_detections_boxes(model_right, str(img_path), conf=conf_thresh, imgsz=imgsz)
+            _render_model_pair_frame(
+                img_path,
+                (pt_left, layer_left, boxes_left, f"{left_label} (Det={len(boxes_left)})"),
+                (pt_right, layer_right, boxes_right, f"{right_label} (Det={len(boxes_right)})"),
+                "drone",
+                (0, 255, 0),
+                device,
+                imgsz,
+                output_dir / "positives_pairs" / f"pair_{idx:02d}_{img_path.stem}.png",
+                show=show_positives,
+            )
+
+    return {
+        "summary": pd.DataFrame(summary_rows),
+        "fp_by_run": fp_by_label,
+        "total_val_negatives": total_negatives,
+    }

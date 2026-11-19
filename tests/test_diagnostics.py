@@ -6,6 +6,7 @@ import torch
 
 from src.processing import diagnostics
 from src.processing.diagnostics import (
+    compare_models_shortcut_learning,
     find_sppf_layer,
     letterbox_image,
     plot_false_positive_inline,
@@ -211,3 +212,74 @@ def test_run_shortcut_analysis_saves_plots_and_uses_output_dir_fallback(tmp_path
             manifest_path=manifest_path,
             show=False,
         )
+
+
+def test_compare_models_shortcut_learning_generates_1x3_pairs(tmp_path, monkeypatch):
+    root = tmp_path / "curated"
+    rows = [
+        {"filename": "va_pos.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "va_neg.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "va_drop.jpg", "split": "val", "category": "negative", "excluded_at": "temporal"},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(folder / item["filename"]), np.zeros((64, 64, 3), dtype=np.uint8))
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path)
+
+    w_pos = tmp_path / "pos.pt"
+    w_neg = tmp_path / "neg.pt"
+    w_pos.write_bytes(b"pt")
+    w_neg.write_bytes(b"pt")
+
+    fp_box = Mock()
+    fp_box.__len__ = Mock(return_value=1)
+    fp_box.conf = torch.tensor([0.75])
+    fp_box.xyxy = torch.tensor([[5.0, 5.0, 20.0, 20.0]])
+
+    def _model_pos(path, **kwargs):
+        if "va_neg" in str(path):
+            return [Mock(boxes=fp_box)]
+        return [Mock(boxes=[])]
+
+    def _model_neg(path, **kwargs):
+        return [Mock(boxes=[])]
+
+    fake_left = Mock(side_effect=_model_pos)
+    fake_right = Mock(side_effect=_model_neg)
+    fake_pt = DummyPyTorchModel([SPPFLayer()])
+
+    def _fake_load(weights_path, device):
+        return (fake_left, fake_pt) if Path_name(weights_path) == "pos.pt" else (fake_right, fake_pt)
+
+    from pathlib import Path
+    def Path_name(value):
+        return Path(value).name
+
+    monkeypatch.setattr(diagnostics, "load_eval_model", _fake_load)
+    monkeypatch.setattr(diagnostics, "manual_eigencam", lambda m, l, t: np.ones((8, 8), dtype=np.float32))
+
+    out_dir = tmp_path / "comparison"
+    result = compare_models_shortcut_learning(
+        {"Positives Only": w_pos, "With Negatives": w_neg},
+        root,
+        out_dir,
+        n_negative_pairs=5,
+        n_positive_pairs=5,
+        manifest_path=manifest_path,
+        show_negatives=False,
+        show_positives=False,
+    )
+
+    summary = result["summary"]
+    assert list(summary["Run"]) == ["Positives Only", "With Negatives"]
+    assert list(summary["Val Negatives"]) == [1, 1]
+    assert list(summary["FP Frames"]) == [1, 0]
+    assert list(summary["FP Rate (%)"]) == [100.0, 0.0]
+    assert (out_dir / "negatives_pairs" / "pair_00_va_neg.png").is_file()
+    assert (out_dir / "positives_pairs" / "pair_00_va_pos.png").is_file()
+
+    with pytest.raises(ValueError, match="exactly 2"):
+        compare_models_shortcut_learning({"Only One": w_pos}, root, out_dir, manifest_path=manifest_path)

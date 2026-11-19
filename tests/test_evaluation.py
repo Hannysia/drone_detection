@@ -5,8 +5,11 @@ import pytest
 
 from src.processing import evaluation
 from src.processing.evaluation import (
+    calibrate_confidence_thresholds,
+    download_yolo_run_artifacts,
     evaluate_model,
     evaluate_predictions,
+    evaluate_runs_on_test,
     run_dataset_predictions_db,
 )
 from src.processing.manifests import CATEGORY_DIRS, write_manifest
@@ -236,3 +239,96 @@ def test_evaluate_model_uses_rect_false_imgsz_1280_and_auto_device(tmp_path, mon
         plots=True,
         conf=0.5,
     )
+
+
+def test_download_yolo_run_artifacts_fetches_weights_and_csv(tmp_path, monkeypatch):
+    def fake_download(repo_id, filename, repo_type, token, local_dir):
+        target = tmp_path / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"ok")
+        return str(target)
+
+    monkeypatch.setattr(evaluation, "hf_hub_download", fake_download)
+    artifacts = download_yolo_run_artifacts(
+        ("run_positives_only", "run_with_negatives"),
+        cache_dir=tmp_path,
+        repo_id="user/ds",
+        token="hf_tok",
+    )
+
+    assert artifacts["run_positives_only"]["weights"] == tmp_path / "models" / "yolo26n_run_positives_only_best.pt"
+    assert artifacts["run_with_negatives"]["results_csv"] == tmp_path / "runs" / "run_with_negatives" / "results.csv"
+
+    with pytest.raises(ValueError, match="Invalid run name"):
+        download_yolo_run_artifacts(("../bad",), cache_dir=tmp_path, repo_id="user/ds", token="hf_tok")
+
+
+def test_calibrate_confidence_thresholds_picks_max_f05_and_saves_plot(tmp_path):
+    raw_database = [
+        {
+            "filename": "pos.jpg",
+            "is_positive": True,
+            "gt_boxes": [[0.0, 0.0, 10.0, 10.0]],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.85], [50.0, 50.0, 60.0, 60.0, 0.40]],
+        },
+        {
+            "filename": "neg.jpg",
+            "is_positive": False,
+            "gt_boxes": [],
+            "pred_boxes": [[0.0, 0.0, 5.0, 5.0, 0.40]],
+        },
+    ]
+
+    cal_png = tmp_path / "cal.png"
+    result = calibrate_confidence_thresholds(
+        raw_database,
+        thresholds=np.array([0.30, 0.60, 0.90]),
+        save_path=cal_png,
+        show=False,
+    )
+
+    assert result["opt_threshold_f05"] == pytest.approx(0.60)
+    assert result["opt_threshold_f1"] == pytest.approx(0.60)
+    assert cal_png.is_file()
+    assert cal_png.stat().st_size > 0
+
+    with pytest.raises(ValueError, match="empty"):
+        calibrate_confidence_thresholds([])
+
+
+def test_evaluate_runs_on_test_stages_evaluates_and_cleans_up(tmp_path, monkeypatch):
+    root, manifest_path = _write_eval_bundle(
+        tmp_path,
+        [
+            {"filename": "tr.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+            {"filename": "va.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+            {"filename": "te.jpg", "split": "test", "category": "positive", "excluded_at": ""},
+        ],
+    )
+    w_pos = tmp_path / "pos.pt"
+    w_neg = tmp_path / "neg.pt"
+    w_pos.write_bytes(b"pt")
+    w_neg.write_bytes(b"pt")
+
+    working = tmp_path / "working"
+    monkeypatch.setattr(evaluation.config, "WORKING_DIR", working)
+    mock_eval = Mock(return_value={
+        "metrics/precision(B)": 0.9,
+        "metrics/recall(B)": 0.8,
+        "metrics/mAP50(B)": 0.88,
+        "metrics/mAP50-95(B)": 0.65,
+    })
+    monkeypatch.setattr(evaluation, "evaluate_model", mock_eval)
+
+    table = evaluate_runs_on_test(
+        {"run_positives_only": w_pos, "run_with_negatives": w_neg},
+        root,
+        calibrated_run="run_with_negatives",
+        calibrated_conf=0.72,
+        manifest_path=manifest_path,
+    )
+
+    assert list(table["Conf"]) == ["default (mAP)", "default (mAP)", "F0.5 (0.7200)"]
+    assert mock_eval.call_count == 3
+    assert mock_eval.call_args_list[2].kwargs["conf"] == pytest.approx(0.72)
+    assert not (working / "yolo_dataset_eval_v1").exists()
