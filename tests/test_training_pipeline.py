@@ -122,6 +122,7 @@ def test_training_uses_safe_defaults_plots_curves_and_uploads_artifacts(tmp_path
     hf_check.assert_called_once_with()
     assert model.train.call_args.kwargs["cache"] is False
     assert model.train.call_args.kwargs["rect"] is False
+    assert model.train.call_args.kwargs["plots"] is False
     assert model.train.call_args.kwargs["imgsz"] == 1280
     assert model.train.call_args.kwargs["batch"] == 8
     assert model.train.call_args.kwargs["epochs"] == 50
@@ -379,3 +380,48 @@ def test_require_gpu_fails_fast_when_cuda_unavailable(tmp_path, monkeypatch):
         == tmp_path / "best.pt"
     )
     fit.assert_called_once()
+
+
+def test_wandb_logs_monitoring_curves_and_summary(tmp_path, monkeypatch):
+    training = _load_training(tmp_path, monkeypatch)
+
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+    run_dir = tmp_path / "run_wb_curves"
+    best = run_dir / "weights" / "best.pt"
+    best.parent.mkdir(parents=True)
+    best.touch()
+    (run_dir / "results.csv").write_text(
+        "epoch,train/box_loss,train/cls_loss,val/box_loss,val/cls_loss,"
+        "metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)\n"
+        "1,1.0,0.8,1.1,0.9,0.80,0.75,0.78,0.52\n",
+        encoding="utf-8",
+    )
+
+    fake_run = SimpleNamespace(summary={})
+    fake_wandb = SimpleNamespace(
+        run=fake_run,
+        login=Mock(return_value=True),
+        init=Mock(),
+        log=Mock(),
+        Image=lambda path: ("wandb_image", path),
+        finish=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setattr(training, "WANDB_API_KEY", "wb-secret")
+    monkeypatch.setattr(training, "WANDB_PROJECT", "uav-proj")
+
+    model = Mock()
+    model.train.return_value = None
+    model.trainer.best = best
+    model.trainer.save_dir = run_dir
+    monkeypatch.setattr(training, "YOLO", Mock(return_value=model))
+
+    training.run_yolo_training(yaml_path, "run_wb_curves", upload_to_hf=False, use_wandb=True)
+
+    curves_path = run_dir / "training_curves_run_wb_curves.png"
+    fake_wandb.log.assert_called_once_with(
+        {"monitoring/training_curves": ("wandb_image", str(curves_path))}
+    )
+    assert fake_run.summary["best_epoch"] == 1
+    assert "fit_status" in fake_run.summary

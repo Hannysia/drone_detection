@@ -281,7 +281,7 @@ def run_yolo_training(
         "name": validated_name,
         "exist_ok": True,
         "save": True,
-        "plots": True,
+        "plots": False,
         "mosaic": 0.0,
         "mixup": 0.0,
         "copy_paste": 0.0,
@@ -363,6 +363,14 @@ def run_yolo_training(
                 summary["val_train_loss_gap"],
                 summary["fit_status"],
             )
+            if wb is not None and getattr(wb, "run", None) is not None:
+                if hasattr(wb, "log") and hasattr(wb, "Image"):
+                    wb.log({"monitoring/training_curves": wb.Image(str(curves_path))})
+                run_summary = getattr(wb.run, "summary", None)
+                if run_summary is not None and hasattr(run_summary, "update"):
+                    run_summary.update({
+                        k: v for k, v in summary.items() if v is not None
+                    })
     except Exception:
         failed = True
         raise
