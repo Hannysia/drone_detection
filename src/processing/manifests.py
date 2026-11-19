@@ -1,9 +1,11 @@
 import csv
+import json
 import os
 from collections.abc import Iterable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from src.config import SPLITS
+from src.config import MANIFESTS_DIR, SPLITS
+from src.utils.io import check_extraction_source
 
 
 CATEGORY_DIRS = {
@@ -190,3 +192,48 @@ def collect_frame_rows(dataset_root: Path) -> list[dict[str, str]]:
         raise ValueError("No JPG images found")
 
     return rows
+
+
+def select_manifest_frames(
+    dataset_root: Path,
+    *,
+    split: str = "val",
+    category: str | None = None,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    allowed_splits: tuple[str, ...] = ("val", "test"),
+) -> list[tuple[Path, str]]:
+    """Returns active frame paths and categories for a split filtered by manifest."""
+    if split not in SPLITS:
+        raise ValueError(f"Unknown split: {split!r}")
+    if split not in allowed_splits:
+        raise ValueError(
+            f"Split {split!r} is not allowed; expected one of {allowed_splits}"
+        )
+    if category is not None and category not in CATEGORY_DIRS:
+        raise ValueError(f"Unknown category: {category!r}")
+
+    root = dataset_root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    if source_path is not None:
+        expected_source = json.loads(source_path.read_text(encoding="utf-8"))
+        check_extraction_source(root, expected_source)
+
+    rows = read_manifest(manifest_path)
+    selected = []
+    for row in rows:
+        if row["split"] != split or row["excluded_at"]:
+            continue
+        if category is not None and row["category"] != category:
+            continue
+        image_path = root / split / CATEGORY_DIRS[row["category"]] / row["filename"]
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Missing manifest image: {image_path}")
+        selected.append((image_path, row["category"]))
+
+    if not selected:
+        raise ValueError(
+            f"No active frames for split={split!r}, category={category!r} in {manifest_path}"
+        )
+    return selected

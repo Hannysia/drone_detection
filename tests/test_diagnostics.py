@@ -1,8 +1,19 @@
+from unittest.mock import Mock
+import cv2
+import numpy as np
 import pytest
 import torch
-from src.processing.diagnostics import find_sppf_layer
-import logging
-import sys
+
+from src.processing import diagnostics
+from src.processing.diagnostics import (
+    find_sppf_layer,
+    letterbox_image,
+    plot_false_positive_inline,
+    preprocess_image_tensor,
+    run_false_positive_inference,
+    run_shortcut_analysis,
+)
+from src.processing.manifests import CATEGORY_DIRS, write_manifest
 
 ConvLayer = type("Conv", (object,), {})
 SPPFLayer = type("SPPF", (object,), {})
@@ -59,3 +70,144 @@ def test_diagnostics_reuses_evaluation_get_detections_boxes():
     from src.processing import diagnostics, evaluation
 
     assert diagnostics.get_detections_boxes is evaluation.get_detections_boxes
+
+
+def test_preprocess_image_tensor_uses_1280_letterbox_and_fails_on_unreadable(tmp_path):
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"not an image")
+    with pytest.raises(ValueError, match="Unreadable diagnostic image"):
+        preprocess_image_tensor(broken, torch.device("cpu"))
+
+    img_path = tmp_path / "wide.jpg"
+    assert cv2.imwrite(str(img_path), np.full((100, 200, 3), 255, dtype=np.uint8))
+
+    orig, letterboxed, tensor = preprocess_image_tensor(img_path, torch.device("cpu"))
+    assert orig.shape == (100, 200, 3)
+    assert letterboxed.shape == (1280, 1280, 3)
+    assert tuple(letterboxed[0, 0]) == (114, 114, 114)
+    assert tuple(tensor.shape) == (1, 3, 1280, 1280)
+
+    _, crop_box = letterbox_image(orig, 1280)
+    assert crop_box == (320, 960, 0, 1280)
+
+
+def test_plot_false_positive_inline_uses_unpadded_1280_eigencam(tmp_path, monkeypatch):
+    img_path = tmp_path / "neg.jpg"
+    assert cv2.imwrite(str(img_path), np.zeros((100, 200, 3), dtype=np.uint8))
+
+    cam_calls = []
+    monkeypatch.setattr(
+        diagnostics,
+        "manual_eigencam",
+        lambda model, layer, tensor: (cam_calls.append(tuple(tensor.shape)), np.ones((40, 40), dtype=np.float32))[1],
+    )
+    overlay_spy = Mock(return_value=np.zeros((100, 200, 3), dtype=np.uint8))
+    monkeypatch.setattr(diagnostics, "overlay_heatmap", overlay_spy)
+    render_spy = Mock()
+    monkeypatch.setattr(diagnostics, "plot_false_positive_results", render_spy)
+
+    fp = {
+        "path": img_path,
+        "n_dets": 1,
+        "max_conf": 0.85,
+        "boxes": np.array([[10.0, 12.0, 50.0, 40.0]]),
+        "confs": np.array([0.85]),
+    }
+
+    plot_false_positive_inline(fp, object(), object(), torch.device("cpu"), show=False)
+
+    assert cam_calls == [(1, 3, 1280, 1280)]
+    assert overlay_spy.call_args.kwargs["crop_box"] == (320, 960, 0, 1280)
+    assert overlay_spy.call_args.kwargs["input_size"] == (1280, 1280)
+    render_spy.assert_called_once()
+
+
+def test_run_false_positive_inference_enforces_manifest_and_imgsz(tmp_path):
+    root = tmp_path / "curated"
+    rows = [
+        {"filename": "tr_neg.jpg", "split": "train", "category": "negative", "excluded_at": ""},
+        {"filename": "va_keep.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "va_excl.jpg", "split": "val", "category": "negative", "excluded_at": "temporal"},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(folder / item["filename"]), np.zeros((32, 32, 3), dtype=np.uint8))
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path)
+
+    fake_boxes = Mock()
+    fake_boxes.__len__ = Mock(return_value=1)
+    fake_boxes.conf = torch.tensor([0.65])
+    fake_boxes.xyxy = torch.tensor([[1.0, 2.0, 10.0, 12.0]])
+    fake_model = Mock(return_value=[Mock(boxes=fake_boxes)])
+
+    fps = run_false_positive_inference(
+        fake_model,
+        root,
+        conf_thresh=0.25,
+        split="val",
+        manifest_path=manifest_path,
+    )
+
+    fake_model.assert_called_once()
+    assert fake_model.call_args.args[0].endswith("va_keep.jpg")
+    assert fake_model.call_args.kwargs["imgsz"] == 1280
+    assert len(fps) == 1
+    assert fps[0]["path"].name == "va_keep.jpg"
+
+
+def test_run_shortcut_analysis_saves_plots_and_uses_output_dir_fallback(tmp_path, monkeypatch):
+    root = tmp_path / "curated"
+    rows = [
+        {"filename": "va_keep.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "va_drop.jpg", "split": "val", "category": "positive", "excluded_at": "temporal"},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(folder / item["filename"]), np.zeros((64, 64, 3), dtype=np.uint8))
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path)
+
+    output_base = tmp_path / "runs" / "detect"
+    fallback_weights = output_base / "demo_run" / "weights" / "best.pt"
+    fallback_weights.parent.mkdir(parents=True)
+    fallback_weights.write_bytes(b"pt")
+
+    monkeypatch.setattr(diagnostics.config, "OUTPUT_DIR", output_base)
+    monkeypatch.setattr(diagnostics, "REPO_ID", None)
+    monkeypatch.setattr(diagnostics, "HF_TOKEN", None)
+
+    fake_model = Mock(return_value=[Mock(boxes=[])])
+    fake_pytorch = DummyPyTorchModel([SPPFLayer()])
+    monkeypatch.setattr(diagnostics, "load_eval_model", lambda path, device: (fake_model, fake_pytorch))
+    monkeypatch.setattr(diagnostics, "manual_eigencam", lambda m, l, t: np.ones((8, 8), dtype=np.float32))
+
+    out_dir = tmp_path / "diag_out"
+    run_shortcut_analysis(
+        tmp_path / "nonexistent.pt",
+        root,
+        out_dir,
+        "demo_run",
+        n_images=5,
+        manifest_path=manifest_path,
+        show=False,
+    )
+
+    assert (out_dir / "demo_run" / "cam_000_va_keep.png").is_file()
+    assert not (out_dir / "demo_run" / "cam_001_va_drop.png").exists()
+    assert (out_dir / "demo_run" / "detection_summary.png").is_file()
+    assert fake_model.call_args.kwargs["imgsz"] == 1280
+
+    with pytest.raises(FileNotFoundError, match="No checkpoint"):
+        run_shortcut_analysis(
+            tmp_path / "missing.pt",
+            root,
+            out_dir,
+            "missing_run",
+            manifest_path=manifest_path,
+            show=False,
+        )

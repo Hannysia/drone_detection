@@ -7,7 +7,6 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 import plotly.express as px
 import cv2
-import torch
 
 
 log = logging.getLogger(__name__)
@@ -241,49 +240,85 @@ def plot_local_contrast_analysis(df_contrast: pd.DataFrame) -> None:
 
 
 
-def overlay_heatmap(img_rgb: np.ndarray, cam_map: np.ndarray, alpha: float = 0.4) -> np.ndarray:
+
+def overlay_heatmap(
+    img_rgb: np.ndarray,
+    cam_map: np.ndarray,
+    alpha: float = 0.4,
+    *,
+    crop_box: tuple[int, int, int, int] | None = None,
+    input_size: tuple[int, int] | None = None,
+) -> np.ndarray:
     """Overlays generated attention maps onto target images."""
     h, w = img_rgb.shape[:2]
-    heatmap = cv2.resize(cam_map, (w, h))
-    heatmap = np.uint8(255 * heatmap)
+    heatmap_src = cam_map
+    if crop_box is not None or input_size is not None:
+        if crop_box is None or input_size is None:
+            raise ValueError("Provide both crop_box and input_size together")
+        in_h, in_w = input_size
+        top, bottom, left, right = crop_box
+        if not (0 <= top < bottom <= in_h and 0 <= left < right <= in_w):
+            raise ValueError(f"Invalid crop_box {crop_box} for input_size {input_size}")
+        resized_map = cv2.resize(cam_map, (in_w, in_h))
+        heatmap_src = resized_map[top:bottom, left:right]
+
+    heatmap = cv2.resize(heatmap_src, (w, h))
+    heatmap = np.uint8(255 * np.clip(heatmap, 0.0, 1.0))
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     return cv2.addWeighted(img_rgb, 1 - alpha, heatmap_color, alpha, 0)
 
 
+def _render_eigencam_triptych(
+    img_rgb: np.ndarray,
+    overlay: np.ndarray,
+    overlay_with_boxes: np.ndarray,
+    suptitle: str,
+    titles: tuple[str, str, str],
+    save_path: Path | None,
+    *,
+    show: bool = True,
+    title_color: str = "black",
+) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(suptitle, fontsize=11, color=title_color, fontweight="bold")
+    for axis, image, title in zip(axes, (img_rgb, overlay, overlay_with_boxes), titles):
+        axis.imshow(image)
+        axis.set_title(title)
+        axis.axis("off")
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show, dpi=120)
+
+
 def plot_eigencam_results(
-    img_rgb: np.ndarray, 
-    overlay: np.ndarray, 
-    overlay_with_boxes: np.ndarray, 
-    save_path: Path, 
+    img_rgb: np.ndarray,
+    overlay: np.ndarray,
+    overlay_with_boxes: np.ndarray,
+    save_path: Path,
     filename: str,
-    boxes_count: int
+    boxes_count: int,
+    *,
+    show: bool = True,
 ) -> None:
     """Plots and saves side-by-side original image, EigenCAM attention map, and predictions."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f"EigenCAM Activation Map — {filename}", fontsize=11, fontweight="bold")
-
-    axes[0].imshow(img_rgb)
-    axes[0].set_title("Original Image")
-    axes[0].axis("off")
-
-    axes[1].imshow(overlay)
-    axes[1].set_title("EigenCAM Attention")
-    axes[1].axis("off")
-
-    axes[2].imshow(overlay_with_boxes)
-    axes[2].set_title(f"Predictions ({boxes_count} found)")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches="tight")
-    plt.show()
-    plt.close()
+    _render_eigencam_triptych(
+        img_rgb,
+        overlay,
+        overlay_with_boxes,
+        f"EigenCAM Activation Map — {filename}",
+        ("Original Image", "EigenCAM Attention", f"Predictions ({boxes_count} found)"),
+        save_path,
+        show=show,
+    )
 
 
-
-def plot_detections_summary(detection_counts: list[int], run_name: str) -> None:
-    """Generates a bar chart summarizing detections per frame and saves it to output_path."""
+def plot_detections_summary(
+    detection_counts: list[int],
+    run_name: str,
+    save_path: Path | None = None,
+    *,
+    show: bool = True,
+) -> None:
+    """Generates a bar chart summarizing detections per frame and optionally saves it."""
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.bar(range(len(detection_counts)), detection_counts, color="#4A90D9")
     ax.set_title(f"Detections Per Frame Summary — {run_name}")
@@ -292,62 +327,36 @@ def plot_detections_summary(detection_counts: list[int], run_name: str) -> None:
     ax.axhline(y=1, color="red", linestyle="--", label="Expected (1)")
     ax.grid(True, alpha=0.2)
     ax.legend()
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-
-
-def plot_false_positive_inline(
-    fp: dict, 
-    pytorch_model: torch.nn.Module, 
-    target_layer: torch.nn.Module, 
-    device: torch.device
-) -> None:
-    """Generates EigenCAM attention overlay and plots the False Positive side-by-side inside the notebook."""
-    from src.processing.yolo import manual_eigencam, preprocess_image_tensor
-  
-    img_path = str(fp["path"])
-    img_rgb, _, tensor = preprocess_image_tensor(img_path, device)
-    if img_rgb is None:
-        return
-
-    cam_map = manual_eigencam(pytorch_model, target_layer, tensor)
-
-    overlay = overlay_heatmap(img_rgb, cam_map)
-    overlay_boxes = overlay.copy()
-
-    for (x1, y1, x2, y2), conf in zip(fp["boxes"], fp["confs"]):
-        cv2.rectangle(overlay_boxes, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-        cv2.putText(
-            overlay_boxes, f"FP {conf:.2f}",
-            (int(x1), max(int(y1) - 5, 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1
-        )
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(
-        f"FALSE POSITIVE — {fp['path'].name}\n"
-        f"Detections: {fp['n_dets']}  Max conf: {fp['max_conf']:.3f}",
-        fontsize=11, color="red", fontweight="bold"
+    _finalize_figure(
+        fig,
+        Path(save_path) if save_path is not None else None,
+        show,
+        tight_rect=None,
     )
 
-    axes[0].imshow(img_rgb)
-    axes[0].set_title("Original (Empty Background)")
-    axes[0].axis("off")
 
-    axes[1].imshow(overlay)
-    axes[1].set_title("EigenCAM Attention Map")
-    axes[1].axis("off")
-
-    axes[2].imshow(overlay_boxes)
-    axes[2].set_title("False Positive BBox (Red)")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
+def plot_false_positive_results(
+    img_rgb: np.ndarray,
+    overlay: np.ndarray,
+    overlay_boxes: np.ndarray,
+    filename: str,
+    n_dets: int,
+    max_conf: float,
+    save_path: Path | None = None,
+    *,
+    show: bool = True,
+) -> None:
+    """Renders original image, EigenCAM overlay, and false positive boxes side-by-side."""
+    _render_eigencam_triptych(
+        img_rgb,
+        overlay,
+        overlay_boxes,
+        f"FALSE POSITIVE — {filename}\nDetections: {n_dets}  Max conf: {max_conf:.3f}",
+        ("Original (Empty Background)", "EigenCAM Attention Map", "False Positive BBox (Red)"),
+        save_path,
+        show=show,
+        title_color="red",
+    )
 
 
 def plot_unified_calibration_curves(
@@ -477,12 +486,22 @@ def _sum_loss_columns(
     return history[present].sum(axis=1)
 
 
-def _finalize_figure(fig: plt.Figure, save_path: Path | None, show: bool) -> None:
+def _finalize_figure(
+    fig: plt.Figure,
+    save_path: Path | None,
+    show: bool,
+    *,
+    dpi: int = 200,
+    tight_rect: tuple[float, float, float, float] | None = (0, 0, 1, 0.94),
+) -> None:
     try:
-        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        if tight_rect is not None:
+            fig.tight_layout(rect=tight_rect)
+        else:
+            fig.tight_layout()
         if save_path is not None:
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(save_path, dpi=200, bbox_inches="tight")
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
         if show:
             plt.show()
     finally:

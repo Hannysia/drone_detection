@@ -180,9 +180,14 @@ def load_eval_model(weights_path: str, device: torch.device) -> tuple[YOLO, torc
     return model, pytorch_model
 
 
-def get_detections_boxes(model: YOLO, img_path: str, conf: float) -> list[tuple[int, int, int, int, float]]:
+def get_detections_boxes(
+    model: YOLO,
+    img_path: str,
+    conf: float,
+    imgsz: int = 1280,
+) -> list[tuple[int, int, int, int, float]]:
     """Executes standard YOLO inference to retrieve bounding boxes."""
-    results = model(img_path, conf=conf, verbose=False)
+    results = model(img_path, conf=conf, imgsz=imgsz, verbose=False)
     boxes = []
     if results and results[0].boxes is not None:
         for box in results[0].boxes:

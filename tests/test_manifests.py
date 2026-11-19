@@ -6,8 +6,12 @@ from threading import Barrier
 import pytest
 
 from src.processing import manifests
-from src.processing.manifests import read_manifest, write_manifest
-
+from src.processing.manifests import (
+    CATEGORY_DIRS,
+    read_manifest,
+    select_manifest_frames,
+    write_manifest,
+)
 
 @pytest.fixture
 def row():
@@ -225,3 +229,51 @@ def test_two_writers_publish_one_complete_result(
         "other.jpg",
     }
     assert list(tmp_path.iterdir()) == [output]
+
+
+def test_select_manifest_frames_filters_split_category_and_excluded(tmp_path):
+    root = tmp_path / "dataset"
+    rows = [
+        {"filename": "tr_neg.jpg", "split": "train", "category": "negative", "excluded_at": ""},
+        {"filename": "va_pos.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "va_neg_keep.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "va_neg_drop.jpg", "split": "val", "category": "negative", "excluded_at": "temporal"},
+        {"filename": "te_neg.jpg", "split": "test", "category": "negative", "excluded_at": ""},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / item["filename"]).write_bytes(b"jpg")
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path)
+
+    selected_neg = select_manifest_frames(
+        root,
+        split="val",
+        category="negative",
+        manifest_path=manifest_path,
+    )
+    assert [(p.name, cat) for p, cat in selected_neg] == [("va_neg_keep.jpg", "negative")]
+
+    selected_all = select_manifest_frames(root, split="val", manifest_path=manifest_path)
+    assert [(p.name, cat) for p, cat in selected_all] == [
+        ("va_pos.jpg", "positive"),
+        ("va_neg_keep.jpg", "negative"),
+    ]
+
+    with pytest.raises(ValueError, match="not allowed"):
+        select_manifest_frames(root, split="train", manifest_path=manifest_path)
+
+
+def test_select_manifest_frames_rejects_missing_file(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(
+        [{"filename": "missing.jpg", "split": "val", "category": "negative"}],
+        manifest_path,
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing.jpg"):
+        select_manifest_frames(root, split="val", manifest_path=manifest_path)

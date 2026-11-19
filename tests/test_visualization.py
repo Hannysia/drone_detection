@@ -1,10 +1,16 @@
+import inspect
 import matplotlib
 matplotlib.use("Agg")
 
+import numpy as np
 import pytest
 
+from src.utils import visualization
 from src.utils.visualization import (
     load_yolo_training_history,
+    overlay_heatmap,
+    plot_detections_summary,
+    plot_false_positive_results,
     plot_yolo_runs_comparison,
     plot_yolo_training_curves,
     summarize_yolo_training,
@@ -166,3 +172,52 @@ def test_plot_yolo_runs_comparison_returns_table_and_saves_png(tmp_path):
     assert out_png.stat().st_size > 0
     assert list(table["Run"]) == ["With Negatives", "Positives Only"]
     assert list(table["Precision"]) == pytest.approx([0.91, 0.78])
+
+
+def test_visualization_has_no_processing_or_torch_imports():
+    source = inspect.getsource(visualization)
+    assert "src.processing" not in source
+    assert "import torch" not in source
+
+
+def test_plot_detections_summary_accepts_and_saves_output_path(tmp_path):
+    out_png = tmp_path / "summary" / "detection_summary.png"
+    plot_detections_summary([0, 1, 2], "run_with_negatives", out_png, show=False)
+    assert out_png.is_file()
+    assert out_png.stat().st_size > 0
+
+
+def test_overlay_heatmap_unpads_letterbox_region_accurately():
+    img_rgb = np.zeros((100, 200, 3), dtype=np.uint8)
+    cam_map = np.zeros((40, 40), dtype=np.float32)
+    cam_map[10:30, :] = 1.0
+
+    overlaid = overlay_heatmap(
+        img_rgb,
+        cam_map,
+        alpha=0.5,
+        crop_box=(320, 960, 0, 1280),
+        input_size=(1280, 1280),
+    )
+    assert overlaid.shape == img_rgb.shape
+    assert overlaid.mean() > 20.0
+
+    with pytest.raises(ValueError, match="both"):
+        overlay_heatmap(img_rgb, cam_map, crop_box=(0, 10, 0, 10))
+
+
+def test_plot_false_positive_results_saves_png(tmp_path):
+    out_png = tmp_path / "fp_cam.png"
+    img = np.zeros((32, 32, 3), dtype=np.uint8)
+    plot_false_positive_results(
+        img,
+        img,
+        img,
+        "neg_001.jpg",
+        1,
+        0.72,
+        save_path=out_png,
+        show=False,
+    )
+    assert out_png.is_file()
+    assert out_png.stat().st_size > 0
