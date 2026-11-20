@@ -145,6 +145,24 @@ def find_and_display_best_configs(
 
 
 
+def _resolve_device(device: str | int | None = None) -> str | int:
+    """Returns an explicit inference device or defaults to GPU when available."""
+    if device is not None:
+        return device
+    return 0 if torch.cuda.is_available() else "cpu"
+
+
+def _validate_model_artifact(weights_path: Path) -> None:
+    """Validates an exported model file or OpenVINO IR directory."""
+    if weights_path.is_dir():
+        xml_files = sorted(weights_path.glob("*.xml"))
+        if not xml_files or not any(xml.with_suffix(".bin").is_file() for xml in xml_files):
+            raise FileNotFoundError(f"OpenVINO IR (.xml/.bin) not found in directory: {weights_path}")
+        return
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+
 def evaluate_model(
     weights_path: Path,
     yaml_path: Path,
@@ -154,27 +172,31 @@ def evaluate_model(
     imgsz: int = 1280,
     batch: int = 16,
     conf: float | None = None,
+    device: str | int | None = None,
     plots: bool = True,
 ) -> dict[str, float]:
     """Evaluates the trained model on the target split and returns metrics."""
-    if not weights_path.is_file():
-        raise FileNotFoundError(f"Weights file not found: {weights_path}")
+    _validate_model_artifact(weights_path)
     if not yaml_path.is_file():
         raise FileNotFoundError(f"Dataset YAML not found: {yaml_path}")
 
-    device = 0 if torch.cuda.is_available() else "cpu"
+    target_device = _resolve_device(device)
     log.info("\n" + "=" * 80)
     log.info("STARTING YOLO EVALUATION ON %s DATA: %s", split.upper(), run_name.upper())
     log.info("=" * 80)
     log.info("Loading weights from: %s", weights_path.resolve())
 
-    model = YOLO(str(weights_path))
+    model = (
+        YOLO(str(weights_path))
+        if weights_path.suffix.lower() == ".pt"
+        else YOLO(str(weights_path), task="detect")
+    )
     val_kwargs = {
         "data": str(yaml_path),
         "split": split,
         "imgsz": imgsz,
         "batch": batch,
-        "device": device,
+        "device": target_device,
         "rect": False,
         "project": str(OUTPUT_DIR),
         "name": f"{run_name}_{split}_evaluation",
@@ -327,6 +349,7 @@ def run_dataset_predictions_db(
     manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
     source_path: Path | None = None,
     allowed_splits: tuple[str, ...] = ("val", "test"),
+    device: str | int | None = None,
 ) -> list[dict]:
     """Collects predictions for manifest-selected frames using collection_conf."""
     selected_frames = select_manifest_frames(
@@ -339,7 +362,7 @@ def run_dataset_predictions_db(
 
     log.info("Found %d active manifest images for split %r.", len(selected_frames), split)
 
-    device = 0 if torch.cuda.is_available() else "cpu"
+    target_device = _resolve_device(device)
     raw_database = []
 
     for img_path, category in tqdm(selected_frames, desc="Running Evaluation Inference"):
@@ -384,7 +407,7 @@ def run_dataset_predictions_db(
             imgsz=imgsz,
             conf=collection_conf,
             verbose=False,
-            device=device,
+            device=target_device,
             rect=False,
         )[0]
         pred_boxes = []

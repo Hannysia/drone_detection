@@ -528,3 +528,86 @@ def test_get_detections_boxes_passes_rect_false():
         rect=False,
         verbose=False,
     )
+
+
+@pytest.mark.parametrize("create_bin", [False, True])
+def test_evaluate_model_validates_openvino_directory(tmp_path, monkeypatch, create_bin):
+    ov_dir = tmp_path / "model_int8_1280_openvino_model"
+    ov_dir.mkdir()
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="OpenVINO"):
+        evaluate_model(ov_dir, yaml_path, "ov_empty", device="cpu")
+
+    (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
+    if not create_bin:
+        with pytest.raises(FileNotFoundError, match="OpenVINO"):
+            evaluate_model(ov_dir, yaml_path, "ov_no_bin", device="cpu")
+        return
+
+    (ov_dir / "model.bin").write_bytes(b"bin")
+    mock_yolo = Mock()
+    mock_yolo.val.return_value = Mock(results_dict={"metrics/mAP50(B)": 0.89})
+    yolo_cls = Mock(return_value=mock_yolo)
+    monkeypatch.setattr(evaluation, "YOLO", yolo_cls)
+    monkeypatch.setattr(evaluation, "OUTPUT_DIR", tmp_path / "runs")
+    monkeypatch.setattr(evaluation.torch.cuda, "is_available", lambda: True)
+
+    metrics = evaluate_model(
+        ov_dir,
+        yaml_path,
+        "ov_int8",
+        imgsz=640,
+        batch=1,
+        device="cpu",
+        plots=False,
+    )
+
+    assert metrics == {"metrics/mAP50(B)": 0.89}
+    yolo_cls.assert_called_once_with(str(ov_dir), task="detect")
+    assert mock_yolo.val.call_args.kwargs["device"] == "cpu"
+    assert mock_yolo.val.call_args.kwargs["rect"] is False
+    assert "conf" not in mock_yolo.val.call_args.kwargs
+
+
+def test_evaluate_model_passes_detect_task_for_onnx(tmp_path, monkeypatch):
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("path: .\n", encoding="utf-8")
+
+    mock_yolo = Mock()
+    mock_yolo.val.return_value = Mock(results_dict={"metrics/mAP50(B)": 0.90})
+    yolo_cls = Mock(return_value=mock_yolo)
+    monkeypatch.setattr(evaluation, "YOLO", yolo_cls)
+    monkeypatch.setattr(evaluation, "OUTPUT_DIR", tmp_path / "runs")
+
+    evaluate_model(onnx_path, yaml_path, "onnx_fp32", batch=1, device="cpu", plots=False)
+
+    yolo_cls.assert_called_once_with(str(onnx_path), task="detect")
+    assert mock_yolo.val.call_args.kwargs["device"] == "cpu"
+
+
+def test_predictions_db_respects_explicit_cpu_device(tmp_path, monkeypatch):
+    root, manifest_path = _write_eval_bundle(
+        tmp_path,
+        [{"filename": "te_pos.jpg", "split": "test", "category": "positive", "excluded_at": ""}],
+    )
+    model = Mock()
+    model.predict.return_value = [Mock(boxes=[])]
+    monkeypatch.setattr(evaluation.torch.cuda, "is_available", lambda: True)
+
+    run_dataset_predictions_db(
+        model,
+        root,
+        imgsz=640,
+        collection_conf=0.01,
+        split="test",
+        manifest_path=manifest_path,
+        device="cpu",
+    )
+
+    assert model.predict.call_args.kwargs["device"] == "cpu"
+    assert model.predict.call_args.kwargs["conf"] == 0.01
+    assert model.predict.call_args.kwargs["rect"] is False
