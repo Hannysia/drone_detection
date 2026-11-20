@@ -12,6 +12,7 @@ from src.processing.evaluation import (
     evaluate_predictions,
     evaluate_runs_on_test,
     evaluate_threshold_free_slices,
+    get_detections_boxes,
     run_dataset_predictions_db,
 )
 from src.processing.manifests import CATEGORY_DIRS, write_manifest
@@ -147,7 +148,12 @@ def test_predictions_db_filters_by_manifest_and_passes_config(tmp_path):
     )
 
     assert model.predict.call_count == 2
-    assert all(call.kwargs["conf"] == 0.07 and call.kwargs["imgsz"] == 1280 for call in model.predict.call_args_list)
+    assert all(
+        call.kwargs["conf"] == 0.07
+        and call.kwargs["imgsz"] == 1280
+        and call.kwargs["rect"] is False
+        for call in model.predict.call_args_list
+    )
     assert [row["filename"] for row in rows] == ["va_pos.jpg", "va_neg.jpg"]
     assert rows[0]["gt_boxes"][0] == pytest.approx([4.0, 4.0, 6.0, 6.0])
     assert rows[1]["gt_boxes"] == []
@@ -331,6 +337,10 @@ def test_evaluate_runs_on_test_stages_evaluates_and_cleans_up(tmp_path, monkeypa
     )
 
     assert list(table["Conf"]) == ["default (mAP)", "default (mAP)", "F0.5 (0.7200)"]
+    assert table.loc[0, "mAP50"] == pytest.approx(0.88)
+    assert np.isnan(table.loc[2, "mAP50"])
+    assert np.isnan(table.loc[2, "mAP50-95"])
+    assert table.loc[2, "F0.5"] == pytest.approx(1.25 * 0.9 * 0.8 / (0.25 * 0.9 + 0.8))
     assert mock_eval.call_count == 3
     assert mock_eval.call_args_list[2].kwargs["conf"] == pytest.approx(0.72)
     assert not (working / "yolo_dataset_eval_v1").exists()
@@ -503,3 +513,18 @@ def test_analyze_model_errors_includes_thresholded_summary():
     assert row["F0.5"] == pytest.approx(5.0 / 9.0)
     assert row["Recall_small"] == pytest.approx(1.0)
     assert row["Neg FA Rate (%)"] == pytest.approx(100.0)
+
+
+def test_get_detections_boxes_passes_rect_false():
+    fake_model = Mock(return_value=[Mock(boxes=None)])
+
+    boxes = get_detections_boxes(fake_model, "frame.jpg", conf=0.25, imgsz=1280)
+
+    assert boxes == []
+    fake_model.assert_called_once_with(
+        "frame.jpg",
+        conf=0.25,
+        imgsz=1280,
+        rect=False,
+        verbose=False,
+    )

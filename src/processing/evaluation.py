@@ -222,7 +222,7 @@ def get_detections_boxes(
     imgsz: int = 1280,
 ) -> list[tuple[int, int, int, int, float]]:
     """Executes standard YOLO inference to retrieve bounding boxes."""
-    results = model(img_path, conf=conf, imgsz=imgsz, verbose=False)
+    results = model(img_path, conf=conf, imgsz=imgsz, rect=False, verbose=False)
     boxes = []
     if results and results[0].boxes is not None:
         for box in results[0].boxes:
@@ -304,11 +304,16 @@ def evaluate_predictions(
     return tp_indices, fp_indices, fn_indices
 
 
+def _compute_f_scores(precision: float, recall: float) -> tuple[float, float]:
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f05 = 1.25 * precision * recall / (0.25 * precision + recall) if (0.25 * precision + recall) > 0 else 0.0
+    return f1, f05
+
+
 def _compute_prf_metrics(tp: int, fp: int, fn: int) -> tuple[float, float, float, float]:
     precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    f05 = 1.25 * precision * recall / (0.25 * precision + recall) if (0.25 * precision + recall) > 0 else 0.0
+    f1, f05 = _compute_f_scores(precision, recall)
     return precision, recall, f1, f05
 
 
@@ -374,12 +379,20 @@ def run_dataset_predictions_db(
             if not gt_boxes:
                 raise ValueError(f"Positive image has no annotated boxes: {txt_path}")
 
-        results = model.predict(img, imgsz=imgsz, conf=collection_conf, verbose=False, device=device)[0]
+        results = model.predict(
+            img,
+            imgsz=imgsz,
+            conf=collection_conf,
+            verbose=False,
+            device=device,
+            rect=False,
+        )[0]
         pred_boxes = []
-        for box in results.boxes:
-            coords = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            pred_boxes.append([coords[0], coords[1], coords[2], coords[3], conf])
+        if results.boxes is not None:
+            for box in results.boxes:
+                coords = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                pred_boxes.append([coords[0], coords[1], coords[2], coords[3], conf])
 
         raw_database.append({
             "filename": img_path.name,
@@ -580,11 +593,15 @@ def evaluate_runs_on_test(
                 batch=batch,
                 plots=plots,
             )
+            precision = float(metrics.get("metrics/precision(B)", 0.0))
+            recall = float(metrics.get("metrics/recall(B)", 0.0))
+            _, f05 = _compute_f_scores(precision, recall)
             rows.append({
                 "Run": validated_name,
                 "Conf": "default (mAP)",
-                "Precision": metrics.get("metrics/precision(B)", 0.0),
-                "Recall": metrics.get("metrics/recall(B)", 0.0),
+                "Precision": precision,
+                "Recall": recall,
+                "F0.5": f05,
                 "mAP50": metrics.get("metrics/mAP50(B)", 0.0),
                 "mAP50-95": metrics.get("metrics/mAP50-95(B)", 0.0),
             })
@@ -601,13 +618,17 @@ def evaluate_runs_on_test(
                 conf=float(calibrated_conf),
                 plots=plots,
             )
+            cal_precision = float(cal_metrics.get("metrics/precision(B)", 0.0))
+            cal_recall = float(cal_metrics.get("metrics/recall(B)", 0.0))
+            _, cal_f05 = _compute_f_scores(cal_precision, cal_recall)
             rows.append({
                 "Run": validated_cal,
                 "Conf": f"F0.5 ({float(calibrated_conf):.4f})",
-                "Precision": cal_metrics.get("metrics/precision(B)", 0.0),
-                "Recall": cal_metrics.get("metrics/recall(B)", 0.0),
-                "mAP50": cal_metrics.get("metrics/mAP50(B)", 0.0),
-                "mAP50-95": cal_metrics.get("metrics/mAP50-95(B)", 0.0),
+                "Precision": cal_precision,
+                "Recall": cal_recall,
+                "F0.5": cal_f05,
+                "mAP50": np.nan,
+                "mAP50-95": np.nan,
             })
     finally:
         cleanup_yolo_dataset(working_dir, "eval_v1")

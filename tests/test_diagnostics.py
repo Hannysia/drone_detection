@@ -155,6 +155,7 @@ def test_run_false_positive_inference_enforces_manifest_and_imgsz(tmp_path):
     fake_model.assert_called_once()
     assert fake_model.call_args.args[0].endswith("va_keep.jpg")
     assert fake_model.call_args.kwargs["imgsz"] == 1280
+    assert fake_model.call_args.kwargs["rect"] is False
     assert len(fps) == 1
     assert fps[0]["path"].name == "va_keep.jpg"
 
@@ -202,6 +203,7 @@ def test_run_shortcut_analysis_saves_plots_and_uses_output_dir_fallback(tmp_path
     assert not (out_dir / "demo_run" / "cam_001_va_drop.png").exists()
     assert (out_dir / "demo_run" / "detection_summary.png").is_file()
     assert fake_model.call_args.kwargs["imgsz"] == 1280
+    assert fake_model.call_args.kwargs["rect"] is False
 
     with pytest.raises(FileNotFoundError, match="No checkpoint"):
         run_shortcut_analysis(

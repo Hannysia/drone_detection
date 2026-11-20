@@ -407,7 +407,14 @@ def run_false_positive_inference(
     false_positives = []
 
     for img_path in tqdm(all_images, desc="Running Inference on Negatives"):
-        results = model(str(img_path), imgsz=imgsz, conf=conf_thresh, device=device, verbose=False)
+        results = model(
+            str(img_path),
+            imgsz=imgsz,
+            conf=conf_thresh,
+            device=device,
+            rect=False,
+            verbose=False,
+        )
 
         if results and results[0].boxes is not None and len(results[0].boxes) > 0:
             boxes = results[0].boxes
