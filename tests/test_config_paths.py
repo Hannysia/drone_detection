@@ -49,7 +49,20 @@ def test_configured_paths(local_config, monkeypatch, tmp_path):
     assert local_config.FRAME_BASELINE_DIR == tmp_path / "frame_baseline"
     assert local_config.WORKING_DIR == tmp_path / "working"
     assert local_config.OUTPUT_DIR == local_config.WORKING_DIR / "runs" / "detect"
+    assert local_config.MOT_DATASET_DIR == local_config.WORKING_DIR / "drone_mot_dataset"
+    assert local_config.SEQMAPS_DIR == local_config.MOT_DATASET_DIR / "seqmaps"
+    assert local_config.YOLO_DETECTIONS_OUT == local_config.WORKING_DIR / "yolo_detections"
+    assert local_config.LOCAL_HF_DATA_DIR == local_config.WORKING_DIR / "drone_dataset"
+    assert local_config.QUANTIZATION_DIR == local_config.WORKING_DIR / "quantization"
+    assert (
+        local_config.YOLO_MODEL_PATH_PT
+        == local_config.LOCAL_HF_DATA_DIR / "models" / "yolo26n_run_with_negatives_best.pt"
+    )
+    assert local_config.TRACKERS_OUT_DIR == local_config.WORKING_DIR / "trackers"
     assert local_config.EXTRACTED_DATA_DIR == tmp_path / "frames"
+
+    with pytest.raises(AttributeError):
+        _ = local_config.YOLO_MODEL_PATH_ENGINE
 
     
 @pytest.mark.parametrize("attached", [True, False])
@@ -154,3 +167,26 @@ def test_colab_config_uses_userdata_and_content_paths(monkeypatch):
     assert colab_loaded["WANDB_PROJECT"] == "drone-detection"
     assert colab_loaded["os"].environ["KAGGLE_USERNAME"] == "anna"
     assert colab_loaded["os"].environ["KAGGLE_KEY"] == "k_secret"
+    assert colab_loaded["QUANTIZATION_DIR"] == Path("/content/quantization")
+    assert (
+        colab_loaded["YOLO_MODEL_PATH_PT"]
+        == Path("/content/drone_dataset/models/yolo26n_run_with_negatives_best.pt")
+    )
+    assert "YOLO_MODEL_PATH_ENGINE" not in colab_loaded
+
+
+def test_quantized_model_paths_isolated_by_resolution(local_config, monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+
+    paths_1280 = local_config.get_quantized_model_paths(local_config.QUANTIZATION_DIR, 1280)
+    paths_640 = local_config.get_quantized_model_paths(local_config.QUANTIZATION_DIR, 640)
+
+    assert local_config.QUANTIZATION_RESOLUTIONS == (1280, 640)
+    assert paths_1280["dir"] == tmp_path / "working" / "quantization" / "1280"
+    assert paths_640["dir"] == tmp_path / "working" / "quantization" / "640"
+    assert set(paths_1280.values()).isdisjoint(set(paths_640.values()))
+    assert paths_1280["onnx_int8"].name == "yolo26n_run_with_negatives_best_int8_1280.onnx"
+    assert paths_640["openvino_int8"].name == "yolo26n_run_with_negatives_best_int8_640_openvino_model"
+
+    with pytest.raises(ValueError, match="imgsz must be positive"):
+        local_config.get_quantized_model_paths(local_config.QUANTIZATION_DIR, 0)

@@ -41,6 +41,14 @@ ml = [
     "trackeval",
     "loguru",
 ]
+quantization = [
+    "onnx>=1.12.0,<2.0.0",
+    "onnxslim>=0.1.82",
+    "onnxruntime>=1.19.0",
+    "openvino>=2024.0.0",
+    "nncf>=2.14.0",
+    "packaging>=23.2",
+]
 classifier = ["google-genai", "Pillow"]
 test = ["pytest"]
 

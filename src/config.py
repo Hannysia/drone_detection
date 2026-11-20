@@ -20,6 +20,28 @@ EMBEDDING_MODEL_NAME = "dinov2_vitb14"
 EMBEDDING_MODEL_REVISION = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
 EMBEDDING_BATCH_SIZE = 64
 
+YOLO_MODEL_STEM = "yolo26n_run_with_negatives_best"
+HF_MODEL_PATH_PT = f"models/{YOLO_MODEL_STEM}.pt"
+QUANTIZATION_RESOLUTIONS = (1280, 640)
+
+
+def get_quantized_model_paths(
+    quantization_dir: Path,
+    imgsz: int,
+    model_stem: str = YOLO_MODEL_STEM,
+) -> dict[str, Path]:
+    if imgsz <= 0:
+        raise ValueError(f"imgsz must be positive, got {imgsz}")
+    target_dir = quantization_dir / str(imgsz)
+    return {
+        "dir": target_dir,
+        "pt": target_dir / f"{model_stem}.pt",
+        "onnx_fp32": target_dir / f"{model_stem}_fp32_{imgsz}.onnx",
+        "onnx_int8": target_dir / f"{model_stem}_int8_{imgsz}.onnx",
+        "openvino_fp32": target_dir / f"{model_stem}_fp32_{imgsz}_openvino_model",
+        "openvino_int8": target_dir / f"{model_stem}_int8_{imgsz}_openvino_model",
+    }
+
 
 def _clean_secret(value: object, default: str | None = None) -> str | None:
     if isinstance(value, str):
@@ -73,10 +95,10 @@ if IS_KAGGLE or IS_COLAB:
     MOT_DATASET_DIR = WORKING_DIR / "drone_mot_dataset"
     SEQMAPS_DIR = MOT_DATASET_DIR / "seqmaps"
     YOLO_DETECTIONS_OUT = WORKING_DIR / "yolo_detections"
-    YOLO_MODEL_PATH_PT = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.pt"
-    YOLO_MODEL_PATH_ENGINE = WORKING_DIR / "drone_dataset/models/yolo26n_final_model_best.engine"
-    TRACKERS_OUT_DIR = WORKING_DIR / "trackers"
     LOCAL_HF_DATA_DIR = WORKING_DIR / "drone_dataset"
+    QUANTIZATION_DIR = WORKING_DIR / "quantization"
+    YOLO_MODEL_PATH_PT = LOCAL_HF_DATA_DIR / HF_MODEL_PATH_PT
+    TRACKERS_OUT_DIR = WORKING_DIR / "trackers"
 
 else:
     from dotenv import load_dotenv
@@ -96,10 +118,18 @@ else:
         "DUPLICATES_DIR": "DUPLICATES_DIR",
     }
 
+    _WORKING_REL = Path("working")
     _BASE_CHILDREN = {
         "FRAME_BASELINE_DIR": "frame_baseline",
         "WORKING_DIR": "working",
-        "OUTPUT_DIR": Path("working") / "runs" / "detect",
+        "OUTPUT_DIR": _WORKING_REL / "runs" / "detect",
+        "MOT_DATASET_DIR": _WORKING_REL / "drone_mot_dataset",
+        "SEQMAPS_DIR": _WORKING_REL / "drone_mot_dataset" / "seqmaps",
+        "YOLO_DETECTIONS_OUT": _WORKING_REL / "yolo_detections",
+        "LOCAL_HF_DATA_DIR": _WORKING_REL / "drone_dataset",
+        "QUANTIZATION_DIR": _WORKING_REL / "quantization",
+        "YOLO_MODEL_PATH_PT": _WORKING_REL / "drone_dataset" / HF_MODEL_PATH_PT,
+        "TRACKERS_OUT_DIR": _WORKING_REL / "trackers",
     }
 
     def __getattr__(name: str) -> Path:

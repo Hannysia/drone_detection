@@ -5,11 +5,10 @@
 
 # Computer Vision & Math
 opencv-python==4.13.0.92    
-numpy>=2.0.0,<2.6.0         
-                            
-pandas==3.0.3                
-imagehash==4.3.2           
-Pillow==12.2.0                
+numpy>=2.0.0,<2.6.0
+pandas>=2.2.0,<3.0.0
+imagehash==4.3.2
+Pillow==12.2.0              
 scikit-learn==1.9.0           
 
 # Tracking & Evaluation (MOT Challenge)
@@ -30,3 +29,13 @@ tqdm==4.68.3
 loguru==0.7.3      
 pytest==9.1.1      
 pyyaml==6.0.3
+torch>=2.6
+torchvision>=0.21
+ultralytics>=8.4.68,<=8.4.72
+huggingface-hub>=1.0
+packaging>=23.2
+onnx>=1.12.0,<2.0.0
+onnxslim>=0.1.82
+onnxruntime>=1.19.0
+openvino>=2024.0.0
+nncf>=2.14.0
