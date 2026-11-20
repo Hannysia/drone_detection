@@ -1,36 +1,53 @@
 from collections import Counter, deque
+import hashlib
+import importlib.metadata as importlib_metadata
+import json
 import logging
 import math
 import os
+import platform
 import random
 import re
 import shutil
+import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import cv2
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download
 import numpy as np
 import onnx
+import pandas as pd
+import torch
 from ultralytics import YOLO
 import yaml
 
+from src import config
 from src.config import (
     HF_MODEL_PATH_PT,
     HF_TOKEN,
     MANIFESTS_DIR,
+    QUANTIZATION_RESOLUTIONS,
     REPO_ID,
     YOLO_MODEL_STEM,
     get_quantized_model_paths,
 )
 from src.processing.dataset import parse_frame_filename_logic
 from src.processing.diagnostics import letterbox_image
+from src.processing.evaluation import (
+    evaluate_model,
+    evaluate_predictions,
+    evaluate_threshold_free_slices,
+    run_dataset_predictions_db,
+)
 from src.processing.manifests import select_manifest_frames
 from src.processing.training import assert_hf_ready
 from src.processing.yolo_dataset import (
     _remove_existing_path,
     _validate_run_name,
     cleanup_yolo_dataset,
+    prepare_yolo_dataset,
 )
 from src.utils.io import parse_frame_name, parse_video_id
 
@@ -717,4 +734,822 @@ def export_stage_models(
         "onnx_int8": onnx_int8,
         "openvino_fp32": ov_fp32,
         "openvino_int8": ov_int8,
+    }
+
+
+
+_INT8_TO_FP32_BASELINE = {
+    "onnx_int8": "onnx_fp32",
+    "openvino_int8": "openvino_fp32",
+}
+
+
+def _load_yolo_for_artifact(artifact_path: Path) -> YOLO:
+    if artifact_path.suffix.lower() == ".pt":
+        return YOLO(str(artifact_path))
+    return YOLO(str(artifact_path), task="detect")
+
+
+def _get_process_memory_mb() -> tuple[float, float]:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _MemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = _MemoryCounters()
+            counters.cb = ctypes.sizeof(_MemoryCounters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                mb = 1024 * 1024
+                return counters.WorkingSetSize / mb, counters.PeakWorkingSetSize / mb
+        except Exception:
+            return 0.0, 0.0
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+        mb_val = float(usage) / divisor
+        return mb_val, mb_val
+    except Exception:
+        return 0.0, 0.0
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _extract_runtime_versions() -> dict[str, str]:
+    packages = (
+        "torch",
+        "ultralytics",
+        "onnx",
+        "onnxslim",
+        "onnxruntime",
+        "openvino",
+        "nncf",
+        "opencv-python",
+        "numpy",
+    )
+    versions = {}
+    for pkg in packages:
+        try:
+            versions[pkg] = importlib_metadata.version(pkg)
+        except importlib_metadata.PackageNotFoundError:
+            versions[pkg] = "not_installed"
+    return versions
+
+
+def _to_json_safe(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _to_json_safe(value.tolist())
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return None if (math.isnan(number) or math.isinf(number)) else number
+    return value
+
+
+def _bgr_to_nchw(bgr: np.ndarray, imgsz: int) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    padded, _ = letterbox_image(rgb, imgsz=imgsz)
+    chw = np.transpose(padded, (2, 0, 1)).astype(np.float32) / 255.0
+    return np.ascontiguousarray(chw[None, ...])
+
+
+def _load_benchmark_frames(
+    dataset_root: Path,
+    split: str,
+    imgsz: int,
+    max_frames: int,
+    *,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    if split not in {"val", "test"}:
+        raise ValueError(f"Benchmark split must be 'val' or 'test', got {split!r}")
+    if max_frames <= 0:
+        raise ValueError(f"max_frames must be positive, got {max_frames}")
+
+    active = select_manifest_frames(
+        Path(dataset_root),
+        split=split,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        allowed_splits=("val", "test"),
+    )
+    sample_count = min(max_frames, len(active))
+    indices = np.linspace(0, len(active) - 1, sample_count, dtype=int)
+
+    bgr_frames = []
+    nchw_tensors = []
+    for idx in indices:
+        img_path, _ = active[int(idx)]
+        bgr = cv2.imread(str(img_path))
+        if bgr is None:
+            raise ValueError(f"Unreadable benchmark image: {img_path}")
+        bgr_frames.append(bgr)
+        nchw_tensors.append(_bgr_to_nchw(bgr, imgsz=imgsz))
+
+    return bgr_frames, nchw_tensors
+
+
+def _summarize_latencies_ms(durations_s: list[float]) -> dict[str, float]:
+    ms = np.asarray(durations_s, dtype=float) * 1000.0
+    mean_ms = float(np.mean(ms))
+    p50_ms = float(np.percentile(ms, 50))
+    return {
+        "mean_ms": mean_ms,
+        "std_ms": float(np.std(ms)),
+        "p50_ms": p50_ms,
+        "p95_ms": float(np.percentile(ms, 95)),
+        "p99_ms": float(np.percentile(ms, 99)),
+        "fps": 1000.0 / mean_ms if mean_ms > 0 else 0.0,
+        "fps_p50": 1000.0 / p50_ms if p50_ms > 0 else 0.0,
+    }
+
+
+def _time_inference_loop(runner, samples: list, *, n_warmup: int, n_benchmark: int) -> dict[str, float]:
+    for idx in range(n_warmup):
+        runner(samples[idx % len(samples)])
+
+    durations_s = []
+    for idx in range(n_benchmark):
+        sample = samples[idx % len(samples)]
+        t0 = time.perf_counter()
+        runner(sample)
+        durations_s.append(time.perf_counter() - t0)
+
+    return _summarize_latencies_ms(durations_s)
+
+
+def _build_onnx_compute_runner(artifact_path: Path):
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(artifact_path), providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    output_names = [out.name for out in session.get_outputs()]
+
+    def _run(tensor: np.ndarray) -> None:
+        session.run(output_names, {input_name: tensor})
+
+    return _run
+
+
+def _build_openvino_compute_runner(artifact_path: Path):
+    import openvino as ov
+
+    _validate_openvino_dir(artifact_path)
+    xml_path = next(sorted(artifact_path.glob("*.xml")).__iter__())
+    core = ov.Core()
+    ov_model = core.read_model(model=str(xml_path), weights=str(xml_path.with_suffix(".bin")))
+    compiled = core.compile_model(
+        ov_model,
+        device_name="CPU",
+        config={"PERFORMANCE_HINT": "LATENCY"},
+    )
+
+    def _run(tensor: np.ndarray) -> None:
+        compiled(tensor)
+
+    return _run
+
+
+def _build_pytorch_compute_runner(artifact_path: Path):
+    yolo_model = _load_yolo_for_artifact(artifact_path)
+    module = yolo_model.model
+    if hasattr(module, "float"):
+        module = module.float()
+    if hasattr(module, "to"):
+        module = module.to("cpu")
+    if hasattr(module, "eval"):
+        module = module.eval()
+    if hasattr(module, "fuse") and callable(module.fuse):
+        try:
+            module = module.fuse()
+        except Exception:
+            pass
+
+    def _run(tensor: np.ndarray) -> None:
+        torch_input = torch.from_numpy(tensor)
+        with torch.inference_mode():
+            module(torch_input)
+
+    return _run
+
+
+def _build_compute_runner(artifact_path: Path):
+    if artifact_path.is_dir():
+        return _build_openvino_compute_runner(artifact_path)
+    suffix = artifact_path.suffix.lower()
+    if suffix == ".onnx":
+        return _build_onnx_compute_runner(artifact_path)
+    if suffix == ".pt":
+        return _build_pytorch_compute_runner(artifact_path)
+    raise ValueError(f"Unsupported artifact for CPU benchmark: {artifact_path}")
+
+
+def benchmark_stage_model(
+    artifact_path: Path,
+    bgr_frames: list[np.ndarray],
+    nchw_tensors: list[np.ndarray],
+    *,
+    imgsz: int,
+    n_warmup: int = 10,
+    n_benchmark: int = 100,
+    e2e_conf: float = 0.25,
+) -> dict[str, float]:
+    """Benchmarks compute-only and end-to-end CPU latency plus process RSS memory."""
+    artifact_path = Path(artifact_path)
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Benchmark artifact not found: {artifact_path}")
+    if not bgr_frames or len(bgr_frames) != len(nchw_tensors):
+        raise ValueError("bgr_frames and nchw_tensors must be non-empty and equal length")
+    if n_warmup < 0 or n_benchmark <= 0:
+        raise ValueError(f"Invalid benchmark counts: warmup={n_warmup}, benchmark={n_benchmark}")
+
+    compute_runner = _build_compute_runner(artifact_path)
+    compute_stats = _time_inference_loop(
+        compute_runner,
+        nchw_tensors,
+        n_warmup=n_warmup,
+        n_benchmark=n_benchmark,
+    )
+
+    yolo_model = _load_yolo_for_artifact(artifact_path)
+
+    def _run_e2e(frame: np.ndarray) -> None:
+        yolo_model.predict(
+            frame,
+            imgsz=imgsz,
+            conf=e2e_conf,
+            device="cpu",
+            rect=False,
+            verbose=False,
+        )
+
+    e2e_stats = _time_inference_loop(
+        _run_e2e,
+        bgr_frames,
+        n_warmup=n_warmup,
+        n_benchmark=n_benchmark,
+    )
+    rss_mb, peak_rss_mb = _get_process_memory_mb()
+
+    return {
+        **{f"compute_{k}": v for k, v in compute_stats.items()},
+        **{f"e2e_{k}": v for k, v in e2e_stats.items()},
+        "rss_mb": rss_mb,
+        "peak_rss_mb": peak_rss_mb,
+    }
+
+
+def _compute_raw_detection_diagnostics(
+    raw_database: list[dict],
+    *,
+    iou_threshold: float = 0.5,
+) -> dict[str, float]:
+    tp_confs: list[float] = []
+    total_gt = 0
+    for entry in raw_database:
+        gt_boxes = entry["gt_boxes"]
+        total_gt += len(gt_boxes)
+        if not entry["is_positive"] or not gt_boxes:
+            continue
+        tp_indices, _, _ = evaluate_predictions(
+            gt_boxes,
+            entry["pred_boxes"],
+            iou_threshold=iou_threshold,
+        )
+        tp_confs.extend(float(entry["pred_boxes"][idx][4]) for idx in tp_indices)
+
+    if total_gt == 0:
+        nan = float("nan")
+        return {
+            "total_gt": 0,
+            "raw_recall": nan,
+            "tp_conf_p10": nan,
+            "tp_conf_median": nan,
+            "tp_conf_p90": nan,
+            "tp_recall_ge_0_30": nan,
+        }
+
+    if not tp_confs:
+        return {
+            "total_gt": total_gt,
+            "raw_recall": 0.0,
+            "tp_conf_p10": float("nan"),
+            "tp_conf_median": float("nan"),
+            "tp_conf_p90": float("nan"),
+            "tp_recall_ge_0_30": 0.0,
+        }
+
+    arr = np.asarray(tp_confs, dtype=float)
+    return {
+        "total_gt": total_gt,
+        "raw_recall": float(len(arr) / total_gt),
+        "tp_conf_p10": float(np.percentile(arr, 10)),
+        "tp_conf_median": float(np.median(arr)),
+        "tp_conf_p90": float(np.percentile(arr, 90)),
+        "tp_recall_ge_0_30": float(np.sum(arr >= 0.30) / total_gt),
+    }
+
+
+def evaluate_quantized_stage(
+    artifact_path: Path,
+    dataset_root: Path,
+    eval_yaml: Path,
+    stage_name: str,
+    *,
+    imgsz: int,
+    eval_split: str = "val",
+    collection_conf: float = 0.01,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+) -> dict[str, object]:
+    """Runs threshold-free CPU evaluation (mAP slices + small/negative metrics) without F0.5 search."""
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+
+    val_metrics = evaluate_model(
+        Path(artifact_path),
+        Path(eval_yaml),
+        run_name=f"{stage_name}_{imgsz}",
+        split=eval_split,
+        imgsz=imgsz,
+        batch=1,
+        conf=None,
+        device="cpu",
+        plots=False,
+    )
+
+    yolo_model = _load_yolo_for_artifact(Path(artifact_path))
+    raw_db = run_dataset_predictions_db(
+        yolo_model,
+        Path(dataset_root),
+        imgsz=imgsz,
+        collection_conf=collection_conf,
+        split=eval_split,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        allowed_splits=("val", "test"),
+        device="cpu",
+    )
+    tf_report = evaluate_threshold_free_slices(
+        raw_db,
+        iou_threshold=0.5,
+        target_recall=0.85,
+        max_neg_fpr=5.0,
+    )
+    summary = tf_report["summary"].iloc[0]
+    by_scale_df = tf_report["by_scale"]
+    by_scale_idx = by_scale_df.set_index("Scale")
+    tp_diag = _compute_raw_detection_diagnostics(raw_db)
+
+    metrics = {
+        "mAP50": float(val_metrics.get("metrics/mAP50(B)", float("nan"))),
+        "mAP50-95": float(val_metrics.get("metrics/mAP50-95(B)", float("nan"))),
+        "AP50": float(summary["AP50"]),
+        "AP50_small": float(summary["AP50_small"]),
+        "AP50_medium": float(summary["AP50_medium"]),
+        "AP50_large": float(summary["AP50_large"]),
+        "Recall_small @ Neg FPR<=5%": float(summary["Recall_small @ Neg FPR<=5%"]),
+        "Neg FPR @ R>=0.85 (%)": float(summary["Neg FPR @ R>=0.85 (%)"]),
+        "Mean Neg FA Rate (%)": float(summary["Mean Neg FA Rate (%)"]),
+        "Max-F1 P": float(summary["Max-F1 P"]),
+        "Max-F1 R": float(summary["Max-F1 R"]),
+        "Max-F1 Recall_small": float(summary["Max-F1 Recall_small"]),
+        "Max-F1 Neg FA Rate (%)": float(summary["Max-F1 Neg FA Rate (%)"]),
+        "Recall_small (raw)": float(by_scale_idx.loc["small", "Max Recall (raw)"])
+        if "small" in by_scale_idx.index
+        else float("nan"),
+        "Max Recall (raw)": tp_diag["raw_recall"],
+        "tp_conf_p10": tp_diag["tp_conf_p10"],
+        "tp_conf_median": tp_diag["tp_conf_median"],
+        "tp_conf_p90": tp_diag["tp_conf_p90"],
+        "tp_recall_ge_0_30": tp_diag["tp_recall_ge_0_30"],
+    }
+    curves = {
+        "thresholds": tf_report["thresholds"],
+        "precision": tf_report["precision"],
+        "recall": tf_report["recall"],
+        "recall_small": tf_report["recall_small"],
+        "f1": tf_report["f1"],
+        "neg_fa_rate": tf_report["neg_fa_rate"],
+    }
+    return {
+        "metrics": metrics,
+        "by_scale": by_scale_df.to_dict(orient="records"),
+        "curves": curves,
+    }
+
+
+def _empty_eval_metrics() -> dict[str, float]:
+    nan = float("nan")
+    return {
+        "mAP50": nan,
+        "mAP50-95": nan,
+        "AP50": nan,
+        "AP50_small": nan,
+        "AP50_medium": nan,
+        "AP50_large": nan,
+        "Recall_small @ Neg FPR<=5%": nan,
+        "Neg FPR @ R>=0.85 (%)": nan,
+        "Mean Neg FA Rate (%)": nan,
+        "Max-F1 P": nan,
+        "Max-F1 R": nan,
+        "Max-F1 Recall_small": nan,
+        "Max-F1 Neg FA Rate (%)": nan,
+        "Recall_small (raw)": nan,
+        "Max Recall (raw)": nan,
+        "tp_conf_p10": nan,
+        "tp_conf_median": nan,
+        "tp_conf_p90": nan,
+        "tp_recall_ge_0_30": nan,
+    }
+
+
+def _safe_diff(a: float, b: float) -> float:
+    return float(a - b) if not (math.isnan(a) or math.isnan(b)) else float("nan")
+
+
+def _safe_ratio(num: float, den: float) -> float:
+    if math.isnan(num) or math.isnan(den) or den <= 0:
+        return float("nan")
+    return float(num / den)
+
+
+def _annotate_ablation_deltas(rows: list[dict[str, object]]) -> pd.DataFrame:
+    by_key = {(int(r["imgsz"]), str(r["stage"])): r for r in rows}
+    annotated = []
+
+    for row in rows:
+        item = dict(row)
+        imgsz = int(row["imgsz"])
+        stage = str(row["stage"])
+        pt_ref = by_key.get((imgsz, "pytorch_fp32"))
+        fp32_name = _INT8_TO_FP32_BASELINE.get(stage)
+        fp32_ref = by_key.get((imgsz, fp32_name)) if fp32_name else None
+
+        item["speedup_compute_vs_pt"] = (
+            _safe_ratio(float(pt_ref["compute_mean_ms"]), float(item["compute_mean_ms"]))
+            if pt_ref is not None
+            else float("nan")
+        )
+        item["speedup_e2e_vs_pt"] = (
+            _safe_ratio(float(pt_ref["e2e_mean_ms"]), float(item["e2e_mean_ms"]))
+            if pt_ref is not None
+            else float("nan")
+        )
+        item["size_ratio_vs_pt"] = (
+            _safe_ratio(float(item["size_mb"]), float(pt_ref["size_mb"]))
+            if pt_ref is not None
+            else float("nan")
+        )
+
+        if fp32_ref is not None:
+            item["ap50_delta_vs_fp32"] = _safe_diff(float(item["AP50"]), float(fp32_ref["AP50"]))
+            item["ap50_small_delta_vs_fp32"] = _safe_diff(
+                float(item["AP50_small"]),
+                float(fp32_ref["AP50_small"]),
+            )
+            item["map50_delta_vs_fp32"] = _safe_diff(float(item["mAP50"]), float(fp32_ref["mAP50"]))
+            item["map50_95_delta_vs_fp32"] = _safe_diff(
+                float(item["mAP50-95"]),
+                float(fp32_ref["mAP50-95"]),
+            )
+            item["neg_fpr_at_r85_delta_vs_fp32"] = _safe_diff(
+                float(item["Neg FPR @ R>=0.85 (%)"]),
+                float(fp32_ref["Neg FPR @ R>=0.85 (%)"]),
+            )
+            item["speedup_compute_vs_fp32"] = _safe_ratio(
+                float(fp32_ref["compute_mean_ms"]),
+                float(item["compute_mean_ms"]),
+            )
+            item["speedup_e2e_vs_fp32"] = _safe_ratio(
+                float(fp32_ref["e2e_mean_ms"]),
+                float(item["e2e_mean_ms"]),
+            )
+            ratio = _safe_ratio(float(item["size_mb"]), float(fp32_ref["size_mb"]))
+            item["size_reduction_pct_vs_fp32"] = (
+                (1.0 - ratio) * 100.0 if not math.isnan(ratio) else float("nan")
+            )
+        else:
+            for col in (
+                "ap50_delta_vs_fp32",
+                "ap50_small_delta_vs_fp32",
+                "map50_delta_vs_fp32",
+                "map50_95_delta_vs_fp32",
+                "neg_fpr_at_r85_delta_vs_fp32",
+                "speedup_compute_vs_fp32",
+                "speedup_e2e_vs_fp32",
+                "size_reduction_pct_vs_fp32",
+            ):
+                item[col] = float("nan")
+
+        annotated.append(item)
+
+    return pd.DataFrame(annotated)
+
+
+def save_quantization_reports(
+    results_df: pd.DataFrame,
+    quantization_dir: Path,
+    metadata: dict[str, object],
+    *,
+    eval_split: str,
+) -> tuple[Path, Path]:
+    """Saves CPU ablation CSV and full JSON metadata under reports/<eval_split>."""
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+
+    report_dir = Path(quantization_dir) / "reports" / eval_split
+    report_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = report_dir / "ablation_results.csv"
+    metadata_path = report_dir / "quantization_metadata.json"
+
+    results_df.to_csv(csv_path, index=False)
+    safe_metadata = _to_json_safe(metadata)
+    metadata_path.write_text(
+        json.dumps(safe_metadata, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    return csv_path, metadata_path
+
+
+def upload_quantization_artifacts_to_hf(
+    quantization_dir: Path,
+    *,
+    eval_split: str,
+    resolutions: tuple[int, ...] = QUANTIZATION_RESOLUTIONS,
+    model_stem: str = YOLO_MODEL_STEM,
+    tag: str | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> None:
+    """Uploads only quantized INT8 models (ONNX + OpenVINO) and split reports to HF."""
+    target_repo, target_token = verify_hf_access(repo_id=repo_id, token=token)
+    quantization_dir = Path(quantization_dir)
+
+    allow_patterns = [f"reports/{eval_split}/**"]
+    required_files = [
+        quantization_dir / "reports" / eval_split / "ablation_results.csv",
+        quantization_dir / "reports" / eval_split / "quantization_metadata.json",
+    ]
+    for path in required_files:
+        if not path.is_file():
+            raise FileNotFoundError(f"Report file missing for HF upload: {path}")
+
+    for imgsz in resolutions:
+        paths = get_quantized_model_paths(quantization_dir, imgsz, model_stem=model_stem)
+        if not paths["onnx_int8"].is_file():
+            raise FileNotFoundError(f"ONNX INT8 artifact missing for HF upload: {paths['onnx_int8']}")
+        _validate_openvino_dir(paths["openvino_int8"])
+        allow_patterns.append(f"{imgsz}/{paths['onnx_int8'].name}")
+        allow_patterns.append(f"{imgsz}/{paths['openvino_int8'].name}/**")
+
+    api = HfApi(token=target_token)
+    api.upload_folder(
+        folder_path=str(quantization_dir),
+        path_in_repo="models/quantization",
+        repo_id=target_repo,
+        repo_type="dataset",
+        allow_patterns=allow_patterns,
+        commit_message=f"Upload CPU INT8 models and {eval_split} quantization reports",
+    )
+    if tag is not None and tag.strip():
+        api.create_tag(
+            repo_id=target_repo,
+            tag=tag.strip(),
+            repo_type="dataset",
+        )
+
+
+def run_cpu_quantization_ablation(
+    dataset_root: Path,
+    *,
+    weights_path: Path | None = None,
+    quantization_dir: Path | None = None,
+    working_dir: Path | None = None,
+    resolutions: tuple[int, ...] = QUANTIZATION_RESOLUTIONS,
+    eval_split: str = "val",
+    eval_pytorch: bool = False,
+    max_calibration_images: int = DEFAULT_CALIBRATION_IMAGES,
+    calibrate_method: str = "MinMax",
+    seed: int = 42,
+    n_warmup: int = 10,
+    n_benchmark: int = 100,
+    collection_conf: float = 0.01,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    model_stem: str = YOLO_MODEL_STEM,
+    upload_to_hf: bool = False,
+    hf_tag: str | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> dict[str, object]:
+    """Runs end-to-end CPU quantization, benchmark, threshold-free ablation, and reporting."""
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+    if not resolutions or any(r <= 0 for r in resolutions):
+        raise ValueError(f"resolutions must be non-empty positive ints, got {resolutions!r}")
+
+    if upload_to_hf:
+        verify_hf_access(repo_id=repo_id, token=token)
+
+    target_quant_dir = Path(quantization_dir) if quantization_dir is not None else config.QUANTIZATION_DIR
+    target_working_dir = Path(working_dir) if working_dir is not None else config.WORKING_DIR
+    cache_dir = target_working_dir / "hf_cache" if working_dir is not None else config.LOCAL_HF_DATA_DIR
+    source_pt = resolve_source_weights(
+        weights_path,
+        cache_dir=cache_dir if weights_path is None else None,
+        repo_id=repo_id,
+        token=token,
+    )
+
+    cal_run_name = "calibration_ptq"
+    eval_run_name = "quantization_eval"
+    calibration_yaml, calibration_images = prepare_calibration_dataset(
+        Path(dataset_root),
+        target_working_dir,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        max_images=max_calibration_images,
+        seed=seed,
+        run_name=cal_run_name,
+        overwrite=True,
+    )
+
+    rows: list[dict[str, object]] = []
+    artifacts_by_res: dict[int, dict[str, Path]] = {}
+    onnx_excluded_nodes: dict[str, list[str]] = {}
+    per_stage_details: dict[str, dict[str, object]] = {}
+
+    try:
+        eval_yaml = prepare_yolo_dataset(
+            Path(dataset_root),
+            target_working_dir,
+            eval_run_name,
+            use_negatives=True,
+            manifest_path=manifest_path,
+            source_path=source_path,
+            overwrite=True,
+        )
+
+        for imgsz in resolutions:
+            stages = export_stage_models(
+                source_pt,
+                target_quant_dir,
+                calibration_images,
+                calibration_yaml,
+                imgsz=imgsz,
+                model_stem=model_stem,
+                calibrate_method=calibrate_method,
+            )
+            artifacts_by_res[imgsz] = stages
+            onnx_fp32_proto = onnx.load(str(stages["onnx_fp32"]))
+            onnx_excluded_nodes[str(imgsz)] = select_onnx_nodes_to_exclude(onnx_fp32_proto)
+
+            bgr_frames, nchw_tensors = _load_benchmark_frames(
+                Path(dataset_root),
+                eval_split,
+                imgsz,
+                max_frames=max(n_benchmark, 50),
+                manifest_path=manifest_path,
+                source_path=source_path,
+            )
+
+            for stage_name, artifact_path in stages.items():
+                size_mb = get_artifact_size_mb(artifact_path)
+                bench = benchmark_stage_model(
+                    artifact_path,
+                    bgr_frames,
+                    nchw_tensors,
+                    imgsz=imgsz,
+                    n_warmup=n_warmup,
+                    n_benchmark=n_benchmark,
+                )
+
+                if stage_name != "pytorch_fp32" or eval_pytorch:
+                    eval_data = evaluate_quantized_stage(
+                        artifact_path,
+                        Path(dataset_root),
+                        eval_yaml,
+                        stage_name,
+                        imgsz=imgsz,
+                        eval_split=eval_split,
+                        collection_conf=collection_conf,
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                    )
+                    eval_metrics = eval_data["metrics"]
+                    per_stage_details[f"{stage_name}_{imgsz}"] = {
+                        "by_scale": eval_data["by_scale"],
+                        "curves": eval_data["curves"],
+                    }
+                else:
+                    eval_metrics = _empty_eval_metrics()
+
+                rows.append({
+                    "imgsz": imgsz,
+                    "stage": stage_name,
+                    "artifact": str(artifact_path),
+                    "size_mb": size_mb,
+                    **bench,
+                    **eval_metrics,
+                })
+    finally:
+        cleanup_calibration_dataset(target_working_dir, run_name=cal_run_name)
+        cleanup_yolo_dataset(target_working_dir, eval_run_name)
+
+    results_df = _annotate_ablation_deltas(rows)
+    metadata = {
+        "source_weights": str(source_pt),
+        "source_weights_sha256": _file_sha256(source_pt),
+        "eval_split": eval_split,
+        "eval_pytorch": eval_pytorch,
+        "resolutions": list(resolutions),
+        "collection_conf": collection_conf,
+        "benchmark": {
+            "n_warmup": n_warmup,
+            "n_benchmark": n_benchmark,
+            "split": eval_split,
+        },
+        "calibration": {
+            "manifest_path": str(manifest_path),
+            "max_images": max_calibration_images,
+            "actual_images": len(calibration_images),
+            "seed": seed,
+            "filenames": [path.name for path in calibration_images],
+        },
+        "onnx_quantization": {
+            "format": "QDQ",
+            "activation_type": "QUInt8",
+            "weight_type": "QInt8",
+            "per_channel": True,
+            "reduce_range": False,
+            "calibrate_method": calibrate_method,
+            "excluded_nodes_by_resolution": onnx_excluded_nodes,
+        },
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "packages": _extract_runtime_versions(),
+        },
+        "stage_details": per_stage_details,
+        "summary_rows": results_df.to_dict(orient="records"),
+    }
+
+    csv_path, metadata_path = save_quantization_reports(
+        results_df,
+        target_quant_dir,
+        metadata,
+        eval_split=eval_split,
+    )
+
+    if upload_to_hf:
+        upload_quantization_artifacts_to_hf(
+            target_quant_dir,
+            eval_split=eval_split,
+            resolutions=resolutions,
+            model_stem=model_stem,
+            tag=hf_tag,
+            repo_id=repo_id,
+            token=token,
+        )
+
+    return {
+        "results_df": results_df,
+        "csv_path": csv_path,
+        "metadata_path": metadata_path,
+        "artifacts": artifacts_by_res,
     }

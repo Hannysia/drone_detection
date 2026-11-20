@@ -1,7 +1,7 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import cv2
 import numpy as np
 import onnx
@@ -287,3 +287,271 @@ def test_export_stage_models_isolates_resolutions_and_propagates_failures(tmp_pa
     monkeypatch.setattr(quantization, "YOLO", Mock(return_value=failing))
     with pytest.raises(FileNotFoundError, match="OpenVINO"):
         quantization.export_openvino_int8(weights, tmp_path / "ov_out", cal_yaml, imgsz=640)
+
+
+def test_benchmark_stage_model_measures_real_onnx_and_mocked_yolo(tmp_path, monkeypatch):
+    fp32_onnx = _make_conv_sigmoid_onnx(tmp_path / "model.onnx", ir_version=9)
+    bgr = np.full((32, 48, 3), 128, dtype=np.uint8)
+    nchw = quantization._bgr_to_nchw(bgr, imgsz=32)
+
+    fake_yolo = Mock()
+    fake_yolo.predict.return_value = [Mock(boxes=None)]
+    monkeypatch.setattr(quantization, "_load_yolo_for_artifact", Mock(return_value=fake_yolo))
+
+    stats = quantization.benchmark_stage_model(
+        fp32_onnx,
+        [bgr],
+        [nchw],
+        imgsz=32,
+        n_warmup=1,
+        n_benchmark=3,
+    )
+
+    assert stats["compute_mean_ms"] > 0.0
+    assert stats["compute_p50_ms"] <= stats["compute_p95_ms"] <= stats["compute_p99_ms"]
+    assert stats["e2e_mean_ms"] > 0.0
+    assert stats["e2e_fps"] > 0.0
+    assert fake_yolo.predict.call_count == 4
+    assert fake_yolo.predict.call_args.kwargs["device"] == "cpu"
+    assert fake_yolo.predict.call_args.kwargs["rect"] is False
+
+    with pytest.raises(ValueError, match="non-empty"):
+        quantization.benchmark_stage_model(fp32_onnx, [], [], imgsz=32)
+
+
+def test_annotate_ablation_deltas_pairs_fp32_to_int8_within_each_resolution():
+    rows = [
+        {
+            "imgsz": 1280,
+            "stage": "pytorch_fp32",
+            "size_mb": 5.5,
+            "compute_mean_ms": 100.0,
+            "e2e_mean_ms": 120.0,
+            "mAP50": float("nan"),
+            "mAP50-95": float("nan"),
+            "AP50": float("nan"),
+            "AP50_small": float("nan"),
+            "Neg FPR @ R>=0.85 (%)": float("nan"),
+        },
+        {
+            "imgsz": 1280,
+            "stage": "onnx_fp32",
+            "size_mb": 10.0,
+            "compute_mean_ms": 80.0,
+            "e2e_mean_ms": 96.0,
+            "mAP50": 0.90,
+            "mAP50-95": 0.75,
+            "AP50": 0.90,
+            "AP50_small": 0.70,
+            "Neg FPR @ R>=0.85 (%)": 6.0,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "onnx_int8",
+            "size_mb": 3.0,
+            "compute_mean_ms": 40.0,
+            "e2e_mean_ms": 48.0,
+            "mAP50": 0.89,
+            "mAP50-95": 0.73,
+            "AP50": 0.88,
+            "AP50_small": 0.67,
+            "Neg FPR @ R>=0.85 (%)": 8.0,
+        },
+        {
+            "imgsz": 640,
+            "stage": "onnx_fp32",
+            "size_mb": 10.0,
+            "compute_mean_ms": 20.0,
+            "e2e_mean_ms": 30.0,
+            "mAP50": 0.80,
+            "mAP50-95": 0.60,
+            "AP50": 0.80,
+            "AP50_small": 0.50,
+            "Neg FPR @ R>=0.85 (%)": 10.0,
+        },
+        {
+            "imgsz": 640,
+            "stage": "onnx_int8",
+            "size_mb": 3.0,
+            "compute_mean_ms": 10.0,
+            "e2e_mean_ms": 15.0,
+            "mAP50": 0.79,
+            "mAP50-95": 0.59,
+            "AP50": 0.78,
+            "AP50_small": 0.48,
+            "Neg FPR @ R>=0.85 (%)": 12.0,
+        },
+    ]
+
+    df = quantization._annotate_ablation_deltas(rows).set_index(["imgsz", "stage"])
+
+    onnx_1280 = df.loc[(1280, "onnx_int8")]
+    onnx_640 = df.loc[(640, "onnx_int8")]
+    assert onnx_1280["ap50_delta_vs_fp32"] == pytest.approx(-0.02)
+    assert onnx_640["ap50_delta_vs_fp32"] == pytest.approx(-0.02)
+    assert onnx_1280["speedup_compute_vs_fp32"] == pytest.approx(2.0)
+    assert onnx_1280["speedup_compute_vs_pt"] == pytest.approx(2.5)
+    assert onnx_1280["size_reduction_pct_vs_fp32"] == pytest.approx(70.0)
+
+
+def test_run_cpu_quantization_ablation_uses_val_skips_pt_eval_and_cleans_up(tmp_path, monkeypatch):
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_001_f0002.jpg", "split": "train", "category": "negative", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0002.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_003_f0001.jpg", "split": "test", "category": "positive", "excluded_at": ""},
+    ]
+    root, manifest_path = _write_calibration_bundle(tmp_path, rows)
+    weights = tmp_path / "best.pt"
+    weights.write_bytes(b"pt")
+    quant_dir = tmp_path / "quant"
+    working_dir = tmp_path / "work"
+
+    def fake_export_stage(pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method):
+        res_dir = qdir / str(imgsz)
+        res_dir.mkdir(parents=True, exist_ok=True)
+        staged_pt = res_dir / f"{model_stem}.pt"
+        staged_pt.write_bytes(b"pt")
+        onnx_fp32 = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_fp32_{imgsz}.onnx")
+        onnx_int8 = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_int8_{imgsz}.onnx")
+        ov_fp32 = res_dir / f"{model_stem}_fp32_{imgsz}_openvino_model"
+        ov_int8 = res_dir / f"{model_stem}_int8_{imgsz}_openvino_model"
+        for ov_dir in (ov_fp32, ov_int8):
+            ov_dir.mkdir()
+            (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
+            (ov_dir / "model.bin").write_bytes(b"bin")
+        return {
+            "pytorch_fp32": staged_pt,
+            "onnx_fp32": onnx_fp32,
+            "onnx_int8": onnx_int8,
+            "openvino_fp32": ov_fp32,
+            "openvino_int8": ov_int8,
+        }
+
+    eval_calls = []
+
+    def fake_eval_stage(artifact, d_root, yaml_p, stage, *, imgsz, eval_split, **kwargs):
+        eval_calls.append((imgsz, stage, eval_split))
+        return {
+            "metrics": {
+                "mAP50": 0.90,
+                "mAP50-95": 0.75,
+                "AP50": 0.89,
+                "AP50_small": 0.65,
+                "AP50_medium": 0.85,
+                "AP50_large": 0.92,
+                "Recall_small @ Neg FPR<=5%": 0.55,
+                "Neg FPR @ R>=0.85 (%)": 5.0,
+                "Mean Neg FA Rate (%)": 4.0,
+                "Max-F1 P": 0.92,
+                "Max-F1 R": 0.88,
+                "Max-F1 Recall_small": 0.60,
+                "Max-F1 Neg FA Rate (%)": 3.0,
+                "Recall_small (raw)": 0.70,
+                "Max Recall (raw)": 0.95,
+                "tp_conf_p10": 0.45,
+                "tp_conf_median": 0.82,
+                "tp_conf_p90": 0.95,
+                "tp_recall_ge_0_30": 0.92,
+            },
+            "by_scale": [{"Scale": "small", "GT": 1, "AP50": 0.65}],
+            "curves": {"thresholds": [0.1, 0.5], "precision": [0.9, 0.95]},
+        }
+
+    monkeypatch.setattr(quantization, "export_stage_models", fake_export_stage)
+    monkeypatch.setattr(
+        quantization,
+        "benchmark_stage_model",
+        lambda *a, **k: {
+            "compute_mean_ms": 10.0,
+            "compute_std_ms": 1.0,
+            "compute_p50_ms": 10.0,
+            "compute_p95_ms": 11.0,
+            "compute_p99_ms": 12.0,
+            "compute_fps": 100.0,
+            "compute_fps_p50": 100.0,
+            "e2e_mean_ms": 15.0,
+            "e2e_std_ms": 1.0,
+            "e2e_p50_ms": 15.0,
+            "e2e_p95_ms": 16.0,
+            "e2e_p99_ms": 17.0,
+            "e2e_fps": 66.7,
+            "e2e_fps_p50": 66.7,
+            "rss_mb": 200.0,
+            "peak_rss_mb": 220.0,
+        },
+    )
+    monkeypatch.setattr(quantization, "evaluate_quantized_stage", fake_eval_stage)
+
+    result = quantization.run_cpu_quantization_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(1280, 640),
+        n_warmup=1,
+        n_benchmark=2,
+        manifest_path=manifest_path,
+    )
+
+    assert len(result["results_df"]) == 10
+    assert len(eval_calls) == 8
+    assert all(stage != "pytorch_fp32" and split == "val" for _, stage, split in eval_calls)
+    assert result["csv_path"] == quant_dir / "reports" / "val" / "ablation_results.csv"
+    assert result["csv_path"].is_file()
+    meta = json.loads(result["metadata_path"].read_text(encoding="utf-8"))
+    assert meta["eval_split"] == "val"
+    assert meta["eval_pytorch"] is False
+    assert all("002_" not in name and "003_" not in name for name in meta["calibration"]["filenames"])
+    assert not (working_dir / "dataset_calibration_ptq.yaml").exists()
+    assert not (working_dir / "dataset_quantization_eval.yaml").exists()
+
+
+def test_upload_quantization_artifacts_to_hf_uploads_only_int8_and_reports(tmp_path, monkeypatch):
+    quant_dir = tmp_path / "quantization"
+    report_dir = quant_dir / "reports" / "test"
+    report_dir.mkdir(parents=True)
+    (report_dir / "ablation_results.csv").write_text("stage\n", encoding="utf-8")
+    (report_dir / "quantization_metadata.json").write_text("{}", encoding="utf-8")
+
+    for imgsz in (1280, 640):
+        res_dir = quant_dir / str(imgsz)
+        res_dir.mkdir()
+        (res_dir / f"yolo26n_run_with_negatives_best_int8_{imgsz}.onnx").write_bytes(b"int8")
+        ov_int8 = res_dir / f"yolo26n_run_with_negatives_best_int8_{imgsz}_openvino_model"
+        ov_int8.mkdir()
+        (ov_int8 / "model.xml").write_text("<net/>", encoding="utf-8")
+        (ov_int8 / "model.bin").write_bytes(b"bin")
+
+    monkeypatch.setattr(quantization, "verify_hf_access", Mock(return_value=("user/repo", "tok")))
+    api = SimpleNamespace(
+        upload_folder=Mock(),
+        create_tag=Mock(),
+    )
+    monkeypatch.setattr(quantization, "HfApi", Mock(return_value=api))
+
+    quantization.upload_quantization_artifacts_to_hf(
+        quant_dir,
+        eval_split="test",
+        tag="cpu-quant-v1",
+    )
+
+    upload_kwargs = api.upload_folder.call_args.kwargs
+    assert upload_kwargs["path_in_repo"] == "models/quantization"
+    assert upload_kwargs["allow_patterns"] == [
+        "reports/test/**",
+        "1280/yolo26n_run_with_negatives_best_int8_1280.onnx",
+        "1280/yolo26n_run_with_negatives_best_int8_1280_openvino_model/**",
+        "640/yolo26n_run_with_negatives_best_int8_640.onnx",
+        "640/yolo26n_run_with_negatives_best_int8_640_openvino_model/**",
+    ]
+    api.create_tag.assert_called_once_with(
+        repo_id="user/repo",
+        tag="cpu-quant-v1",
+        repo_type="dataset",
+    )
+
+    api.upload_folder.side_effect = RuntimeError("hf upload failed")
+    with pytest.raises(RuntimeError, match="hf upload failed"):
+        quantization.upload_quantization_artifacts_to_hf(quant_dir, eval_split="test")
