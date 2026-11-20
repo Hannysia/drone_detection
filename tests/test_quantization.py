@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -555,3 +556,158 @@ def test_upload_quantization_artifacts_to_hf_uploads_only_int8_and_reports(tmp_p
     api.upload_folder.side_effect = RuntimeError("hf upload failed")
     with pytest.raises(RuntimeError, match="hf upload failed"):
         quantization.upload_quantization_artifacts_to_hf(quant_dir, eval_split="test")
+
+
+def _load_quantize_cli_module():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "06_quantize_cpu.py"
+    spec = importlib.util.spec_from_file_location("quantize_cpu_cli", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_evaluate_quantized_stage_runs_threshold_free_cpu_eval(tmp_path, monkeypatch):
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+    eval_yaml = tmp_path / "eval.yaml"
+    eval_yaml.write_text("path: .\n", encoding="utf-8")
+
+    mock_eval_model = Mock(return_value={
+        "metrics/mAP50(B)": 0.91,
+        "metrics/mAP50-95(B)": 0.74,
+    })
+    raw_db = [
+        {
+            "filename": "quad_rgb_sky_001_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [[10.0, 10.0, 20.0, 20.0]],
+            "pred_boxes": [[10.0, 10.0, 20.0, 20.0, 0.85]],
+        },
+        {
+            "filename": "quad_rgb_sky_001_f0002.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [[100.0, 100.0, 220.0, 220.0]],
+            "pred_boxes": [[100.0, 100.0, 220.0, 220.0, 0.20]],
+        },
+        {
+            "filename": "quad_rgb_sky_001_f0003.jpg",
+            "is_positive": False,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.15]],
+        },
+    ]
+    mock_preds_db = Mock(return_value=raw_db)
+    fake_model = Mock()
+
+    monkeypatch.setattr(quantization, "evaluate_model", mock_eval_model)
+    monkeypatch.setattr(quantization, "_load_yolo_for_artifact", Mock(return_value=fake_model))
+    monkeypatch.setattr(quantization, "run_dataset_predictions_db", mock_preds_db)
+
+    with pytest.raises(ValueError, match="eval_split"):
+        quantization.evaluate_quantized_stage(onnx_path, tmp_path, eval_yaml, "onnx_int8", imgsz=640, eval_split="train")
+
+    report = quantization.evaluate_quantized_stage(
+        onnx_path,
+        tmp_path,
+        eval_yaml,
+        "onnx_int8",
+        imgsz=640,
+        eval_split="val",
+        collection_conf=0.01,
+    )
+
+    mock_eval_model.assert_called_once_with(
+        onnx_path,
+        eval_yaml,
+        run_name="onnx_int8_640",
+        split="val",
+        imgsz=640,
+        batch=1,
+        conf=None,
+        device="cpu",
+        plots=False,
+    )
+    assert mock_preds_db.call_args.kwargs["device"] == "cpu"
+    assert mock_preds_db.call_args.kwargs["collection_conf"] == 0.01
+    assert report["metrics"]["mAP50"] == pytest.approx(0.91)
+    assert report["metrics"]["mAP50-95"] == pytest.approx(0.74)
+    assert report["metrics"]["AP50"] == pytest.approx(1.0)
+    assert report["metrics"]["AP50_small"] == pytest.approx(1.0)
+    assert report["metrics"]["tp_conf_median"] == pytest.approx(0.525)
+    assert report["metrics"]["tp_recall_ge_0_30"] == pytest.approx(0.5)
+    assert len(report["by_scale"]) == 3
+    assert len(report["curves"]["thresholds"]) > 0
+
+
+def test_quantize_cpu_cli_defaults_and_flags(tmp_path, monkeypatch):
+    cli = _load_quantize_cli_module()
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+
+    import pandas as pd
+
+    fake_result = {
+        "results_df": pd.DataFrame([{"imgsz": 640, "stage": "onnx_int8", "size_mb": 3.0}]),
+        "csv_path": tmp_path / "ablation.csv",
+        "metadata_path": tmp_path / "meta.json",
+    }
+    mock_run = Mock(return_value=fake_result)
+    monkeypatch.setattr(cli, "run_cpu_quantization_ablation", mock_run)
+
+    assert cli.main([]) == 0
+    first_args, first_kwargs = mock_run.call_args
+    assert first_args[0] == tmp_path / "frame_baseline" / "v1"
+    assert first_kwargs["eval_split"] == "val"
+    assert first_kwargs["resolutions"] == (1280, 640)
+    assert first_kwargs["eval_pytorch"] is False
+    assert first_kwargs["max_calibration_images"] == 300
+    assert first_kwargs["upload_to_hf"] is False
+    assert first_kwargs["source_path"] == cli.MANIFESTS_DIR / "sources" / "hf.json"
+
+    custom_root = tmp_path / "custom"
+    assert cli.main([
+        "--split", "test",
+        "--resolutions", "640",
+        "--dataset-root", str(custom_root),
+        "--no-source-check",
+        "--calibration-images", "128",
+        "--calibrate-method", "Entropy",
+        "--n-warmup", "2",
+        "--n-benchmark", "5",
+        "--eval-pytorch",
+        "--upload",
+        "--hf-tag", "cpu-v1",
+    ]) == 0
+
+    second_args, second_kwargs = mock_run.call_args
+    assert second_args[0] == custom_root
+    assert second_kwargs["eval_split"] == "test"
+    assert second_kwargs["resolutions"] == (640,)
+    assert second_kwargs["source_path"] is None
+    assert second_kwargs["max_calibration_images"] == 128
+    assert second_kwargs["calibrate_method"] == "Entropy"
+    assert second_kwargs["n_warmup"] == 2
+    assert second_kwargs["n_benchmark"] == 5
+    assert second_kwargs["eval_pytorch"] is True
+    assert second_kwargs["upload_to_hf"] is True
+    assert second_kwargs["hf_tag"] == "cpu-v1"
+
+
+@pytest.mark.parametrize(
+    "bad_argv",
+    [
+        ["--resolutions", "0"],
+        ["--resolutions", "650"],
+        ["--hf-tag", "cpu-v1"],
+        ["--calibration-images", "0"],
+    ],
+)
+def test_quantize_cpu_cli_rejects_invalid_arguments(bad_argv):
+    cli = _load_quantize_cli_module()
+    with pytest.raises(SystemExit):
+        cli.main(bad_argv)
