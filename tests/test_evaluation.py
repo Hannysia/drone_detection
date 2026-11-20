@@ -11,6 +11,7 @@ from src.processing.evaluation import (
     evaluate_model,
     evaluate_predictions,
     evaluate_runs_on_test,
+    evaluate_threshold_free_slices,
     run_dataset_predictions_db,
 )
 from src.processing.manifests import CATEGORY_DIRS, write_manifest
@@ -403,3 +404,102 @@ def test_analyze_model_errors_breaks_down_scales_positions_metadata_and_modes():
 
     with pytest.raises(ValueError, match="empty"):
         analyze_model_errors([], conf_threshold=0.5)
+
+
+
+
+def test_evaluate_threshold_free_slices_computes_ap_small_and_neg_fpr_tradeoffs():
+    raw_database = [
+        {
+            "filename": "quad_rgb_sky_001_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [
+                [0.0, 0.0, 10.0, 10.0],
+                [100.0, 100.0, 220.0, 220.0],
+            ],
+            "pred_boxes": [
+                [0.0, 0.0, 10.0, 10.0, 0.90],
+                [300.0, 300.0, 310.0, 310.0, 0.60],
+                [100.0, 100.0, 220.0, 220.0, 0.40],
+            ],
+        },
+        {
+            "filename": "wing_rgb_sky_002_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [[0.0, 0.0, 10.0, 10.0]],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.70]],
+        },
+        {
+            "filename": "no_drone_rgb_sky_003_f0001.jpg",
+            "is_positive": False,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.80]],
+        },
+        {
+            "filename": "no_drone_rgb_sky_004_f0001.jpg",
+            "is_positive": False,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [],
+            "pred_boxes": [],
+        },
+    ]
+
+    report = evaluate_threshold_free_slices(
+        raw_database,
+        thresholds=np.array([0.30, 0.50, 0.75, 0.85]),
+    )
+    summary = report["summary"].iloc[0]
+
+    assert summary["AP50"] == pytest.approx(34.0 / 45.0)
+    assert summary["AP50_small"] == pytest.approx(5.0 / 6.0)
+    assert np.isnan(summary["AP50_medium"])
+    assert summary["AP50_large"] == pytest.approx(1.0)
+    assert summary["Recall_small @ Neg FPR<=5%"] == pytest.approx(0.5)
+    assert summary["Neg FPR @ R>=0.85 (%)"] == pytest.approx(50.0)
+    assert summary["Mean Neg FA Rate (%)"] == pytest.approx(37.5)
+
+    by_scale = report["by_scale"].set_index("Scale")
+    assert by_scale.loc["small", "GT"] == 2
+    assert by_scale.loc["small", "AP50"] == pytest.approx(5.0 / 6.0)
+    assert by_scale.loc["large", "AP50"] == pytest.approx(1.0)
+
+    with pytest.raises(ValueError, match="empty"):
+        evaluate_threshold_free_slices([])
+
+
+def test_analyze_model_errors_includes_thresholded_summary():
+    raw_database = [
+        {
+            "filename": "quad_rgb_sky_001_f0001.jpg",
+            "is_positive": True,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [[490.0, 490.0, 510.0, 510.0]],
+            "pred_boxes": [[490.0, 490.0, 510.0, 510.0, 0.90]],
+        },
+        {
+            "filename": "no_drone_rgb_sky_002_f0001.jpg",
+            "is_positive": False,
+            "width": 1000,
+            "height": 1000,
+            "gt_boxes": [],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.80]],
+        },
+    ]
+
+    report = analyze_model_errors(raw_database, conf_threshold=0.70)
+    row = report["summary"].iloc[0]
+
+    assert row["Conf"] == pytest.approx(0.70)
+    assert row["Precision"] == pytest.approx(0.5)
+    assert row["Recall"] == pytest.approx(1.0)
+    assert row["F0.5"] == pytest.approx(5.0 / 9.0)
+    assert row["Recall_small"] == pytest.approx(1.0)
+    assert row["Neg FA Rate (%)"] == pytest.approx(100.0)

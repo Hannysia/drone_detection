@@ -232,15 +232,15 @@ def get_detections_boxes(
     return boxes
 
 
-def _match_predictions_with_details(
+def _greedy_match_predictions(
     gt_boxes: list,
     pred_boxes: list,
     iou_threshold: float = 0.5,
-) -> tuple[list[int], list[int], list[int], dict[int, float], set[int]]:
+) -> tuple[list[tuple[int, int]], list[int], list[int], dict[int, float]]:
     if len(pred_boxes) == 0:
-        return [], [], list(range(len(gt_boxes))), {}, set()
+        return [], [], list(range(len(gt_boxes))), {}
     if len(gt_boxes) == 0:
-        return [], list(range(len(pred_boxes))), [], {}, set()
+        return [], list(range(len(pred_boxes))), [], {}
 
     ordered_preds = sorted(
         enumerate(pred_boxes),
@@ -250,7 +250,7 @@ def _match_predictions_with_details(
 
     matched_gts: set[int] = set()
     matched_gt_ious: dict[int, float] = {}
-    tp_indices: list[int] = []
+    tp_gt_pairs: list[tuple[int, int]] = []
     fp_indices: list[int] = []
 
     for orig_idx, pred in ordered_preds:
@@ -268,12 +268,26 @@ def _match_predictions_with_details(
         if best_iou >= iou_threshold:
             matched_gts.add(best_gt_idx)
             matched_gt_ious[best_gt_idx] = float(best_iou)
-            tp_indices.append(orig_idx)
+            tp_gt_pairs.append((orig_idx, best_gt_idx))
         else:
             fp_indices.append(orig_idx)
 
     fn_indices = [i for i in range(len(gt_boxes)) if i not in matched_gts]
-    return tp_indices, fp_indices, fn_indices, matched_gt_ious, matched_gts
+    return tp_gt_pairs, fp_indices, fn_indices, matched_gt_ious
+
+
+def _match_predictions_with_details(
+    gt_boxes: list,
+    pred_boxes: list,
+    iou_threshold: float = 0.5,
+) -> tuple[list[int], list[int], list[int], dict[int, float], set[int]]:
+    tp_gt_pairs, fp_indices, fn_indices, matched_gt_ious = _greedy_match_predictions(
+        gt_boxes,
+        pred_boxes,
+        iou_threshold=iou_threshold,
+    )
+    tp_indices = [pred_idx for pred_idx, _ in tp_gt_pairs]
+    return tp_indices, fp_indices, fn_indices, matched_gt_ious, set(matched_gt_ious.keys())
 
 
 def evaluate_predictions(
@@ -288,6 +302,14 @@ def evaluate_predictions(
         iou_threshold=iou_threshold,
     )
     return tp_indices, fp_indices, fn_indices
+
+
+def _compute_prf_metrics(tp: int, fp: int, fn: int) -> tuple[float, float, float, float]:
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f05 = 1.25 * precision * recall / (0.25 * precision + recall) if (0.25 * precision + recall) > 0 else 0.0
+    return precision, recall, f1, f05
 
 
 def run_dataset_predictions_db(
@@ -454,10 +476,7 @@ def calibrate_confidence_thresholds(
                 if filtered_preds:
                     negatives_with_false_alarms += 1
 
-        precision = tps_count / (tps_count + fps_count) if (tps_count + fps_count) > 0 else 1.0
-        recall = tps_count / (tps_count + fns_count) if (tps_count + fns_count) > 0 else 0.0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        f05 = 1.25 * (precision * recall) / (0.25 * precision + recall) if (0.25 * precision + recall) > 0 else 0.0
+        precision, recall, f1, f05 = _compute_prf_metrics(tps_count, fps_count, fns_count)
         fa_rate = (negatives_with_false_alarms / total_negatives * 100) if total_negatives > 0 else 0.0
 
         precision_curve.append(precision)
@@ -806,16 +825,42 @@ def analyze_model_errors(
         {"Type": name, "Count": count}
         for name, count in error_counts.items()
     ])
+    by_size_df = _aggregate_gt_bucket_table(
+        gt_records,
+        "scale",
+        "Scale",
+        ordered_groups=("small", "medium", "large"),
+    )
+    by_shape_df = _aggregate_metadata_table(frame_records, "shape")
+
+    tp_total = error_counts["TP"]
+    fp_total = (
+        error_counts["Background FP"]
+        + error_counts["Localization FP"]
+        + error_counts["Duplicate FP"]
+    )
+    fn_total = error_counts["Threshold Miss FN"] + error_counts["Blind Miss FN"]
+    precision, recall, f1, f05 = _compute_prf_metrics(tp_total, fp_total, fn_total)
+    size_recalls = dict(zip(by_size_df["Scale"], by_size_df["Recall"]))
+    neg_rows = by_shape_df[by_shape_df["Group"] == "no_drone"]
+    neg_fpr = float(neg_rows["Neg FA Rate (%)"].iloc[0]) if not neg_rows.empty else float("nan")
+    summary_df = pd.DataFrame([{
+        "Conf": round(float(conf_threshold), 4),
+        "Precision": precision,
+        "Recall": recall,
+        "F0.5": f05,
+        "F1": f1,
+        "Recall_small": float(size_recalls.get("small", np.nan)),
+        "Recall_medium": float(size_recalls.get("medium", np.nan)),
+        "Recall_large": float(size_recalls.get("large", np.nan)),
+        "Neg FA Rate (%)": neg_fpr,
+    }])
 
     return {
         "conf_threshold": float(conf_threshold),
+        "summary": summary_df,
         "error_types": error_types_df,
-        "by_size": _aggregate_gt_bucket_table(
-            gt_records,
-            "scale",
-            "Scale",
-            ordered_groups=("small", "medium", "large"),
-        ),
+        "by_size": by_size_df,
         "by_position": _aggregate_gt_bucket_table(
             gt_records,
             "region",
@@ -824,7 +869,210 @@ def analyze_model_errors(
         ),
         "by_background": _aggregate_metadata_table(frame_records, "background"),
         "by_camera": _aggregate_metadata_table(frame_records, "camera"),
-        "by_shape": _aggregate_metadata_table(frame_records, "shape"),
+        "by_shape": by_shape_df,
         "worst_fps": fp_cases[:top_k],
         "worst_fns": fn_cases[:top_k],
+    }
+
+
+def _compute_average_precision(scores: np.ndarray, tp_flags: np.ndarray, total_gt: int) -> float:
+    if total_gt <= 0:
+        return float("nan")
+    if scores.size == 0:
+        return 0.0
+
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_tp = tp_flags[order].astype(float)
+
+    tp_cum = np.cumsum(sorted_tp)
+    fp_cum = np.cumsum(1.0 - sorted_tp)
+    keep = np.r_[np.diff(sorted_scores) < 0.0, True]
+
+    recalls = tp_cum[keep] / float(total_gt)
+    precisions = tp_cum[keep] / np.maximum(tp_cum[keep] + fp_cum[keep], 1e-12)
+
+    mrec = np.concatenate(([0.0], recalls, [1.0]))
+    mpre = np.concatenate(([1.0], precisions, [0.0]))
+    mpre = np.maximum.accumulate(mpre[::-1])[::-1]
+
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
+def _collect_matched_detections(
+    raw_database: list[dict],
+    iou_threshold: float,
+) -> tuple[dict[str, int], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    gt_scale_counts = {"small": 0, "medium": 0, "large": 0}
+    det_scores: list[float] = []
+    det_tps: list[int] = []
+    det_scales: list[str] = []
+    neg_max_confs: list[float] = []
+
+    for entry in raw_database:
+        gt_boxes = entry["gt_boxes"]
+        pred_boxes = entry["pred_boxes"]
+        for gt_box in gt_boxes:
+            gt_scale_counts[_classify_bbox_scale(gt_box)] += 1
+
+        tp_gt_pairs, fp_idx, _, _ = _greedy_match_predictions(
+            gt_boxes,
+            pred_boxes,
+            iou_threshold=iou_threshold,
+        )
+        for pred_idx, gt_idx in tp_gt_pairs:
+            det_scores.append(float(pred_boxes[pred_idx][4]))
+            det_tps.append(1)
+            det_scales.append(_classify_bbox_scale(gt_boxes[gt_idx]))
+        for pred_idx in fp_idx:
+            pred = pred_boxes[pred_idx]
+            det_scores.append(float(pred[4]))
+            det_tps.append(0)
+            det_scales.append(_classify_bbox_scale(pred[:4]))
+
+        if not entry["is_positive"]:
+            neg_max_confs.append(max((float(pred[4]) for pred in pred_boxes), default=-1.0))
+
+    return (
+        gt_scale_counts,
+        np.asarray(det_scores, dtype=float),
+        np.asarray(det_tps, dtype=int),
+        np.asarray(det_scales, dtype=object),
+        np.asarray(neg_max_confs, dtype=float),
+    )
+
+
+def evaluate_threshold_free_slices(
+    raw_database: list[dict],
+    *,
+    iou_threshold: float = 0.5,
+    target_recall: float = 0.85,
+    max_neg_fpr: float = 5.0,
+    thresholds: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Computes threshold-free AP slices and negative-frame false alarm trade-offs."""
+    if not raw_database:
+        raise ValueError("Evaluation database is empty")
+    if not 0.0 <= iou_threshold <= 1.0:
+        raise ValueError(f"Invalid iou_threshold: {iou_threshold}")
+    if not 0.0 < target_recall <= 1.0:
+        raise ValueError(f"Invalid target_recall: {target_recall}")
+    if not 0.0 <= max_neg_fpr <= 100.0:
+        raise ValueError(f"Invalid max_neg_fpr: {max_neg_fpr}")
+
+    grid = np.linspace(0.01, 0.99, 99) if thresholds is None else np.asarray(thresholds, dtype=float)
+    if grid.size == 0:
+        raise ValueError("Threshold grid must not be empty")
+
+    gt_scale_counts, scores_arr, tps_arr, scales_arr, neg_arr = _collect_matched_detections(
+        raw_database,
+        iou_threshold,
+    )
+    scale_names = ("small", "medium", "large")
+    total_gt = sum(gt_scale_counts.values())
+    small_gt = gt_scale_counts["small"]
+    total_negatives = int(neg_arr.size)
+
+    ap50_all = _compute_average_precision(scores_arr, tps_arr, total_gt)
+    ap50_by_scale = {}
+    for name in scale_names:
+        scale_mask = scales_arr == name
+        ap50_by_scale[name] = _compute_average_precision(
+            scores_arr[scale_mask],
+            tps_arr[scale_mask],
+            gt_scale_counts[name],
+        )
+
+    precision_curve, recall_curve, recall_small_curve = [], [], []
+    f1_curve, f05_curve, neg_fa_rate = [], [], []
+    small_tp_mask = (tps_arr == 1) & (scales_arr == "small")
+
+    for threshold in grid:
+        mask = scores_arr >= threshold
+        tp_t = int(tps_arr[mask].sum())
+        fp_t = int(mask.sum()) - tp_t
+        fn_t = total_gt - tp_t
+        precision, recall, f1, f05 = _compute_prf_metrics(tp_t, fp_t, fn_t)
+
+        r_small = float((small_tp_mask & mask).sum() / small_gt) if small_gt > 0 else float("nan")
+        neg_fpr = float(np.mean(neg_arr >= threshold) * 100.0) if total_negatives > 0 else float("nan")
+
+        precision_curve.append(precision)
+        recall_curve.append(recall)
+        recall_small_curve.append(r_small)
+        f1_curve.append(f1)
+        f05_curve.append(f05)
+        neg_fa_rate.append(neg_fpr)
+
+    opt_f1_idx = int(np.argmax(f1_curve))
+    opt_f05_idx = int(np.argmax(f05_curve))
+
+    recall_ok_indices = [i for i, r in enumerate(recall_curve) if r >= target_recall]
+    neg_fpr_at_recall = (
+        float(min(neg_fa_rate[i] for i in recall_ok_indices))
+        if total_negatives > 0 and recall_ok_indices
+        else float("nan")
+    )
+
+    fpr_ok_indices = (
+        [i for i, fpr in enumerate(neg_fa_rate) if fpr <= max_neg_fpr]
+        if total_negatives > 0
+        else []
+    )
+    recall_small_at_fpr = (
+        float(max(recall_small_curve[i] for i in fpr_ok_indices))
+        if small_gt > 0 and fpr_ok_indices
+        else float("nan")
+    )
+
+    by_scale_rows = []
+    for name in scale_names:
+        gt_count = gt_scale_counts[name]
+        tp_scale_mask = (tps_arr == 1) & (scales_arr == name)
+        max_recall = float(tp_scale_mask.sum() / gt_count) if gt_count > 0 else float("nan")
+        r_f1 = float((tp_scale_mask & (scores_arr >= grid[opt_f1_idx])).sum() / gt_count) if gt_count > 0 else float("nan")
+        r_at_fpr = (
+            float(max((tp_scale_mask & (scores_arr >= grid[i])).sum() / gt_count for i in fpr_ok_indices))
+            if gt_count > 0 and fpr_ok_indices
+            else float("nan")
+        )
+        by_scale_rows.append({
+            "Scale": name,
+            "GT": gt_count,
+            "AP50": ap50_by_scale[name],
+            "Max Recall (raw)": max_recall,
+            "Recall @ Max-F1": r_f1,
+            f"Recall @ Neg FPR<={max_neg_fpr:g}%": r_at_fpr,
+        })
+
+    mean_neg_fpr = float(np.mean(neg_fa_rate)) if total_negatives > 0 else float("nan")
+    summary_df = pd.DataFrame([{
+        "AP50": ap50_all,
+        "AP50_small": ap50_by_scale["small"],
+        "AP50_medium": ap50_by_scale["medium"],
+        "AP50_large": ap50_by_scale["large"],
+        "Max-F1 P": precision_curve[opt_f1_idx],
+        "Max-F1 R": recall_curve[opt_f1_idx],
+        "Max-F1 Recall_small": recall_small_curve[opt_f1_idx],
+        "Max-F1 Neg FA Rate (%)": neg_fa_rate[opt_f1_idx],
+        f"Recall_small @ Neg FPR<={max_neg_fpr:g}%": recall_small_at_fpr,
+        f"Neg FPR @ R>={target_recall:g} (%)": neg_fpr_at_recall,
+        "Mean Neg FA Rate (%)": mean_neg_fpr,
+    }])
+
+    return {
+        "summary": summary_df,
+        "by_scale": pd.DataFrame(by_scale_rows),
+        "ap50": ap50_all,
+        "ap50_by_scale": ap50_by_scale,
+        "thresholds": grid,
+        "precision": precision_curve,
+        "recall": recall_curve,
+        "recall_small": recall_small_curve,
+        "f1": f1_curve,
+        "f05": f05_curve,
+        "neg_fa_rate": neg_fa_rate,
+        "oracle_f1_conf": float(grid[opt_f1_idx]),
+        "oracle_f05_conf": float(grid[opt_f05_idx]),
     }
