@@ -1,4 +1,6 @@
+import json
 import logging
+from pathlib import Path
 import sys
 
 from src.config import LABELS_DIR, TRACKEVAL_DIR, VIDEO_EXTENSIONS
@@ -9,6 +11,16 @@ log = logging.getLogger(__name__)
 
 SPLITS = ["test", "val"]
 
+
+def _index_zip_archives(root: Path) -> dict[str, Path]:
+    archives: dict[str, Path] = {}
+    for zip_path in sorted(root.rglob("*.zip")):
+        if zip_path.stem in archives:
+            raise ValueError(f"Duplicate archive stem {zip_path.stem!r} in {root}")
+        archives[zip_path.stem] = zip_path
+    return archives
+
+
 def main() -> None:
     if not LABELS_DIR.exists():
         log.error(f"Error: Base labels directory does not exist: {LABELS_DIR}")
@@ -17,7 +29,9 @@ def main() -> None:
     seqmaps_dir = TRACKEVAL_DIR / "seqmaps"
     seqmaps_dir.mkdir(parents=True, exist_ok=True)
 
-    zip_files = {z.stem: z for z in LABELS_DIR.glob("*.zip")}
+    curated_root = LABELS_DIR / "labels_curated" / "v1"
+    search_root = curated_root if curated_root.is_dir() else LABELS_DIR
+    zip_files = _index_zip_archives(search_root)
 
     for split in SPLITS:
         split_dir = LABELS_DIR / split
@@ -49,11 +63,16 @@ def main() -> None:
                 seqinfo_path = gt_dir / seq_name / "seqinfo.ini"
                 
                 try:
+                    review_path = Path(str(zip_path).removesuffix(".zip") + ".review.json")
+                    extra_kwargs = {}
+                    if review_path.is_file():
+                        extra_kwargs["review"] = json.loads(review_path.read_text(encoding="utf-8"))
                     prepare_trackeval_sequence(
                         video_path=video_path,
                         zip_path=zip_path,
                         seq_gt_dir=seq_gt_dir,
                         seqinfo_path=seqinfo_path,
+                        **extra_kwargs,
                     )
                 except Exception as e:
                     log.error(f"❌ Failed to process sequence {seq_name}: {e}")

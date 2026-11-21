@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from src.config import MANIFESTS_DIR, SPLITS
-from src.utils.io import check_extraction_source
+from src.utils.io import check_extraction_source, parse_frame_name
 
 
 CATEGORY_DIRS = {
@@ -194,6 +194,31 @@ def collect_frame_rows(dataset_root: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _load_validated_split_rows(
+    dataset_root: Path,
+    *,
+    split: str,
+    manifest_path: Path,
+    source_path: Path | None,
+    allowed_splits: tuple[str, ...],
+) -> tuple[Path, list[dict[str, str]]]:
+    if split not in SPLITS:
+        raise ValueError(f"Unknown split: {split!r}")
+    if split not in allowed_splits:
+        raise ValueError(
+            f"Split {split!r} is not allowed; expected one of {allowed_splits}"
+        )
+
+    root = Path(dataset_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    if source_path is not None:
+        expected_source = json.loads(Path(source_path).read_text(encoding="utf-8"))
+        check_extraction_source(root, expected_source)
+
+    return root, read_manifest(Path(manifest_path))
+
+
 def select_manifest_frames(
     dataset_root: Path,
     *,
@@ -204,23 +229,16 @@ def select_manifest_frames(
     allowed_splits: tuple[str, ...] = ("val", "test"),
 ) -> list[tuple[Path, str]]:
     """Returns active frame paths and categories for a split filtered by manifest."""
-    if split not in SPLITS:
-        raise ValueError(f"Unknown split: {split!r}")
-    if split not in allowed_splits:
-        raise ValueError(
-            f"Split {split!r} is not allowed; expected one of {allowed_splits}"
-        )
     if category is not None and category not in CATEGORY_DIRS:
         raise ValueError(f"Unknown category: {category!r}")
 
-    root = dataset_root.resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
-    if source_path is not None:
-        expected_source = json.loads(source_path.read_text(encoding="utf-8"))
-        check_extraction_source(root, expected_source)
-
-    rows = read_manifest(manifest_path)
+    root, rows = _load_validated_split_rows(
+        dataset_root,
+        split=split,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        allowed_splits=allowed_splits,
+    )
     selected = []
     for row in rows:
         if row["split"] != split or row["excluded_at"]:
@@ -237,3 +255,77 @@ def select_manifest_frames(
             f"No active frames for split={split!r}, category={category!r} in {manifest_path}"
         )
     return selected
+
+
+def load_baseline_video_sequences(
+    dataset_root: Path,
+    *,
+    split: str = "val",
+    manifest_path: Path = MANIFESTS_DIR / "baseline" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    allowed_splits: tuple[str, ...] = ("val", "test"),
+    require_positive_labels: bool = True,
+) -> dict[str, list[dict[str, object]]]:
+    """Loads chronologically ordered retained frames grouped by video_id with gap deltas."""
+    root, rows = _load_validated_split_rows(
+        dataset_root,
+        split=split,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        allowed_splits=allowed_splits,
+    )
+    grouped: dict[str, list[tuple[int, dict[str, object]]]] = {}
+    seen_frames: dict[str, set[int]] = {}
+
+    for row in rows:
+        if row["split"] != split or row["excluded_at"]:
+            continue
+        video_id, frame_num = parse_frame_name(row["filename"])
+        seen = seen_frames.setdefault(video_id, set())
+        if frame_num in seen:
+            raise ValueError(f"Duplicate frame number {frame_num} for video {video_id}")
+        seen.add(frame_num)
+
+        image_path = root / split / CATEGORY_DIRS[row["category"]] / row["filename"]
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Missing baseline frame: {image_path}")
+
+        label_path: Path | None = None
+        if row["category"] == "positive":
+            candidate = image_path.with_suffix(".txt")
+            if require_positive_labels and not candidate.is_file():
+                raise FileNotFoundError(f"Missing label for positive baseline frame: {candidate}")
+            if candidate.is_file():
+                label_path = candidate
+
+        grouped.setdefault(video_id, []).append((
+            frame_num,
+            {
+                "video_id": video_id,
+                "filename": row["filename"],
+                "image_path": image_path,
+                "label_path": label_path,
+                "category": row["category"],
+                "source_frame": frame_num,
+            },
+        ))
+
+    if not grouped:
+        raise ValueError(f"No active video frames for split={split!r} in {manifest_path}")
+
+    sequences: dict[str, list[dict[str, object]]] = {}
+    for video_id in sorted(grouped):
+        items = sorted(grouped[video_id], key=lambda pair: pair[0])
+        seq_frames: list[dict[str, object]] = []
+        prev_source: int | None = None
+        for mot_frame, (source_frame, item) in enumerate(items, start=1):
+            dt_frames = 1 if prev_source is None else source_frame - prev_source
+            prev_source = source_frame
+            seq_frames.append({
+                **item,
+                "mot_frame": mot_frame,
+                "dt_frames": dt_frames,
+            })
+        sequences[video_id] = seq_frames
+
+    return sequences

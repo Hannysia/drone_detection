@@ -1,10 +1,13 @@
 import configparser
+import json
 import logging
 import sys
 import time
 from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
+
+from src.processing.frame_alignment import build_frame_mapping
 
 log = logging.getLogger(__name__)
 
@@ -43,26 +46,33 @@ def run_tracking_pipeline(
     dataset_base_dir: Path, 
     trackers_out_dir: Path,
     detections_source_dir: Path = None
-) -> None:
+) -> dict[str, float]:
     """Runs tracking and measures high-precision tracker execution time (latency and FPS)."""
     split_dir = dataset_base_dir / f"drone-{split_name}"
     if not split_dir.exists():
-        print(f"Error: Split directory {split_dir} does not exist.")
-        return
-        
-    sequences = [d for d in split_dir.iterdir() if d.is_dir()]
+        log.error("Split directory %s does not exist.", split_dir)
+        return {"avg_latency_ms": 0.0, "avg_fps": 0.0, "total_frames": 0, "total_time_s": 0.0}
+
+    sequences = sorted(d for d in split_dir.iterdir() if d.is_dir())
     global_total_time = 0.0
     global_total_frames = 0
-    
+
     for seq in sequences:
         seq_name = seq.name
-        
-        config = configparser.ConfigParser()
-        config.read(seq / "seqinfo.ini")
-        width = int(config['Sequence']['imWidth'])
-        height = int(config['Sequence']['imHeight'])
-        fps = int(config['Sequence']['frameRate'])
-        seq_length = int(config['Sequence']['seqLength']) 
+        seqinfo_file = seq / "seqinfo.ini"
+        if not seqinfo_file.is_file():
+            raise FileNotFoundError(f"Missing seqinfo.ini: {seqinfo_file}")
+
+        seq_cfg = configparser.ConfigParser()
+        seq_cfg.read(seqinfo_file, encoding="utf-8")
+        width = int(seq_cfg["Sequence"]["imWidth"])
+        height = int(seq_cfg["Sequence"]["imHeight"])
+        fps = int(seq_cfg["Sequence"]["frameRate"])
+        seq_length = int(seq_cfg["Sequence"]["seqLength"])
+        if min(width, height, fps, seq_length) <= 0:
+            raise ValueError(
+                f"Invalid seqinfo.ini values in {seqinfo_file}: w={width}, h={height}, fps={fps}, len={seq_length}"
+            )
         
         tracker = get_configured_tracker(tracker_name, tracker_config, fps)
         
@@ -127,35 +137,85 @@ def run_tracking_pipeline(
         if len(results) > 0:
             np.savetxt(res_file, np.array(results), fmt='%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d')
         else:
-            open(res_file, 'w').close()
-            
-    if global_total_frames > 0:
+            res_file.write_text("", encoding="utf-8")
+
+    if global_total_frames > 0 and global_total_time > 0:
         global_latency_ms = (global_total_time / global_total_frames) * 1000
         global_fps = global_total_frames / global_total_time
-        print(f"===> [{tracker_name.upper()}] {run_dir_name.upper()} | Config: {tracker_config} | Avg Latency: {global_latency_ms:.3f} ms/frame | Avg FPS: {global_fps:.1f}")
+        log.info(
+            "===> [%s] %s | Config: %s | Avg Latency: %.3f ms/frame | Avg FPS: %.1f",
+            tracker_name.upper(),
+            run_dir_name.upper(),
+            tracker_config,
+            global_latency_ms,
+            global_fps,
+        )
+        return {
+            "avg_latency_ms": float(global_latency_ms),
+            "avg_fps": float(global_fps),
+            "total_frames": int(global_total_frames),
+            "total_time_s": float(global_total_time),
+        }
+    return {"avg_latency_ms": 0.0, "avg_fps": 0.0, "total_frames": int(global_total_frames), "total_time_s": float(global_total_time)}
+
+
+def _resolve_sequence_frame_map(
+    seq_name: str,
+    curated_split_dir: Path,
+    frame_mappings: dict[str, dict[int, int]] | None,
+) -> dict[int, int] | None:
+    if frame_mappings is not None and seq_name in frame_mappings:
+        return frame_mappings[seq_name]
+    if not curated_split_dir.is_dir():
+        return None
+    matches = sorted(curated_split_dir.rglob(f"{seq_name}.review.json"))
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 review JSON for {seq_name!r} in {curated_split_dir}, found {len(matches)}"
+        )
+    review = json.loads(matches[0].read_text(encoding="utf-8"))
+    return build_frame_mapping(review)
 
 
 def run_yolo_inference_for_tracking(
-    model_path: Path, 
-    seqmaps_dir: Path, 
-    local_hf_dir: Path, 
-    yolo_out_dir: Path, 
-    video_extensions: tuple[str]
+    model_path: Path,
+    seqmaps_dir: Path,
+    local_hf_dir: Path,
+    yolo_out_dir: Path,
+    video_extensions: tuple[str, ...],
+    *,
+    imgsz: int = 1280,
+    conf: float = 0.01,
+    device: str | int | None = None,
+    splits: tuple[str, ...] = ("val", "test"),
+    annotation_version: str = "v1",
+    review_dir: Path | None = None,
+    frame_mappings: dict[str, dict[int, int]] | None = None,
 ) -> None:
-    """Runs YOLO engine GPU inference on val and test splits and saves detections as flat files."""
-    model = YOLO(str(model_path), task="detect")
-    splits = ["val", "test"]
+    """Runs YOLO detection with rect=False and curated frame-mapping alignment for tracking."""
+    model = (
+        YOLO(str(model_path))
+        if Path(model_path).suffix.lower() == ".pt"
+        else YOLO(str(model_path), task="detect")
+    )
+    curated_base = (
+        Path(review_dir)
+        if review_dir is not None
+        else Path(local_hf_dir) / "labels_curated" / annotation_version
+    )
 
     for split in splits:
-        split_video_dir = local_hf_dir / split
-        output_split_dir = yolo_out_dir / split
+        seqmap_file = Path(seqmaps_dir) / f"drone-{split}.txt"
+        if not seqmap_file.is_file():
+            continue
+
+        split_video_dir = Path(local_hf_dir) / split
+        output_split_dir = Path(yolo_out_dir) / split
         output_split_dir.mkdir(parents=True, exist_ok=True)
+        curated_split_dir = curated_base / split
+        sequences = [line.strip() for line in seqmap_file.read_text(encoding="utf-8").splitlines()[1:] if line.strip()]
 
-        seqmap_file = seqmaps_dir / f"drone-{split}.txt"
-        with open(seqmap_file, "r", encoding="utf-8") as f:
-            sequences = f.read().splitlines()[1:]
-
-        print(f"\n--- Running YOLO GPU inference on '{split}' split ---")
+        log.info("Running YOLO inference on '%s' split (%d sequences)", split, len(sequences))
         for seq_name in sequences:
             video_path = None
             for ext in video_extensions:
@@ -167,12 +227,28 @@ def run_yolo_inference_for_tracking(
             if not video_path:
                 continue
 
-            print(f"Inference on: {video_path.name}")
-            results = model(str(video_path), stream=True, conf=0.01, verbose=False)
+            frame_map = _resolve_sequence_frame_map(seq_name, curated_split_dir, frame_mappings)
+            predict_kwargs: dict[str, object] = {
+                "stream": True,
+                "imgsz": imgsz,
+                "conf": conf,
+                "rect": False,
+                "verbose": False,
+            }
+            if device is not None:
+                predict_kwargs["device"] = device
+
+            results = model(str(video_path), **predict_kwargs)
             detections = []
 
-            for frame_idx, result in enumerate(results):
-                frame_id = frame_idx + 1
+            for source_frame_idx, result in enumerate(results, start=1):
+                if frame_map is not None:
+                    if source_frame_idx not in frame_map:
+                        continue
+                    frame_id = frame_map[source_frame_idx]
+                else:
+                    frame_id = source_frame_idx
+
                 boxes = result.boxes
                 if boxes is not None:
                     xyxy = boxes.xyxy.cpu().numpy()
@@ -181,12 +257,12 @@ def run_yolo_inference_for_tracking(
 
                     for i in range(len(xyxy)):
                         x1, y1, x2, y2 = xyxy[i]
-                        conf = confs[i]
+                        score = confs[i]
                         cls = int(clss[i])
-                        detections.append([frame_id, -1, x1, y1, x2 - x1, y2 - y1, conf, cls, -1])
+                        detections.append([frame_id, -1, x1, y1, x2 - x1, y2 - y1, score, cls, -1])
 
             out_file = output_split_dir / f"{seq_name}.txt"
             if len(detections) > 0:
                 np.savetxt(out_file, np.array(detections), fmt='%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,%d,%d')
             else:
-                open(out_file, 'w').close()
+                out_file.write_text("", encoding="utf-8")

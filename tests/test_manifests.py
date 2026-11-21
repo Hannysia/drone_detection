@@ -8,6 +8,7 @@ import pytest
 from src.processing import manifests
 from src.processing.manifests import (
     CATEGORY_DIRS,
+    load_baseline_video_sequences,
     read_manifest,
     select_manifest_frames,
     write_manifest,
@@ -277,3 +278,59 @@ def test_select_manifest_frames_rejects_missing_file(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="missing.jpg"):
         select_manifest_frames(root, split="val", manifest_path=manifest_path)
+
+
+
+
+def test_load_baseline_video_sequences_groups_chronologically_and_tracks_gaps(tmp_path):
+    root = tmp_path / "baseline"
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0004.jpg", "split": "val", "category": "negative"},
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "val", "category": "positive"},
+        {"filename": "quad_rgb_sky_001_f0003.jpg", "split": "val", "category": "positive"},
+        {"filename": "no_drone_rgb_sky_002_f0005.jpg", "split": "val", "category": "negative"},
+        {"filename": "no_drone_rgb_sky_002_f0001.jpg", "split": "val", "category": "negative"},
+        {"filename": "quad_rgb_sky_003_f0001.jpg", "split": "train", "category": "positive"},
+    ]
+    for item in rows:
+        folder = root / item["split"] / CATEGORY_DIRS[item["category"]]
+        folder.mkdir(parents=True, exist_ok=True)
+        img = folder / item["filename"]
+        img.write_bytes(b"jpg")
+        if item["category"] == "positive":
+            img.with_suffix(".txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path, include_excluded=False)
+
+    sequences = load_baseline_video_sequences(root, split="val", manifest_path=manifest_path)
+
+    assert sorted(sequences) == ["no_drone_rgb_sky_002", "quad_rgb_sky_001"]
+    pos_seq = sequences["quad_rgb_sky_001"]
+    assert [f["source_frame"] for f in pos_seq] == [1, 3, 4]
+    assert [f["mot_frame"] for f in pos_seq] == [1, 2, 3]
+    assert [f["dt_frames"] for f in pos_seq] == [1, 2, 1]
+    assert pos_seq[0]["label_path"] is not None
+    assert pos_seq[2]["label_path"] is None
+
+    neg_seq = sequences["no_drone_rgb_sky_002"]
+    assert [f["source_frame"] for f in neg_seq] == [1, 5]
+    assert [f["dt_frames"] for f in neg_seq] == [1, 4]
+
+
+def test_load_baseline_video_sequences_rejects_duplicate_frame_numbers(tmp_path):
+    root = tmp_path / "baseline"
+    rows = [
+        {"filename": "quad_rgb_sky_001_f1.jpg", "split": "val", "category": "negative"},
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "val", "category": "negative"},
+    ]
+    folder = root / "val" / CATEGORY_DIRS["negative"]
+    folder.mkdir(parents=True, exist_ok=True)
+    for item in rows:
+        (folder / item["filename"]).write_bytes(b"jpg")
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(rows, manifest_path, include_excluded=False)
+
+    with pytest.raises(ValueError, match="Duplicate frame number"):
+        load_baseline_video_sequences(root, split="val", manifest_path=manifest_path)
