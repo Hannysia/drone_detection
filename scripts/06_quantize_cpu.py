@@ -1,13 +1,17 @@
 import argparse
 import logging
+import os
 from pathlib import Path
 import sys
 
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 from src import config
 from src.config import MANIFESTS_DIR, QUANTIZATION_RESOLUTIONS
 from src.processing.quantization import (
+    ALL_STAGES,
     DEFAULT_CALIBRATION_IMAGES,
     run_cpu_quantization_ablation,
 )
@@ -18,6 +22,7 @@ log = logging.getLogger(__name__)
 _SUMMARY_COLUMNS = (
     "imgsz",
     "stage",
+    "status",
     "size_mb",
     "compute_mean_ms",
     "compute_fps",
@@ -106,6 +111,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-benchmark", type=int, default=100)
     parser.add_argument("--collection-conf", type=float, default=0.01)
     parser.add_argument(
+        "--stages",
+        nargs="+",
+        choices=ALL_STAGES,
+        default=list(ALL_STAGES),
+        help="Subset of pipeline stages to run.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse valid exported artifacts and skip completed stages from checkpoint metadata.",
+    )
+    parser.add_argument(
+        "--skip-existing-exports",
+        action="store_true",
+        help="Reuse valid exported models already present on disk without re-exporting.",
+    )
+    parser.add_argument(
         "--eval-pytorch",
         action="store_true",
         help="Also run full CPU evaluation for baseline PyTorch FP32 weights.",
@@ -159,33 +181,63 @@ def main(argv: list[str] | None = None) -> int:
     else:
         source_path = MANIFESTS_DIR / "sources" / "hf.json"
 
-    result = run_cpu_quantization_ablation(
-        dataset_root,
-        weights_path=args.weights,
-        quantization_dir=args.quantization_dir,
-        working_dir=args.working_dir,
-        resolutions=tuple(args.resolutions),
-        eval_split=args.split,
-        eval_pytorch=args.eval_pytorch,
-        max_calibration_images=args.calibration_images,
-        calibrate_method=args.calibrate_method,
-        seed=args.seed,
-        n_warmup=args.n_warmup,
-        n_benchmark=args.n_benchmark,
-        collection_conf=args.collection_conf,
-        manifest_path=args.manifest_path,
-        source_path=source_path,
-        upload_to_hf=args.upload,
-        hf_tag=args.hf_tag,
+    target_quant_dir = (
+        Path(args.quantization_dir)
+        if args.quantization_dir is not None
+        else config.QUANTIZATION_DIR
     )
+    log_path = target_quant_dir / "reports" / args.split / "quantize_cpu.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root_logger = logging.getLogger()
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    root_logger.addHandler(file_handler)
 
-    df = result["results_df"]
-    cols = [col for col in _SUMMARY_COLUMNS if col in df.columns]
-    if cols:
-        log.info("\n%s", df[cols].to_string(index=False))
-    log.info("CSV report: %s", result["csv_path"])
-    log.info("Metadata JSON: %s", result["metadata_path"])
-    return 0
+    try:
+        result = run_cpu_quantization_ablation(
+            dataset_root,
+            weights_path=args.weights,
+            quantization_dir=target_quant_dir,
+            working_dir=args.working_dir,
+            resolutions=tuple(args.resolutions),
+            stages=tuple(dict.fromkeys(args.stages)),
+            eval_split=args.split,
+            eval_pytorch=args.eval_pytorch,
+            resume=args.resume,
+            skip_existing_exports=args.skip_existing_exports,
+            max_calibration_images=args.calibration_images,
+            calibrate_method=args.calibrate_method,
+            seed=args.seed,
+            n_warmup=args.n_warmup,
+            n_benchmark=args.n_benchmark,
+            collection_conf=args.collection_conf,
+            manifest_path=args.manifest_path,
+            source_path=source_path,
+            upload_to_hf=args.upload,
+            hf_tag=args.hf_tag,
+        )
+
+        df = result["results_df"]
+        cols = [col for col in _SUMMARY_COLUMNS if col in df.columns]
+        if cols:
+            log.info("\n%s", df[cols].to_string(index=False))
+        log.info("CSV report: %s", result["csv_path"])
+        log.info("Metadata JSON: %s", result["metadata_path"])
+        log.info("Log file: %s", log_path)
+
+        failed = result.get("failed_stages") or []
+        if failed:
+            failed_names = " ".join(sorted({item["stage"] for item in failed}))
+            log.error(
+                "Some stages failed. Re-run safely with: .venv\\Scripts\\python.exe scripts\\06_quantize_cpu.py --split %s --resume --stages %s",
+                args.split,
+                failed_names,
+            )
+            return 1
+        return 0
+    finally:
+        root_logger.removeHandler(file_handler)
+        file_handler.close()
 
 
 if __name__ == "__main__":

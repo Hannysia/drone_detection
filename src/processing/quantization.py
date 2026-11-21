@@ -5,17 +5,22 @@ import json
 import logging
 import math
 import os
+
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 import platform
+import queue
 import random
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import cv2
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, constants as hf_constants, hf_hub_download
 import numpy as np
 import onnx
 import pandas as pd
@@ -36,7 +41,8 @@ from src.config import (
 from src.processing.dataset import parse_frame_filename_logic
 from src.processing.diagnostics import letterbox_image
 from src.processing.evaluation import (
-    evaluate_model,
+    _collect_matched_detections,
+    _compute_average_precision,
     evaluate_predictions,
     evaluate_threshold_free_slices,
     run_dataset_predictions_db,
@@ -47,7 +53,6 @@ from src.processing.yolo_dataset import (
     _remove_existing_path,
     _validate_run_name,
     cleanup_yolo_dataset,
-    prepare_yolo_dataset,
 )
 from src.utils.io import parse_frame_name, parse_video_id
 
@@ -55,6 +60,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CALIBRATION_IMAGES = 300
 MAX_ONNX_IR_VERSION = 10
+HF_UPLOAD_TIMEOUT_SECONDS = 180.0
+ALL_STAGES = (
+    "pytorch_fp32",
+    "onnx_fp32",
+    "onnx_int8",
+    "openvino_fp32",
+    "openvino_int8",
+)
 
 _HEAD_PREFIX_RE = re.compile(r"(/?model\.(\d+))(?=/|\.)")
 _POSTPROCESS_OP_TYPES = frozenset({"TopK", "Mod", "NonMaxSuppression"})
@@ -460,7 +473,11 @@ def _extract_detect_head_prefix(model_proto: onnx.ModelProto) -> str | None:
     return max(pool, key=lambda prefix: candidates[prefix][0])
 
 
-def select_onnx_nodes_to_exclude(model_proto: onnx.ModelProto) -> list[str]:
+def select_onnx_nodes_to_exclude(
+    model_proto: onnx.ModelProto,
+    *,
+    exclude_head_convs: bool = False,
+) -> list[str]:
     """Selects Detect head decode, DFL, Sigmoid, and end2end TopK nodes to keep in FP32."""
     head_prefix = _extract_detect_head_prefix(model_proto)
     excluded = []
@@ -478,7 +495,7 @@ def select_onnx_nodes_to_exclude(model_proto: onnx.ModelProto) -> list[str]:
 
         if node.op_type in _POSTPROCESS_OP_TYPES or is_dfl:
             excluded.append(name)
-        elif in_head and node.op_type in _SENSITIVE_HEAD_OP_TYPES:
+        elif in_head and (exclude_head_convs or node.op_type in _SENSITIVE_HEAD_OP_TYPES):
             excluded.append(name)
         elif head_prefix is None and (
             node.op_type in _FALLBACK_SENSITIVE_OP_TYPES or "postprocess" in lowered
@@ -567,8 +584,10 @@ def quantize_onnx_int8(
     *,
     imgsz: int,
     calibrate_method: str = "MinMax",
+    exclude_head_convs: bool = False,
 ) -> Path:
     """Quantizes an ONNX FP32 model to QDQ INT8 with end2end head exclusion and ARM64 parity."""
+    import onnxruntime as ort
     from onnxruntime.quantization import CalibrationMethod, QuantFormat, QuantType, quantize_static
 
     if not onnx_fp32_path.is_file():
@@ -595,7 +614,10 @@ def quantize_onnx_int8(
         tmp_root = Path(tmp_dir)
         pre_path = _preprocess_onnx_for_quantization(onnx_fp32_path, tmp_root / "pre.onnx")
         pre_model = onnx.load(str(pre_path))
-        nodes_to_exclude = select_onnx_nodes_to_exclude(pre_model)
+        nodes_to_exclude = select_onnx_nodes_to_exclude(
+            pre_model,
+            exclude_head_convs=exclude_head_convs,
+        )
         reader = _build_calibration_reader(calibration_images, imgsz, input_name)
 
         tmp_int8 = tmp_root / output_path.name
@@ -617,16 +639,50 @@ def quantize_onnx_int8(
             raise FileNotFoundError(f"Quantized ONNX INT8 output was not created: {tmp_int8}")
 
         _copy_onnx_metadata_and_ir(source_model, tmp_int8)
+        ort.InferenceSession(str(tmp_int8), providers=["CPUExecutionProvider"])
         _move_artifact(tmp_int8, output_path)
 
     log.info(
-        "Exported ONNX INT8 (%s, excluded %d head nodes) -> %s",
+        "Exported ONNX INT8 (%s, exclude_head_convs=%s, excluded %d nodes) -> %s",
         calibrate_method,
+        exclude_head_convs,
         len(nodes_to_exclude),
         output_path,
     )
     return output_path
 
+
+def _quantize_onnx_with_fallback(
+    onnx_fp32_path: Path,
+    output_path: Path,
+    calibration_images: list[Path],
+    *,
+    imgsz: int,
+    calibrate_method: str,
+) -> tuple[Path, list[str], bool]:
+    try:
+        out = quantize_onnx_int8(
+            onnx_fp32_path,
+            output_path,
+            calibration_images,
+            imgsz=imgsz,
+            calibrate_method=calibrate_method,
+            exclude_head_convs=False,
+        )
+        excluded = select_onnx_nodes_to_exclude(onnx.load(str(onnx_fp32_path)), exclude_head_convs=False)
+        return out, excluded, False
+    except Exception as exc:
+        log.warning("ONNX INT8 failed (%s); retrying with full Detect head excluded.", exc)
+        out = quantize_onnx_int8(
+            onnx_fp32_path,
+            output_path,
+            calibration_images,
+            imgsz=imgsz,
+            calibrate_method=calibrate_method,
+            exclude_head_convs=True,
+        )
+        excluded = select_onnx_nodes_to_exclude(onnx.load(str(onnx_fp32_path)), exclude_head_convs=True)
+        return out, excluded, True
 
 def _export_openvino_variant(
     pt_path: Path,
@@ -736,6 +792,83 @@ def export_stage_models(
         "openvino_int8": ov_int8,
     }
 
+
+def _is_valid_stage_artifact(stage_name: str, artifact_path: Path) -> bool:
+    if stage_name in {"openvino_fp32", "openvino_int8"}:
+        try:
+            _validate_openvino_dir(artifact_path)
+            return True
+        except FileNotFoundError:
+            return False
+    return artifact_path.is_file() and artifact_path.stat().st_size > 0
+
+
+def _export_single_stage(
+    stage_name: str,
+    weights_path: Path,
+    quantization_dir: Path,
+    calibration_images: list[Path],
+    calibration_yaml: Path,
+    *,
+    imgsz: int,
+    model_stem: str = YOLO_MODEL_STEM,
+    calibrate_method: str = "MinMax",
+    skip_existing: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    paths = get_quantized_model_paths(Path(quantization_dir), imgsz, model_stem=model_stem)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+    meta_info: dict[str, object] = {}
+
+    if stage_name == "pytorch_fp32":
+        if not skip_existing or not _is_valid_stage_artifact(stage_name, paths["pt"]):
+            if weights_path.resolve() != paths["pt"].resolve():
+                shutil.copy2(weights_path, paths["pt"])
+        return paths["pt"], meta_info
+
+    if stage_name == "onnx_fp32":
+        if skip_existing and _is_valid_stage_artifact("onnx_fp32", paths["onnx_fp32"]):
+            return paths["onnx_fp32"], meta_info
+        return export_onnx_fp32(weights_path, paths["onnx_fp32"], imgsz=imgsz), meta_info
+
+    if stage_name == "onnx_int8":
+        if not _is_valid_stage_artifact("onnx_fp32", paths["onnx_fp32"]) or not skip_existing:
+            if not _is_valid_stage_artifact("onnx_fp32", paths["onnx_fp32"]):
+                export_onnx_fp32(weights_path, paths["onnx_fp32"], imgsz=imgsz)
+        if skip_existing and _is_valid_stage_artifact("onnx_int8", paths["onnx_int8"]):
+            excluded = select_onnx_nodes_to_exclude(onnx.load(str(paths["onnx_fp32"])))
+            meta_info["excluded_nodes"] = excluded
+            meta_info["onnx_fallback_full_head"] = False
+            return paths["onnx_int8"], meta_info
+        out_path, excluded, used_fallback = _quantize_onnx_with_fallback(
+            paths["onnx_fp32"],
+            paths["onnx_int8"],
+            calibration_images,
+            imgsz=imgsz,
+            calibrate_method=calibrate_method,
+        )
+        meta_info["excluded_nodes"] = excluded
+        meta_info["onnx_fallback_full_head"] = used_fallback
+        return out_path, meta_info
+
+    if stage_name == "openvino_fp32":
+        if skip_existing and _is_valid_stage_artifact("openvino_fp32", paths["openvino_fp32"]):
+            return paths["openvino_fp32"], meta_info
+        return export_openvino_fp32(weights_path, paths["openvino_fp32"], imgsz=imgsz), meta_info
+
+    if stage_name == "openvino_int8":
+        if skip_existing and _is_valid_stage_artifact("openvino_int8", paths["openvino_int8"]):
+            return paths["openvino_int8"], meta_info
+        return (
+            export_openvino_int8(
+                weights_path,
+                paths["openvino_int8"],
+                calibration_yaml,
+                imgsz=imgsz,
+            ),
+            meta_info,
+        )
+
+    raise ValueError(f"Unknown quantization stage: {stage_name!r}")
 
 
 _INT8_TO_FP32_BASELINE = {
@@ -1082,11 +1215,36 @@ def _compute_raw_detection_diagnostics(
     }
 
 
+def _filter_raw_database(raw_database: list[dict], min_conf: float) -> list[dict]:
+    return [
+        {
+            **entry,
+            "pred_boxes": [box for box in entry["pred_boxes"] if float(box[4]) >= min_conf],
+        }
+        for entry in raw_database
+    ]
+
+
+def _compute_coco_map_metrics(raw_database: list[dict]) -> tuple[float, float]:
+    aps = []
+    for iou in np.round(np.linspace(0.50, 0.95, 10), 2):
+        gt_scale_counts, scores_arr, tps_arr, _, _ = _collect_matched_detections(
+            raw_database,
+            float(iou),
+        )
+        total_gt = sum(gt_scale_counts.values())
+        ap = _compute_average_precision(scores_arr, tps_arr, total_gt)
+        if math.isnan(ap):
+            return float("nan"), float("nan")
+        aps.append(ap)
+    return float(aps[0]), float(np.mean(aps))
+
+
 def evaluate_quantized_stage(
     artifact_path: Path,
     dataset_root: Path,
-    eval_yaml: Path,
-    stage_name: str,
+    eval_yaml: Path | None = None,
+    stage_name: str = "model",
     *,
     imgsz: int,
     eval_split: str = "val",
@@ -1094,36 +1252,27 @@ def evaluate_quantized_stage(
     manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
     source_path: Path | None = None,
 ) -> dict[str, object]:
-    """Runs threshold-free CPU evaluation (mAP slices + small/negative metrics) without F0.5 search."""
+    """Runs single-pass threshold-free CPU evaluation (mAP50/50-95 + scale/negative metrics)."""
     if eval_split not in {"val", "test"}:
         raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
 
-    val_metrics = evaluate_model(
-        Path(artifact_path),
-        Path(eval_yaml),
-        run_name=f"{stage_name}_{imgsz}",
-        split=eval_split,
-        imgsz=imgsz,
-        batch=1,
-        conf=None,
-        device="cpu",
-        plots=False,
-    )
-
     yolo_model = _load_yolo_for_artifact(Path(artifact_path))
+    raw_conf = min(float(collection_conf), 0.001)
     raw_db = run_dataset_predictions_db(
         yolo_model,
         Path(dataset_root),
         imgsz=imgsz,
-        collection_conf=collection_conf,
+        collection_conf=raw_conf,
         split=eval_split,
         manifest_path=manifest_path,
         source_path=source_path,
         allowed_splits=("val", "test"),
         device="cpu",
     )
+    map50, map50_95 = _compute_coco_map_metrics(raw_db)
+    slice_db = _filter_raw_database(raw_db, collection_conf) if raw_conf < collection_conf else raw_db
     tf_report = evaluate_threshold_free_slices(
-        raw_db,
+        slice_db,
         iou_threshold=0.5,
         target_recall=0.85,
         max_neg_fpr=5.0,
@@ -1131,11 +1280,11 @@ def evaluate_quantized_stage(
     summary = tf_report["summary"].iloc[0]
     by_scale_df = tf_report["by_scale"]
     by_scale_idx = by_scale_df.set_index("Scale")
-    tp_diag = _compute_raw_detection_diagnostics(raw_db)
+    tp_diag = _compute_raw_detection_diagnostics(slice_db)
 
     metrics = {
-        "mAP50": float(val_metrics.get("metrics/mAP50(B)", float("nan"))),
-        "mAP50-95": float(val_metrics.get("metrics/mAP50-95(B)", float("nan"))),
+        "mAP50": map50,
+        "mAP50-95": map50_95,
         "AP50": float(summary["AP50"]),
         "AP50_small": float(summary["AP50_small"]),
         "AP50_medium": float(summary["AP50_medium"]),
@@ -1196,6 +1345,28 @@ def _empty_eval_metrics() -> dict[str, float]:
     }
 
 
+def _empty_benchmark_metrics() -> dict[str, float]:
+    nan = float("nan")
+    return {
+        "compute_mean_ms": nan,
+        "compute_std_ms": nan,
+        "compute_p50_ms": nan,
+        "compute_p95_ms": nan,
+        "compute_p99_ms": nan,
+        "compute_fps": nan,
+        "compute_fps_p50": nan,
+        "e2e_mean_ms": nan,
+        "e2e_std_ms": nan,
+        "e2e_p50_ms": nan,
+        "e2e_p95_ms": nan,
+        "e2e_p99_ms": nan,
+        "e2e_fps": nan,
+        "e2e_fps_p50": nan,
+        "rss_mb": nan,
+        "peak_rss_mb": nan,
+    }
+
+
 def _safe_diff(a: float, b: float) -> float:
     return float(a - b) if not (math.isnan(a) or math.isnan(b)) else float("nan")
 
@@ -1214,9 +1385,11 @@ def _annotate_ablation_deltas(rows: list[dict[str, object]]) -> pd.DataFrame:
         item = dict(row)
         imgsz = int(row["imgsz"])
         stage = str(row["stage"])
-        pt_ref = by_key.get((imgsz, "pytorch_fp32"))
+        pt_raw = by_key.get((imgsz, "pytorch_fp32"))
+        pt_ref = pt_raw if pt_raw is not None and pt_raw.get("status", "ok") == "ok" else None
         fp32_name = _INT8_TO_FP32_BASELINE.get(stage)
-        fp32_ref = by_key.get((imgsz, fp32_name)) if fp32_name else None
+        fp32_raw = by_key.get((imgsz, fp32_name)) if fp32_name else None
+        fp32_ref = fp32_raw if fp32_raw is not None and fp32_raw.get("status", "ok") == "ok" else None
 
         item["speedup_compute_vs_pt"] = (
             _safe_ratio(float(pt_ref["compute_mean_ms"]), float(item["compute_mean_ms"]))
@@ -1304,6 +1477,45 @@ def save_quantization_reports(
     return csv_path, metadata_path
 
 
+def _disable_hf_xet() -> None:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    hf_constants.HF_HUB_DISABLE_XET = True
+
+
+def _prepare_hf_upload_client(
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> tuple[str, HfApi]:
+    _disable_hf_xet()
+    target_repo, target_token = verify_hf_access(repo_id=repo_id, token=token)
+    return target_repo, HfApi(token=target_token)
+
+
+def _run_with_timeout(fn, timeout_seconds: float | None, *args, **kwargs):
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return fn(*args, **kwargs)
+
+    outcome: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            outcome.put((True, fn(*args, **kwargs)))
+        except BaseException as exc:
+            outcome.put((False, exc))
+
+    worker = threading.Thread(target=_worker, name="hf-upload-worker", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"Timed out after {timeout_seconds:.0f}s")
+
+    ok, payload = outcome.get_nowait()
+    if not ok:
+        assert isinstance(payload, BaseException)
+        raise payload
+    return payload
+
+
 def upload_quantization_artifacts_to_hf(
     quantization_dir: Path,
     *,
@@ -1315,7 +1527,7 @@ def upload_quantization_artifacts_to_hf(
     token: str | None = None,
 ) -> None:
     """Uploads only quantized INT8 models (ONNX + OpenVINO) and split reports to HF."""
-    target_repo, target_token = verify_hf_access(repo_id=repo_id, token=token)
+    target_repo, api = _prepare_hf_upload_client(repo_id=repo_id, token=token)
     quantization_dir = Path(quantization_dir)
 
     allow_patterns = [f"reports/{eval_split}/**"]
@@ -1334,8 +1546,6 @@ def upload_quantization_artifacts_to_hf(
         _validate_openvino_dir(paths["openvino_int8"])
         allow_patterns.append(f"{imgsz}/{paths['onnx_int8'].name}")
         allow_patterns.append(f"{imgsz}/{paths['openvino_int8'].name}/**")
-
-    api = HfApi(token=target_token)
     api.upload_folder(
         folder_path=str(quantization_dir),
         path_in_repo="models/quantization",
@@ -1352,6 +1562,158 @@ def upload_quantization_artifacts_to_hf(
         )
 
 
+def upload_single_quantized_artifact_to_hf(
+    artifact_path: Path,
+    imgsz: int,
+    stage_name: str,
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> None:
+    """Immediately uploads a single quantized INT8 model (file or OpenVINO dir) to HF."""
+    target_repo, api = _prepare_hf_upload_client(repo_id=repo_id, token=token)
+    artifact_path = Path(artifact_path)
+    path_in_repo = f"models/quantization/{imgsz}/{artifact_path.name}"
+    commit_msg = f"Upload {stage_name} ({imgsz}) quantized model"
+
+    if artifact_path.is_dir():
+        _validate_openvino_dir(artifact_path)
+        api.upload_folder(
+            folder_path=str(artifact_path),
+            path_in_repo=path_in_repo,
+            repo_id=target_repo,
+            repo_type="dataset",
+            commit_message=commit_msg,
+        )
+        return
+
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"Quantized artifact not found for HF upload: {artifact_path}")
+    api.upload_file(
+        path_or_fileobj=str(artifact_path),
+        path_in_repo=path_in_repo,
+        repo_id=target_repo,
+        repo_type="dataset",
+        commit_message=commit_msg,
+    )
+
+
+def upload_quantization_reports_to_hf(
+    quantization_dir: Path,
+    *,
+    eval_split: str,
+    tag: str | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> None:
+    """Uploads split CSV, JSON metadata, and logs under models/quantization/reports/<split>."""
+    target_repo, api = _prepare_hf_upload_client(repo_id=repo_id, token=token)
+    report_dir = Path(quantization_dir) / "reports" / eval_split
+    for name in ("ablation_results.csv", "quantization_metadata.json"):
+        if not (report_dir / name).is_file():
+            raise FileNotFoundError(f"Report file missing for HF upload: {report_dir / name}")
+
+    api.upload_folder(
+        folder_path=str(report_dir),
+        path_in_repo=f"models/quantization/reports/{eval_split}",
+        repo_id=target_repo,
+        repo_type="dataset",
+        commit_message=f"Upload {eval_split} quantization reports",
+    )
+    if tag is not None and tag.strip():
+        api.create_tag(
+            repo_id=target_repo,
+            tag=tag.strip(),
+            repo_type="dataset",
+        )
+
+
+def _try_hf_operation(
+    action_name: str,
+    fn,
+    *args,
+    timeout_seconds: float | None = HF_UPLOAD_TIMEOUT_SECONDS,
+    **kwargs,
+) -> bool:
+    try:
+        _disable_hf_xet()
+        _run_with_timeout(fn, timeout_seconds, *args, **kwargs)
+        return True
+    except (ValueError, PermissionError):
+        raise
+    except Exception as exc:
+        log.warning("HF %s failed (%s); continuing locally.", action_name, exc)
+        return False
+
+
+def _load_resume_checkpoint(
+    quantization_dir: Path,
+    eval_split: str,
+    *,
+    source_sha256: str,
+    max_calibration_images: int,
+    seed: int,
+    calibrate_method: str,
+) -> tuple[
+    dict[tuple[int, str], dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[str, list[str]],
+    dict[str, bool],
+]:
+    meta_path = Path(quantization_dir) / "reports" / eval_split / "quantization_metadata.json"
+    if not meta_path.is_file():
+        return {}, {}, {}, {}
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Could not parse checkpoint metadata %s (%s); starting fresh.", meta_path, exc)
+        return {}, {}, {}, {}
+
+    cal = meta.get("calibration") or {}
+    onnx_cfg = meta.get("onnx_quantization") or {}
+    if (
+        meta.get("source_weights_sha256") != source_sha256
+        or cal.get("max_images") != max_calibration_images
+        or cal.get("seed") != seed
+        or onnx_cfg.get("calibrate_method") != calibrate_method
+    ):
+        log.warning("Resume checkpoint config mismatch in %s; starting fresh.", meta_path)
+        return {}, {}, {}, {}
+
+    rows_by_key: dict[tuple[int, str], dict[str, object]] = {}
+    for row in meta.get("summary_rows") or []:
+        if row.get("status") != "ok":
+            continue
+        artifact = Path(str(row.get("artifact", "")))
+        stage_name = str(row["stage"])
+        if not _is_valid_stage_artifact(stage_name, artifact):
+            continue
+        cleaned_row = {
+            k: (
+                float("nan")
+                if v is None and k not in {"artifact", "error", "stage", "status", "hf_uploaded"}
+                else v
+            )
+            for k, v in row.items()
+        }
+        rows_by_key[(int(row["imgsz"]), stage_name)] = cleaned_row
+
+    details = dict(meta.get("stage_details") or {})
+    excluded = dict(onnx_cfg.get("excluded_nodes_by_resolution") or {})
+    fallbacks = dict(onnx_cfg.get("fallback_full_head_by_resolution") or {})
+    return rows_by_key, details, excluded, fallbacks
+
+
+def _ordered_rows_snapshot(rows_by_key: dict[tuple[int, str], dict[str, object]]) -> list[dict[str, object]]:
+    def _sort_key(key: tuple[int, str]) -> tuple[int, int, str]:
+        imgsz, stage_name = key
+        idx = ALL_STAGES.index(stage_name) if stage_name in ALL_STAGES else len(ALL_STAGES)
+        return -imgsz, idx, stage_name
+
+    return [rows_by_key[key] for key in sorted(rows_by_key, key=_sort_key)]
+
+
 def run_cpu_quantization_ablation(
     dataset_root: Path,
     *,
@@ -1359,8 +1721,11 @@ def run_cpu_quantization_ablation(
     quantization_dir: Path | None = None,
     working_dir: Path | None = None,
     resolutions: tuple[int, ...] = QUANTIZATION_RESOLUTIONS,
+    stages: tuple[str, ...] = ALL_STAGES,
     eval_split: str = "val",
     eval_pytorch: bool = False,
+    resume: bool = False,
+    skip_existing_exports: bool = False,
     max_calibration_images: int = DEFAULT_CALIBRATION_IMAGES,
     calibrate_method: str = "MinMax",
     seed: int = 42,
@@ -1375,14 +1740,22 @@ def run_cpu_quantization_ablation(
     repo_id: str | None = None,
     token: str | None = None,
 ) -> dict[str, object]:
-    """Runs end-to-end CPU quantization, benchmark, threshold-free ablation, and reporting."""
+    """Runs resumable single-pass CPU quantization, benchmark, threshold-free eval, and checkpoints."""
     if eval_split not in {"val", "test"}:
         raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
     if not resolutions or any(r <= 0 for r in resolutions):
         raise ValueError(f"resolutions must be non-empty positive ints, got {resolutions!r}")
+    if not stages or any(s not in ALL_STAGES for s in stages):
+        raise ValueError(f"Invalid stages {stages!r}; expected subset of {ALL_STAGES}")
 
     if upload_to_hf:
-        verify_hf_access(repo_id=repo_id, token=token)
+        _try_hf_operation(
+            "preflight check",
+            verify_hf_access,
+            repo_id=repo_id,
+            token=token,
+            timeout_seconds=min(30.0, HF_UPLOAD_TIMEOUT_SECONDS),
+        )
 
     target_quant_dir = Path(quantization_dir) if quantization_dir is not None else config.QUANTIZATION_DIR
     target_working_dir = Path(working_dir) if working_dir is not None else config.WORKING_DIR
@@ -1393,9 +1766,25 @@ def run_cpu_quantization_ablation(
         repo_id=repo_id,
         token=token,
     )
+    source_sha256 = _file_sha256(source_pt)
 
+    rows_by_key: dict[tuple[int, str], dict[str, object]] = {}
+    per_stage_details: dict[str, dict[str, object]] = {}
+    onnx_excluded_nodes: dict[str, list[str]] = {}
+    onnx_fallback_flags: dict[str, bool] = {}
+
+    if resume:
+        rows_by_key, per_stage_details, onnx_excluded_nodes, onnx_fallback_flags = _load_resume_checkpoint(
+            target_quant_dir,
+            eval_split,
+            source_sha256=source_sha256,
+            max_calibration_images=max_calibration_images,
+            seed=seed,
+            calibrate_method=calibrate_method,
+        )
+
+    effective_skip_exports = resume or skip_existing_exports
     cal_run_name = "calibration_ptq"
-    eval_run_name = "quantization_eval"
     calibration_yaml, calibration_images = prepare_calibration_dataset(
         Path(dataset_root),
         target_working_dir,
@@ -1407,144 +1796,220 @@ def run_cpu_quantization_ablation(
         overwrite=True,
     )
 
-    rows: list[dict[str, object]] = []
     artifacts_by_res: dict[int, dict[str, Path]] = {}
-    onnx_excluded_nodes: dict[str, list[str]] = {}
-    per_stage_details: dict[str, dict[str, object]] = {}
+
+    def _build_metadata(results_df: pd.DataFrame, *, complete: bool, failed_items: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "source_weights": str(source_pt),
+            "source_weights_sha256": source_sha256,
+            "eval_split": eval_split,
+            "eval_pytorch": eval_pytorch,
+            "resolutions": list(resolutions),
+            "stages": list(stages),
+            "collection_conf": collection_conf,
+            "complete": complete,
+            "failed_stages": failed_items,
+            "benchmark": {
+                "n_warmup": n_warmup,
+                "n_benchmark": n_benchmark,
+                "split": eval_split,
+            },
+            "calibration": {
+                "manifest_path": str(manifest_path),
+                "max_images": max_calibration_images,
+                "actual_images": len(calibration_images),
+                "seed": seed,
+                "filenames": [path.name for path in calibration_images],
+            },
+            "onnx_quantization": {
+                "format": "QDQ",
+                "activation_type": "QUInt8",
+                "weight_type": "QInt8",
+                "per_channel": True,
+                "reduce_range": False,
+                "calibrate_method": calibrate_method,
+                "excluded_nodes_by_resolution": onnx_excluded_nodes,
+                "fallback_full_head_by_resolution": onnx_fallback_flags,
+            },
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "cpu_count": os.cpu_count(),
+                "packages": _extract_runtime_versions(),
+            },
+            "stage_details": per_stage_details,
+            "summary_rows": results_df.to_dict(orient="records"),
+        }
+
+    def _save_checkpoint(
+        *,
+        complete: bool | None = None,
+    ) -> tuple[pd.DataFrame, list[dict[str, object]], Path, Path]:
+        snapshot = _ordered_rows_snapshot(rows_by_key)
+        snapshot_df = _annotate_ablation_deltas(snapshot)
+        failed_items = [
+            {"imgsz": int(r["imgsz"]), "stage": str(r["stage"]), "error": str(r.get("error", ""))}
+            for r in snapshot
+            if r.get("status") != "ok"
+        ]
+        is_complete = (len(failed_items) == 0) if complete is None else complete
+        saved_csv, saved_meta = save_quantization_reports(
+            snapshot_df,
+            target_quant_dir,
+            _build_metadata(snapshot_df, complete=is_complete, failed_items=failed_items),
+            eval_split=eval_split,
+        )
+        return snapshot_df, failed_items, saved_csv, saved_meta
 
     try:
-        eval_yaml = prepare_yolo_dataset(
-            Path(dataset_root),
-            target_working_dir,
-            eval_run_name,
-            use_negatives=True,
-            manifest_path=manifest_path,
-            source_path=source_path,
-            overwrite=True,
-        )
-
         for imgsz in resolutions:
-            stages = export_stage_models(
-                source_pt,
-                target_quant_dir,
-                calibration_images,
-                calibration_yaml,
-                imgsz=imgsz,
-                model_stem=model_stem,
-                calibrate_method=calibrate_method,
-            )
-            artifacts_by_res[imgsz] = stages
-            onnx_fp32_proto = onnx.load(str(stages["onnx_fp32"]))
-            onnx_excluded_nodes[str(imgsz)] = select_onnx_nodes_to_exclude(onnx_fp32_proto)
+            artifacts_by_res.setdefault(imgsz, {})
+            bgr_frames = None
+            nchw_tensors = None
 
-            bgr_frames, nchw_tensors = _load_benchmark_frames(
-                Path(dataset_root),
-                eval_split,
-                imgsz,
-                max_frames=max(n_benchmark, 50),
-                manifest_path=manifest_path,
-                source_path=source_path,
-            )
-
-            for stage_name, artifact_path in stages.items():
-                size_mb = get_artifact_size_mb(artifact_path)
-                bench = benchmark_stage_model(
-                    artifact_path,
-                    bgr_frames,
-                    nchw_tensors,
-                    imgsz=imgsz,
-                    n_warmup=n_warmup,
-                    n_benchmark=n_benchmark,
-                )
-
-                if stage_name != "pytorch_fp32" or eval_pytorch:
-                    eval_data = evaluate_quantized_stage(
-                        artifact_path,
+            for stage_name in stages:
+                is_int8_stage = stage_name in {"onnx_int8", "openvino_int8"}
+                if (imgsz, stage_name) in rows_by_key:
+                    existing_row = rows_by_key[(imgsz, stage_name)]
+                    existing_artifact = Path(str(existing_row["artifact"]))
+                    artifacts_by_res[imgsz][stage_name] = existing_artifact
+                    if upload_to_hf and is_int8_stage and not bool(existing_row.get("hf_uploaded", False)):
+                        existing_row["hf_uploaded"] = _try_hf_operation(
+                            f"upload {stage_name} ({imgsz})",
+                            upload_single_quantized_artifact_to_hf,
+                            existing_artifact,
+                            imgsz,
+                            stage_name,
+                            repo_id=repo_id,
+                            token=token,
+                            timeout_seconds=HF_UPLOAD_TIMEOUT_SECONDS,
+                        )
+                        _save_checkpoint(complete=False)
+                    log.info("[SKIP-RESUME] imgsz=%d stage=%s", imgsz, stage_name)
+                    continue
+                if bgr_frames is None:
+                    bgr_frames, nchw_tensors = _load_benchmark_frames(
                         Path(dataset_root),
-                        eval_yaml,
-                        stage_name,
-                        imgsz=imgsz,
-                        eval_split=eval_split,
-                        collection_conf=collection_conf,
+                        eval_split,
+                        imgsz,
+                        max_frames=max(n_benchmark, 50),
                         manifest_path=manifest_path,
                         source_path=source_path,
                     )
-                    eval_metrics = eval_data["metrics"]
-                    per_stage_details[f"{stage_name}_{imgsz}"] = {
-                        "by_scale": eval_data["by_scale"],
-                        "curves": eval_data["curves"],
-                    }
-                else:
-                    eval_metrics = _empty_eval_metrics()
 
-                rows.append({
-                    "imgsz": imgsz,
-                    "stage": stage_name,
-                    "artifact": str(artifact_path),
-                    "size_mb": size_mb,
-                    **bench,
-                    **eval_metrics,
-                })
+                try:
+                    artifact_path, stage_meta = _export_single_stage(
+                        stage_name,
+                        source_pt,
+                        target_quant_dir,
+                        calibration_images,
+                        calibration_yaml,
+                        imgsz=imgsz,
+                        model_stem=model_stem,
+                        calibrate_method=calibrate_method,
+                        skip_existing=effective_skip_exports,
+                    )
+                    artifacts_by_res[imgsz][stage_name] = artifact_path
+                    if "excluded_nodes" in stage_meta:
+                        onnx_excluded_nodes[str(imgsz)] = list(stage_meta["excluded_nodes"])
+                    if "onnx_fallback_full_head" in stage_meta:
+                        onnx_fallback_flags[str(imgsz)] = bool(stage_meta["onnx_fallback_full_head"])
+
+                    size_mb = get_artifact_size_mb(artifact_path)
+                    bench = benchmark_stage_model(
+                        artifact_path,
+                        bgr_frames,
+                        nchw_tensors,
+                        imgsz=imgsz,
+                        n_warmup=n_warmup,
+                        n_benchmark=n_benchmark,
+                    )
+
+                    if stage_name != "pytorch_fp32" or eval_pytorch:
+                        eval_data = evaluate_quantized_stage(
+                            artifact_path,
+                            Path(dataset_root),
+                            None,
+                            stage_name,
+                            imgsz=imgsz,
+                            eval_split=eval_split,
+                            collection_conf=collection_conf,
+                            manifest_path=manifest_path,
+                            source_path=source_path,
+                        )
+                        eval_metrics = eval_data["metrics"]
+                        per_stage_details[f"{stage_name}_{imgsz}"] = {
+                            "by_scale": eval_data["by_scale"],
+                            "curves": eval_data["curves"],
+                        }
+                    else:
+                        eval_metrics = _empty_eval_metrics()
+
+                    rows_by_key[(imgsz, stage_name)] = {
+                        "imgsz": imgsz,
+                        "stage": stage_name,
+                        "status": "ok",
+                        "hf_uploaded": False,
+                        "error": "",
+                        "artifact": str(artifact_path),
+                        "size_mb": size_mb,
+                        **bench,
+                        **eval_metrics,
+                    }
+
+                    log.info(
+                        "[STAGE OK] %d %s | e2e=%.2fms (%.1ffps) | mAP50=%.4f | AP50=%.4f | AP50_small=%.4f",
+                        imgsz,
+                        stage_name,
+                        bench["e2e_mean_ms"],
+                        bench["e2e_fps"],
+                        eval_metrics["mAP50"] if not math.isnan(eval_metrics["mAP50"]) else 0.0,
+                        eval_metrics["AP50"] if not math.isnan(eval_metrics["AP50"]) else 0.0,
+                        eval_metrics["AP50_small"] if not math.isnan(eval_metrics["AP50_small"]) else 0.0,
+                    )
+                except Exception as exc:
+                    rows_by_key[(imgsz, stage_name)] = {
+                        "imgsz": imgsz,
+                        "stage": stage_name,
+                        "status": "failed",
+                        "hf_uploaded": False,
+                        "error": str(exc),
+                        "artifact": "",
+                        "size_mb": float("nan"),
+                        **_empty_benchmark_metrics(),
+                        **_empty_eval_metrics(),
+                    }
+                    _save_checkpoint(complete=False)
+                else:
+                    _save_checkpoint(complete=False)
+                    if upload_to_hf and is_int8_stage:
+                        rows_by_key[(imgsz, stage_name)]["hf_uploaded"] = _try_hf_operation(
+                            f"upload {stage_name} ({imgsz})",
+                            upload_single_quantized_artifact_to_hf,
+                            artifact_path,
+                            imgsz,
+                            stage_name,
+                            repo_id=repo_id,
+                            token=token,
+                            timeout_seconds=HF_UPLOAD_TIMEOUT_SECONDS,
+                        )
+                        _save_checkpoint(complete=False)
     finally:
         cleanup_calibration_dataset(target_working_dir, run_name=cal_run_name)
-        cleanup_yolo_dataset(target_working_dir, eval_run_name)
 
-    results_df = _annotate_ablation_deltas(rows)
-    metadata = {
-        "source_weights": str(source_pt),
-        "source_weights_sha256": _file_sha256(source_pt),
-        "eval_split": eval_split,
-        "eval_pytorch": eval_pytorch,
-        "resolutions": list(resolutions),
-        "collection_conf": collection_conf,
-        "benchmark": {
-            "n_warmup": n_warmup,
-            "n_benchmark": n_benchmark,
-            "split": eval_split,
-        },
-        "calibration": {
-            "manifest_path": str(manifest_path),
-            "max_images": max_calibration_images,
-            "actual_images": len(calibration_images),
-            "seed": seed,
-            "filenames": [path.name for path in calibration_images],
-        },
-        "onnx_quantization": {
-            "format": "QDQ",
-            "activation_type": "QUInt8",
-            "weight_type": "QInt8",
-            "per_channel": True,
-            "reduce_range": False,
-            "calibrate_method": calibrate_method,
-            "excluded_nodes_by_resolution": onnx_excluded_nodes,
-        },
-        "environment": {
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "cpu_count": os.cpu_count(),
-            "packages": _extract_runtime_versions(),
-        },
-        "stage_details": per_stage_details,
-        "summary_rows": results_df.to_dict(orient="records"),
-    }
-
-    csv_path, metadata_path = save_quantization_reports(
-        results_df,
-        target_quant_dir,
-        metadata,
-        eval_split=eval_split,
-    )
+    results_df, failed_stages, csv_path, metadata_path = _save_checkpoint()
 
     if upload_to_hf:
-        upload_quantization_artifacts_to_hf(
+        _try_hf_operation(
+            "upload reports",
+            upload_quantization_reports_to_hf,
             target_quant_dir,
             eval_split=eval_split,
-            resolutions=resolutions,
-            model_stem=model_stem,
             tag=hf_tag,
             repo_id=repo_id,
             token=token,
+            timeout_seconds=HF_UPLOAD_TIMEOUT_SECONDS,
         )
 
     return {
@@ -1552,4 +2017,5 @@ def run_cpu_quantization_ablation(
         "csv_path": csv_path,
         "metadata_path": metadata_path,
         "artifacts": artifacts_by_res,
+        "failed_stages": failed_stages,
     }

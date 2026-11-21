@@ -409,26 +409,24 @@ def test_run_cpu_quantization_ablation_uses_val_skips_pt_eval_and_cleans_up(tmp_
     quant_dir = tmp_path / "quant"
     working_dir = tmp_path / "work"
 
-    def fake_export_stage(pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method):
-        res_dir = qdir / str(imgsz)
+    def fake_export_single(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+        res_dir = Path(qdir) / str(imgsz)
         res_dir.mkdir(parents=True, exist_ok=True)
-        staged_pt = res_dir / f"{model_stem}.pt"
-        staged_pt.write_bytes(b"pt")
-        onnx_fp32 = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_fp32_{imgsz}.onnx")
-        onnx_int8 = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_int8_{imgsz}.onnx")
-        ov_fp32 = res_dir / f"{model_stem}_fp32_{imgsz}_openvino_model"
-        ov_int8 = res_dir / f"{model_stem}_int8_{imgsz}_openvino_model"
-        for ov_dir in (ov_fp32, ov_int8):
-            ov_dir.mkdir()
-            (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
-            (ov_dir / "model.bin").write_bytes(b"bin")
-        return {
-            "pytorch_fp32": staged_pt,
-            "onnx_fp32": onnx_fp32,
-            "onnx_int8": onnx_int8,
-            "openvino_fp32": ov_fp32,
-            "openvino_int8": ov_int8,
-        }
+        if stage_name == "pytorch_fp32":
+            out = res_dir / f"{model_stem}.pt"
+            out.write_bytes(b"pt")
+            return out, {}
+        if stage_name in {"onnx_fp32", "onnx_int8"}:
+            suffix = "fp32" if stage_name == "onnx_fp32" else "int8"
+            out = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_{suffix}_{imgsz}.onnx")
+            meta = {"excluded_nodes": ["/model.23/Add"], "onnx_fallback_full_head": False} if stage_name == "onnx_int8" else {}
+            return out, meta
+        suffix = "fp32" if stage_name == "openvino_fp32" else "int8"
+        ov_dir = res_dir / f"{model_stem}_{suffix}_{imgsz}_openvino_model"
+        ov_dir.mkdir(exist_ok=True)
+        (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
+        (ov_dir / "model.bin").write_bytes(b"bin")
+        return ov_dir, {}
 
     eval_calls = []
 
@@ -460,7 +458,7 @@ def test_run_cpu_quantization_ablation_uses_val_skips_pt_eval_and_cleans_up(tmp_
             "curves": {"thresholds": [0.1, 0.5], "precision": [0.9, 0.95]},
         }
 
-    monkeypatch.setattr(quantization, "export_stage_models", fake_export_stage)
+    monkeypatch.setattr(quantization, "_export_single_stage", fake_export_single)
     monkeypatch.setattr(
         quantization,
         "benchmark_stage_model",
@@ -566,16 +564,10 @@ def _load_quantize_cli_module():
     return module
 
 
-def test_evaluate_quantized_stage_runs_threshold_free_cpu_eval(tmp_path, monkeypatch):
+def test_evaluate_quantized_stage_runs_single_pass_threshold_free_cpu_eval(tmp_path, monkeypatch):
     onnx_path = tmp_path / "model.onnx"
     onnx_path.write_bytes(b"onnx")
-    eval_yaml = tmp_path / "eval.yaml"
-    eval_yaml.write_text("path: .\n", encoding="utf-8")
 
-    mock_eval_model = Mock(return_value={
-        "metrics/mAP50(B)": 0.91,
-        "metrics/mAP50-95(B)": 0.74,
-    })
     raw_db = [
         {
             "filename": "quad_rgb_sky_001_f0001.jpg",
@@ -599,44 +591,33 @@ def test_evaluate_quantized_stage_runs_threshold_free_cpu_eval(tmp_path, monkeyp
             "width": 1000,
             "height": 1000,
             "gt_boxes": [],
-            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.15]],
+            "pred_boxes": [[0.0, 0.0, 10.0, 10.0, 0.15], [0.0, 0.0, 10.0, 10.0, 0.005]],
         },
     ]
     mock_preds_db = Mock(return_value=raw_db)
     fake_model = Mock()
 
-    monkeypatch.setattr(quantization, "evaluate_model", mock_eval_model)
     monkeypatch.setattr(quantization, "_load_yolo_for_artifact", Mock(return_value=fake_model))
     monkeypatch.setattr(quantization, "run_dataset_predictions_db", mock_preds_db)
 
     with pytest.raises(ValueError, match="eval_split"):
-        quantization.evaluate_quantized_stage(onnx_path, tmp_path, eval_yaml, "onnx_int8", imgsz=640, eval_split="train")
+        quantization.evaluate_quantized_stage(onnx_path, tmp_path, None, "onnx_int8", imgsz=640, eval_split="train")
 
     report = quantization.evaluate_quantized_stage(
         onnx_path,
         tmp_path,
-        eval_yaml,
+        None,
         "onnx_int8",
         imgsz=640,
         eval_split="val",
         collection_conf=0.01,
     )
 
-    mock_eval_model.assert_called_once_with(
-        onnx_path,
-        eval_yaml,
-        run_name="onnx_int8_640",
-        split="val",
-        imgsz=640,
-        batch=1,
-        conf=None,
-        device="cpu",
-        plots=False,
-    )
+    mock_preds_db.assert_called_once()
     assert mock_preds_db.call_args.kwargs["device"] == "cpu"
-    assert mock_preds_db.call_args.kwargs["collection_conf"] == 0.01
-    assert report["metrics"]["mAP50"] == pytest.approx(0.91)
-    assert report["metrics"]["mAP50-95"] == pytest.approx(0.74)
+    assert mock_preds_db.call_args.kwargs["collection_conf"] == pytest.approx(0.001)
+    assert report["metrics"]["mAP50"] == pytest.approx(1.0)
+    assert report["metrics"]["mAP50-95"] == pytest.approx(1.0)
     assert report["metrics"]["AP50"] == pytest.approx(1.0)
     assert report["metrics"]["AP50_small"] == pytest.approx(1.0)
     assert report["metrics"]["tp_conf_median"] == pytest.approx(0.525)
@@ -711,3 +692,381 @@ def test_quantize_cpu_cli_rejects_invalid_arguments(bad_argv):
     cli = _load_quantize_cli_module()
     with pytest.raises(SystemExit):
         cli.main(bad_argv)
+
+
+def test_load_quantization_reports_and_plots_create_pngs(tmp_path):
+    from src.utils.visualization import (
+        load_quantization_reports,
+        plot_quantization_ablation_dashboard,
+        plot_quantization_curves,
+    )
+
+    quant_dir = tmp_path / "quantization"
+    with pytest.raises(ValueError, match="eval_split"):
+        load_quantization_reports(quant_dir, eval_split="train")
+    with pytest.raises(FileNotFoundError):
+        load_quantization_reports(quant_dir, eval_split="val")
+
+    rows = []
+    stage_details = {}
+    for imgsz, base_ms, base_ap in ((1280, 100.0, 0.90), (640, 30.0, 0.80)):
+        rows.append({
+            "imgsz": imgsz,
+            "stage": "pytorch_fp32",
+            "size_mb": 5.5,
+            "compute_mean_ms": base_ms,
+            "e2e_mean_ms": base_ms + 10.0,
+            "e2e_fps": 1000.0 / (base_ms + 10.0),
+            "mAP50": float("nan"),
+            "AP50": float("nan"),
+            "AP50_small": float("nan"),
+            "Neg FPR @ R>=0.85 (%)": float("nan"),
+            "Recall_small @ Neg FPR<=5%": float("nan"),
+            "tp_conf_p10": float("nan"),
+            "tp_conf_median": float("nan"),
+            "tp_conf_p90": float("nan"),
+        })
+        for stage, factor in (("onnx_fp32", 0.8), ("onnx_int8", 0.4), ("openvino_fp32", 0.7), ("openvino_int8", 0.3)):
+            e2e_ms = base_ms * factor
+            rows.append({
+                "imgsz": imgsz,
+                "stage": stage,
+                "size_mb": 3.0 if "int8" in stage else 10.0,
+                "compute_mean_ms": e2e_ms * 0.8,
+                "e2e_mean_ms": e2e_ms,
+                "e2e_fps": 1000.0 / e2e_ms,
+                "mAP50": base_ap,
+                "AP50": base_ap,
+                "AP50_small": base_ap - 0.15,
+                "Neg FPR @ R>=0.85 (%)": 6.0,
+                "Recall_small @ Neg FPR<=5%": 0.65,
+                "tp_conf_p10": 0.4,
+                "tp_conf_median": 0.8,
+                "tp_recall_ge_0_30": 0.95,
+                "tp_conf_p90": 0.95,
+            })
+            stage_details[f"{stage}_{imgsz}"] = {
+                "by_scale": [{"Scale": "small", "GT": 10, "AP50": base_ap - 0.15}],
+                "curves": {
+                    "thresholds": [0.1, 0.5, 0.9],
+                    "precision": [0.7, 0.9, 0.98],
+                    "recall": [0.95, 0.85, 0.6],
+                    "recall_small": [0.8, 0.65, 0.4],
+                    "neg_fa_rate": [12.0, 4.0, 0.5],
+                },
+            }
+
+    report_dir = quant_dir / "reports" / "val"
+    report_dir.mkdir(parents=True)
+    import pandas as pd
+
+    pd.DataFrame(rows).to_csv(report_dir / "ablation_results.csv", index=False)
+    meta = {
+        "eval_split": "val",
+        "summary_rows": rows,
+        "stage_details": stage_details,
+    }
+    (report_dir / "quantization_metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    loaded_df, loaded_meta = load_quantization_reports(quant_dir, eval_split="val")
+    assert len(loaded_df) == 10
+
+    dash_png = report_dir / "dashboard.png"
+    curves_png = report_dir / "curves.png"
+    plot_quantization_ablation_dashboard(loaded_df, loaded_meta, save_path=dash_png, show=False)
+    plot_quantization_curves(loaded_meta, save_path=curves_png, show=False)
+
+    assert dash_png.is_file() and dash_png.stat().st_size > 0
+    assert curves_png.is_file() and curves_png.stat().st_size > 0
+
+
+def test_quantize_onnx_fallback_excludes_full_head_on_initial_failure(tmp_path, monkeypatch):
+    calls = []
+    def fake_quantize(src, dst, cal, *, imgsz, calibrate_method="MinMax", exclude_head_convs=False):
+        calls.append(exclude_head_convs)
+        if not exclude_head_convs:
+            raise RuntimeError("partial head qdq failed")
+        dst.write_bytes(b"qdq-fallback")
+        return dst
+
+    fp32 = _make_conv_sigmoid_onnx(tmp_path / "fp32.onnx")
+    monkeypatch.setattr(quantization, "quantize_onnx_int8", fake_quantize)
+
+    out, excluded, used_fallback = quantization._quantize_onnx_with_fallback(
+        fp32,
+        tmp_path / "int8.onnx",
+        [tmp_path / "cal.jpg"],
+        imgsz=32,
+        calibrate_method="MinMax",
+    )
+
+    assert calls == [False, True]
+    assert used_fallback is True
+    assert out.is_file()
+    assert "/model.23/Add" in excluded
+
+
+def test_ablation_uploads_each_int8_immediately_and_resumes_from_failed_stage(tmp_path, monkeypatch):
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0002.jpg", "split": "val", "category": "negative", "excluded_at": ""},
+    ]
+    root, manifest_path = _write_calibration_bundle(tmp_path, rows)
+    weights = tmp_path / "best.pt"
+    weights.write_bytes(b"pt")
+    quant_dir = tmp_path / "quant"
+    working_dir = tmp_path / "work"
+
+    fail_openvino_int8 = True
+    export_history = []
+    uploaded_models = []
+
+    def fake_export(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+        export_history.append((stage_name, skip_existing))
+        res_dir = Path(qdir) / str(imgsz)
+        res_dir.mkdir(parents=True, exist_ok=True)
+        if stage_name == "openvino_int8" and fail_openvino_int8:
+            raise RuntimeError("openvino int8 exploded")
+        if stage_name in {"onnx_fp32", "onnx_int8"}:
+            out = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_{stage_name}_{imgsz}.onnx")
+            return out, ({"excluded_nodes": [], "onnx_fallback_full_head": False} if stage_name == "onnx_int8" else {})
+        ov_dir = res_dir / f"{model_stem}_{stage_name}_{imgsz}_openvino_model"
+        ov_dir.mkdir(exist_ok=True)
+        (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
+        (ov_dir / "model.bin").write_bytes(b"bin")
+        return ov_dir, {}
+
+    def fake_single_upload(artifact_path, imgsz, stage_name, **kwargs):
+        uploaded_models.append((imgsz, stage_name, Path(artifact_path).name))
+
+    monkeypatch.setattr(quantization, "_export_single_stage", fake_export)
+    monkeypatch.setattr(
+        quantization,
+        "benchmark_stage_model",
+        lambda *a, **k: {
+            "compute_mean_ms": 10.0,
+            "compute_std_ms": 0.5,
+            "compute_p50_ms": 10.0,
+            "compute_p95_ms": 11.0,
+            "compute_p99_ms": 12.0,
+            "compute_fps": 100.0,
+            "compute_fps_p50": 100.0,
+            "e2e_mean_ms": 12.0,
+            "e2e_std_ms": 0.5,
+            "e2e_p50_ms": 12.0,
+            "e2e_p95_ms": 13.0,
+            "e2e_p99_ms": 14.0,
+            "e2e_fps": 83.3,
+            "e2e_fps_p50": 83.3,
+            "rss_mb": 100.0,
+            "peak_rss_mb": 110.0,
+        },
+    )
+    monkeypatch.setattr(
+        quantization,
+        "evaluate_quantized_stage",
+        lambda *a, **k: {
+            "metrics": {**quantization._empty_eval_metrics(), "mAP50": 0.9, "AP50": 0.89, "AP50_small": 0.7},
+            "by_scale": [],
+            "curves": {},
+        },
+    )
+    mock_reports_upload = Mock(side_effect=RuntimeError("hf service down"))
+    monkeypatch.setattr(quantization, "verify_hf_access", Mock(return_value=("u/r", "t")))
+    monkeypatch.setattr(quantization, "upload_single_quantized_artifact_to_hf", fake_single_upload)
+    monkeypatch.setattr(quantization, "upload_quantization_reports_to_hf", mock_reports_upload)
+
+    first = quantization.run_cpu_quantization_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(640,),
+        stages=("onnx_fp32", "onnx_int8", "openvino_int8"),
+        n_warmup=1,
+        n_benchmark=1,
+        manifest_path=manifest_path,
+        upload_to_hf=True,
+    )
+
+    assert len(first["failed_stages"]) == 1
+    assert first["failed_stages"][0]["stage"] == "openvino_int8"
+    assert uploaded_models == [(640, "onnx_int8", "yolo26n_run_with_negatives_best_onnx_int8_640.onnx")]
+    df1 = first["results_df"].set_index("stage")
+    assert df1.loc["onnx_fp32", "status"] == "ok"
+    assert df1.loc["onnx_int8", "status"] == "ok"
+    assert df1.loc["onnx_int8", "hf_uploaded"] == True
+    assert df1.loc["openvino_int8", "status"] == "failed"
+    assert first["csv_path"].is_file()
+    mock_reports_upload.assert_called_once()
+
+    fail_openvino_int8 = False
+    export_history.clear()
+    uploaded_models.clear()
+    mock_reports_upload.reset_mock()
+    mock_reports_upload.side_effect = None
+
+    resumed = quantization.run_cpu_quantization_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(640,),
+        stages=("onnx_fp32", "onnx_int8", "openvino_int8"),
+        resume=True,
+        n_warmup=1,
+        n_benchmark=1,
+        manifest_path=manifest_path,
+        upload_to_hf=True,
+    )
+
+    assert resumed["failed_stages"] == []
+    assert export_history == [("openvino_int8", True)]
+    assert uploaded_models == [(640, "openvino_int8", "yolo26n_run_with_negatives_best_openvino_int8_640_openvino_model")]
+    df2 = resumed["results_df"].set_index("stage")
+    assert all(df2["status"] == "ok")
+    mock_reports_upload.assert_called_once()
+
+
+def test_quantize_cpu_cli_writes_log_file_and_returns_nonzero_on_failure(tmp_path, monkeypatch):
+    cli = _load_quantize_cli_module()
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+
+    import pandas as pd
+
+    monkeypatch.setattr(
+        cli,
+        "run_cpu_quantization_ablation",
+        Mock(return_value={
+            "results_df": pd.DataFrame([{"imgsz": 1280, "stage": "onnx_int8", "status": "failed"}]),
+            "csv_path": tmp_path / "working" / "quantization" / "reports" / "val" / "ablation_results.csv",
+            "metadata_path": tmp_path / "working" / "quantization" / "reports" / "val" / "quantization_metadata.json",
+            "failed_stages": [{"imgsz": 1280, "stage": "onnx_int8", "error": "boom"}],
+        }),
+    )
+
+    code = cli.main(["--resume", "--skip-existing-exports", "--stages", "onnx_int8"])
+    log_file = tmp_path / "working" / "quantization" / "reports" / "val" / "quantize_cpu.log"
+    assert code == 1
+    assert log_file.is_file()
+
+
+
+
+def test_try_hf_operation_disables_xet_times_out_and_reraises_permission_error(monkeypatch):
+    import threading
+    from huggingface_hub import constants as hf_constants
+    from huggingface_hub.utils._runtime import is_xet_available
+
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    monkeypatch.setattr(hf_constants, "HF_HUB_DISABLE_XET", False)
+
+    stop_event = threading.Event()
+
+    def slow_upload():
+        stop_event.wait(timeout=2.0)
+
+    try:
+        assert quantization._try_hf_operation("slow upload", slow_upload, timeout_seconds=0.05) is False
+        assert hf_constants.HF_HUB_DISABLE_XET is True
+        assert is_xet_available() is False
+    finally:
+        stop_event.set()
+
+    with pytest.raises(PermissionError, match="read-only"):
+        quantization._try_hf_operation(
+            "auth check",
+            Mock(side_effect=PermissionError("read-only")),
+            timeout_seconds=1.0,
+        )
+
+
+def test_ablation_checkpoints_stage_before_hf_upload_timeout(tmp_path, monkeypatch):
+    import threading
+
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+    ]
+    root, manifest_path = _write_calibration_bundle(tmp_path, rows)
+    weights = tmp_path / "best.pt"
+    weights.write_bytes(b"pt")
+    quant_dir = tmp_path / "quant"
+    working_dir = tmp_path / "work"
+    events = []
+    csv_existed_before_upload = []
+    stop_event = threading.Event()
+
+    def fake_export(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+        events.append("export")
+        res_dir = Path(qdir) / str(imgsz)
+        res_dir.mkdir(parents=True, exist_ok=True)
+        out = _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_{stage_name}_{imgsz}.onnx")
+        return out, {"excluded_nodes": [], "onnx_fallback_full_head": False}
+
+    def fake_bench(*args, **kwargs):
+        events.append("benchmark")
+        return {
+            "compute_mean_ms": 10.0,
+            "compute_std_ms": 0.5,
+            "compute_p50_ms": 10.0,
+            "compute_p95_ms": 11.0,
+            "compute_p99_ms": 12.0,
+            "compute_fps": 100.0,
+            "compute_fps_p50": 100.0,
+            "e2e_mean_ms": 12.0,
+            "e2e_std_ms": 0.5,
+            "e2e_p50_ms": 12.0,
+            "e2e_p95_ms": 13.0,
+            "e2e_p99_ms": 14.0,
+            "e2e_fps": 83.3,
+            "e2e_fps_p50": 83.3,
+            "rss_mb": 100.0,
+            "peak_rss_mb": 110.0,
+        }
+
+    def fake_eval(*args, **kwargs):
+        events.append("evaluate")
+        return {
+            "metrics": {**quantization._empty_eval_metrics(), "mAP50": 0.91, "AP50": 0.90, "AP50_small": 0.72},
+            "by_scale": [],
+            "curves": {},
+        }
+
+    def hanging_upload(artifact_path, imgsz, stage_name, **kwargs):
+        events.append("upload")
+        csv_existed_before_upload.append((quant_dir / "reports" / "val" / "ablation_results.csv").is_file())
+        stop_event.wait(timeout=2.0)
+
+    monkeypatch.setattr(quantization, "HF_UPLOAD_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(quantization, "_export_single_stage", fake_export)
+    monkeypatch.setattr(quantization, "benchmark_stage_model", fake_bench)
+    monkeypatch.setattr(quantization, "evaluate_quantized_stage", fake_eval)
+    monkeypatch.setattr(quantization, "verify_hf_access", Mock(return_value=("u/r", "t")))
+    monkeypatch.setattr(quantization, "upload_single_quantized_artifact_to_hf", hanging_upload)
+    monkeypatch.setattr(quantization, "upload_quantization_reports_to_hf", Mock())
+
+    try:
+        result = quantization.run_cpu_quantization_ablation(
+            root,
+            weights_path=weights,
+            quantization_dir=quant_dir,
+            working_dir=working_dir,
+            resolutions=(640,),
+            stages=("onnx_int8",),
+            n_warmup=1,
+            n_benchmark=1,
+            manifest_path=manifest_path,
+            upload_to_hf=True,
+        )
+    finally:
+        stop_event.set()
+
+    assert events == ["export", "benchmark", "evaluate", "upload"]
+    assert csv_existed_before_upload == [True]
+    assert result["failed_stages"] == []
+    df = result["results_df"]
+    assert df.loc[0, "status"] == "ok"
+    assert bool(df.loc[0, "hf_uploaded"]) is False
+    assert df.loc[0, "AP50"] == pytest.approx(0.90)
