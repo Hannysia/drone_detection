@@ -1405,3 +1405,60 @@ def test_quantize_cpu_cli_ptq_ablation_rejects_upload_and_invokes_runner(tmp_pat
     assert code == 0
     assert log_file.is_file()
     assert mock_ptq.call_args.kwargs["variants"] == ("onnx_int8_entropy_head_fp32",)
+
+
+def test_plot_ptq_variant_ablation_dashboard_handles_failed_rows(tmp_path):
+    import matplotlib
+    import pandas as pd
+    from src.utils.visualization import plot_ptq_variant_ablation_dashboard
+
+    matplotlib.use("Agg")
+    df = pd.DataFrame([
+        {
+            "imgsz": 1280,
+            "stage": "onnx_fp32",
+            "status": "ok",
+            "compute_fps": 3.2,
+            "AP50": 0.95,
+            "AP50_small": 0.91,
+            "Neg FPR @ R>=0.85 (%)": 4.0,
+            "tp_conf_p10": 0.92,
+            "tp_conf_median": 0.97,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "onnx_int8_moving_avg_head_fp32",
+            "status": "ok",
+            "compute_fps": 3.1,
+            "AP50": 0.936,
+            "AP50_small": 0.937,
+            "Neg FPR @ R>=0.85 (%)": 5.4,
+            "tp_conf_p10": 0.85,
+            "tp_conf_median": 0.97,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "onnx_int8_entropy_head_fp32",
+            "status": "failed",
+            "compute_fps": np.nan,
+            "AP50": np.nan,
+            "AP50_small": np.nan,
+            "Neg FPR @ R>=0.85 (%)": np.nan,
+            "tp_conf_p10": np.nan,
+            "tp_conf_median": np.nan,
+        },
+        {
+            "imgsz": 640,
+            "stage": "openvino_int8_ultralytics",
+            "status": "ok",
+            "compute_fps": 38.6,
+            "AP50": 0.782,
+            "AP50_small": 0.428,
+            "Neg FPR @ R>=0.85 (%)": np.nan,
+            "tp_conf_p10": 0.28,
+            "tp_conf_median": 0.95,
+        },
+    ])
+    out_png = tmp_path / "ptq_dash.png"
+    plot_ptq_variant_ablation_dashboard(df, save_path=out_png, show=False)
+    assert out_png.is_file()

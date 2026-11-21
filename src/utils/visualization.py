@@ -1456,6 +1456,174 @@ def plot_quantization_curves(
     ax_conf.legend(loc="lower right", fontsize=8)
 
     _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+_PTQ_VARIANT_LABELS = {
+    "onnx_fp32": "ONNX FP32",
+    "onnx_int8_minmax_head_int8": "ORT MinMax (Head INT8)",
+    "onnx_int8_moving_avg_head_int8": "ORT MovAvg (Head INT8)",
+    "onnx_int8_minmax_head_fp32": "ORT MinMax (Head FP32)",
+    "onnx_int8_moving_avg_head_fp32": "ORT MovAvg (Head FP32)",
+    "onnx_int8_entropy_head_int8": "ORT Entropy (Head INT8)",
+    "onnx_int8_entropy_head_fp32": "ORT Entropy (Head FP32)",
+    "onnx_int8_percentile_head_int8": "ORT Pctl (Head INT8)",
+    "onnx_int8_percentile_head_fp32": "ORT Pctl (Head FP32)",
+    "onnx_int8_nncf_head_int8": "NNCF ONNX (Head INT8)",
+    "onnx_int8_nncf_head_fp32": "NNCF ONNX (Head FP32)",
+    "openvino_fp32": "OpenVINO FP32",
+    "openvino_int8_ultralytics": "OV INT8 (Ultralytics)",
+    "openvino_int8_nncf_full_bias_head_fp32": "OV INT8 (NNCF Head FP32)",
+}
+
+
+def _ptq_variant_color(stage: str) -> str:
+    if stage in ("onnx_fp32", "openvino_fp32"):
+        return "#64748b"
+    if stage.startswith("openvino_int8"):
+        return "#059669"
+    if "nncf" in stage:
+        return "#7c3aed"
+    if "moving_avg" in stage:
+        return "#2563eb"
+    return "#ea580c"
+
+
+def _plot_ptq_resolution_panel(
+    ax,
+    ok_df: pd.DataFrame,
+    *,
+    imgsz: int,
+    title: str,
+) -> None:
+    sub = ok_df[ok_df["imgsz"] == imgsz].copy()
+    if sub.empty:
+        ax.set_title(f"{title} (no data)", fontweight="bold")
+        ax.axis("off")
+        return
+
+    sub = sub.sort_values(["AP50", "AP50_small"], ascending=[True, True])
+    y_pos = np.arange(len(sub))
+    labels = [_PTQ_VARIANT_LABELS.get(str(s), str(s)) for s in sub["stage"]]
+    colors = [_ptq_variant_color(str(s)) for s in sub["stage"]]
+    ap50_vals = [float(v) if pd.notna(v) else 0.0 for v in sub["AP50"]]
+    small_vals = [float(v) if pd.notna(v) else 0.0 for v in sub["AP50_small"]]
+
+    h = 0.38
+    bars_ap = ax.barh(y_pos + h / 2, ap50_vals, height=h, color=colors, alpha=0.9, label="AP50")
+    bars_sm = ax.barh(y_pos - h / 2, small_vals, height=h, color=colors, alpha=0.45, hatch="//", label="AP50_small")
+
+    fp32_row = sub[sub["stage"] == "onnx_fp32"]
+    if not fp32_row.empty and pd.notna(fp32_row.iloc[0]["AP50"]):
+        ax.axvline(float(fp32_row.iloc[0]["AP50"]), color="#0f172a", linestyle="--", linewidth=1.2, label="ONNX FP32 AP50")
+
+    for bar, val in zip(bars_ap, ap50_vals):
+        ax.text(val + 0.01, bar.get_y() + bar.get_height() / 2, f"{val:.3f}", va="center", ha="left", fontsize=7.5)
+    for bar, val in zip(bars_sm, small_vals):
+        ax.text(val + 0.01, bar.get_y() + bar.get_height() / 2, f"{val:.3f}", va="center", ha="left", fontsize=7.5)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8.5)
+    ax.set_xlim(0, 1.12)
+    ax.set_xlabel("Threshold-Free Score (higher is better)")
+    ax.set_title(title, fontweight="bold")
+    ax.grid(axis="x", alpha=0.25)
+    ax.legend(loc="lower right", fontsize=8)
+
+
+def plot_ptq_variant_ablation_dashboard(
+    ptq_df: pd.DataFrame,
+    *,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots 2x2 PTQ variant ablation dashboard comparing calibration, head protection, safety, and speed."""
+    required = {
+        "imgsz",
+        "stage",
+        "status",
+        "compute_fps",
+        "AP50",
+        "AP50_small",
+        "Neg FPR @ R>=0.85 (%)",
+        "tp_conf_p10",
+        "tp_conf_median",
+    }
+    if ptq_df.empty or not required.issubset(ptq_df.columns):
+        missing = sorted(required - set(ptq_df.columns))
+        raise ValueError(f"Invalid PTQ ablation dataframe; missing: {missing}")
+
+    ok_df = ptq_df[ptq_df["status"] == "ok"].copy()
+    if ok_df.empty:
+        raise ValueError("No successful PTQ variant rows available to plot")
+
+    fig, axes = plt.subplots(2, 2, figsize=(19, 12))
+    fig.suptitle(
+        "PTQ Calibration, Head Protection & NNCF Ablation (Val Split)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    _plot_ptq_resolution_panel(axes[0, 0], ok_df, imgsz=1280, title="1280px Quality Retention (AP50 vs AP50_small)")
+    _plot_ptq_resolution_panel(axes[0, 1], ok_df, imgsz=640, title="640px Quality Retention (AP50 vs AP50_small)")
+
+    ax_safe = axes[1, 0]
+    sub_1280 = ok_df[(ok_df["imgsz"] == 1280) & ok_df["Neg FPR @ R>=0.85 (%)"].notna()].copy()
+    if not sub_1280.empty:
+        sub_1280 = sub_1280.sort_values("Neg FPR @ R>=0.85 (%)", ascending=False)
+        y_s = np.arange(len(sub_1280))
+        fpr_vals = [float(v) for v in sub_1280["Neg FPR @ R>=0.85 (%)"]]
+        s_colors = ["#dc2626" if v > 6.0 else "#2563eb" for v in fpr_vals]
+        bars_s = ax_safe.barh(y_s, fpr_vals, color=s_colors, alpha=0.85, height=0.6)
+        ax_safe.axvline(5.0, color="#0f172a", linestyle=":", linewidth=1.4, label="5% Neg FPR Target")
+        for bar, row in zip(bars_s, sub_1280.itertuples(index=False)):
+            fpr = float(bar.get_width())
+            med = float(row.tp_conf_median) if pd.notna(row.tp_conf_median) else np.nan
+            p10 = float(row.tp_conf_p10) if pd.notna(row.tp_conf_p10) else np.nan
+            ax_safe.text(
+                fpr + 0.3,
+                bar.get_y() + bar.get_height() / 2,
+                f"{fpr:.2f}% | conf med={med:.2f} (p10={p10:.2f})",
+                va="center",
+                ha="left",
+                fontsize=7.8,
+            )
+        ax_safe.set_yticks(y_s)
+        ax_safe.set_yticklabels([_PTQ_VARIANT_LABELS.get(str(s), str(s)) for s in sub_1280["stage"]], fontsize=8.5)
+        ax_safe.set_xlim(0, max(fpr_vals) + 8.5)
+        ax_safe.legend(loc="lower right", fontsize=8)
+    ax_safe.set_title("1280px Negative False Alarm Rate (@ R>=0.85) & TP Confidence", fontweight="bold")
+    ax_safe.set_xlabel("Neg FPR % (lower is better)")
+    ax_safe.grid(axis="x", alpha=0.25)
+
+    ax_pareto = axes[1, 1]
+    res_markers = {1280: "o", 640: "s"}
+    for _, row in ok_df[ok_df["AP50"].notna() & ok_df["compute_fps"].notna()].iterrows():
+        imgsz = int(row["imgsz"])
+        stage = str(row["stage"])
+        fps = float(row["compute_fps"])
+        ap50 = float(row["AP50"])
+        ax_pareto.scatter(
+            fps,
+            ap50,
+            color=_ptq_variant_color(stage),
+            marker=res_markers.get(imgsz, "^"),
+            s=95,
+            edgecolor="black",
+            linewidth=0.7,
+            zorder=4,
+        )
+        ax_pareto.annotate(
+            f"{_PTQ_VARIANT_LABELS.get(stage, stage)} ({imgsz})",
+            (fps, ap50),
+            textcoords="offset points",
+            xytext=(5, 3),
+            fontsize=7.2,
+        )
+    ax_pareto.set_title("CPU Compute Speed vs Accuracy Pareto (1280 circles, 640 squares)", fontweight="bold")
+    ax_pareto.set_xlabel("Compute-Only FPS (higher is better)")
+    ax_pareto.set_ylabel("Threshold-Free AP50 (higher is better)")
+    ax_pareto.grid(True, alpha=0.25)
+
     _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
 
 
