@@ -1456,3 +1456,303 @@ def plot_quantization_curves(
     ax_conf.legend(loc="lower right", fontsize=8)
 
     _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+_VIDEO_MODE_ORDER = ("full_1280", "resize_640", "roi_static", "roi_kalman")
+_VIDEO_MODE_LABELS = {
+    "full_1280": "Full 1280",
+    "resize_640": "Resize 640",
+    "roi_static": "ROI Static",
+    "roi_kalman": "ROI Kalman",
+}
+_VIDEO_MODE_COLORS = {
+    "full_1280": "#64748b",
+    "resize_640": "#f59e0b",
+    "roi_static": "#2563eb",
+    "roi_kalman": "#059669",
+}
+_TRACKER_LABELS = {"bytetrack": "ByteTrack", "ocsort": "OC-SORT"}
+
+
+def load_video_ablation_reports(
+    ablation_dir: Path,
+    *,
+    eval_split: str = "test",
+) -> dict[str, object]:
+    """Loads test video ablation CSV, optional val calibration CSVs, and metadata JSON."""
+    reports_dir = Path(ablation_dir) / "reports"
+    test_csv = reports_dir / f"{eval_split}_video_ablation.csv"
+    metadata_path = reports_dir / "video_ablation_metadata.json"
+    if not test_csv.is_file():
+        raise FileNotFoundError(f"Video ablation CSV not found: {test_csv}")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Video ablation metadata JSON not found: {metadata_path}")
+
+    results_df = pd.read_csv(test_csv)
+    if results_df.empty:
+        raise ValueError(f"Video ablation CSV is empty: {test_csv}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    val_grid_csv = reports_dir / "val_tracker_grid.csv"
+    val_roi_csv = reports_dir / "val_roi_calibration.csv"
+    return {
+        "results_df": results_df,
+        "metadata": metadata,
+        "val_grid_df": pd.read_csv(val_grid_csv) if val_grid_csv.is_file() else pd.DataFrame(),
+        "val_roi_df": pd.read_csv(val_roi_csv) if val_roi_csv.is_file() else pd.DataFrame(),
+    }
+
+
+def plot_val_tracker_calibration(
+    val_grid_df: pd.DataFrame,
+    *,
+    val_roi_df: pd.DataFrame | None = None,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots validation HOTA grid search curves for ByteTrack/OC-SORT and ROI hysteresis."""
+    if val_grid_df.empty:
+        raise ValueError("val_grid_df is empty")
+
+    has_roi = val_roi_df is not None and not val_roi_df.empty
+    ncols = 3 if has_roi else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 5.2))
+    fig.suptitle("Validation Tracker Calibration & ROI Hysteresis", fontsize=14, fontweight="bold")
+    flat_axes = np.atleast_1d(axes).ravel()
+
+    tracker_specs = (
+        (flat_axes[0], "bytetrack", "ByteTrack: HOTA vs track_thresh", "param_track_thresh", "param_track_buffer", "track_buffer"),
+        (flat_axes[1], "ocsort", "OC-SORT: HOTA vs det_thresh", "param_det_thresh", "param_max_age", "max_age"),
+    )
+    buffer_palette = ("#64748b", "#2563eb", "#059669", "#dc2626", "#7c3aed")
+
+    for ax, tracker_name, title, x_col, group_col, group_label in tracker_specs:
+        sub = val_grid_df[val_grid_df["tracker"] == tracker_name]
+        if not sub.empty and x_col in sub.columns and group_col in sub.columns:
+            best_by_pair = sub.groupby([group_col, x_col], as_index=False)["HOTA"].max()
+            for idx, group_val in enumerate(sorted(best_by_pair[group_col].unique())):
+                curve = best_by_pair[best_by_pair[group_col] == group_val].sort_values(x_col)
+                ax.plot(
+                    curve[x_col],
+                    curve["HOTA"],
+                    marker="o",
+                    linewidth=1.8,
+                    color=buffer_palette[idx % len(buffer_palette)],
+                    label=f"{group_label}={int(group_val)}",
+                )
+            ax.legend(loc="best", fontsize=8)
+        ax.set_title(title, fontweight="bold")
+        ax.set_xlabel(x_col.removeprefix("param_"))
+        ax.set_ylabel("Val HOTA (%)")
+        ax.grid(True, alpha=0.25)
+
+    if has_roi and val_roi_df is not None:
+        ax_roi = flat_axes[2]
+        for tracker_name, color in (("bytetrack", "#2563eb"), ("ocsort", "#dc2626")):
+            sub_roi = val_roi_df[val_roi_df["tracker"] == tracker_name].sort_values("max_lost_frames")
+            if not sub_roi.empty:
+                ax_roi.plot(
+                    sub_roi["max_lost_frames"],
+                    sub_roi["HOTA"],
+                    marker="s",
+                    linewidth=2.0,
+                    color=color,
+                    label=f"{_TRACKER_LABELS.get(tracker_name, tracker_name)} HOTA",
+                )
+        ax_roi.set_title("ROI Hysteresis: max_lost_frames (Val)", fontweight="bold")
+        ax_roi.set_xlabel("max_lost_frames")
+        ax_roi.set_ylabel("Val HOTA (%)")
+        ax_roi.grid(True, alpha=0.25)
+        ax_roi.legend(loc="best", fontsize=8)
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+def plot_video_ablation_dashboard(
+    results_df: pd.DataFrame,
+    *,
+    target_fps: float = 30.0,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots 2x2 dashboard comparing Full 1280, Resize 640, ROI Static, and ROI Kalman."""
+    required = {
+        "mode",
+        "tracker",
+        "e2e_fps",
+        "e2e_mean_ms",
+        "e2e_p95_ms",
+        "pct_track_frames",
+        "HOTA",
+        "DetA",
+        "IDF1",
+        "IDSW",
+        "track_recall_small",
+    }
+    if results_df.empty or not required.issubset(results_df.columns):
+        missing = sorted(required - set(results_df.columns))
+        raise ValueError(f"Invalid video ablation dataframe; missing: {missing}")
+
+    df = results_df.copy()
+    modes = [m for m in _VIDEO_MODE_ORDER if m in set(df["mode"])]
+    trackers = [t for t in ("bytetrack", "ocsort") if t in set(df["tracker"])]
+    fig, axes = plt.subplots(2, 2, figsize=(18, 11))
+    fig.suptitle(
+        "Adaptive ROI & Tracker Video Ablation (CPU OpenVINO INT8)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    ax_pareto = axes[0, 0]
+    markers = {"bytetrack": "o", "ocsort": "D"}
+    for _, row in df.iterrows():
+        mode = str(row["mode"])
+        tracker = str(row["tracker"])
+        fps = float(row["e2e_fps"])
+        hota = float(row["HOTA"])
+        ax_pareto.scatter(
+            fps,
+            hota,
+            color=_VIDEO_MODE_COLORS.get(mode, "#0f172a"),
+            marker=markers.get(tracker, "^"),
+            s=120,
+            edgecolor="black",
+            linewidth=0.8,
+            zorder=4,
+        )
+        ax_pareto.annotate(
+            f"{_VIDEO_MODE_LABELS.get(mode, mode)}\n({_TRACKER_LABELS.get(tracker, tracker)})",
+            (fps, hota),
+            textcoords="offset points",
+            xytext=(6, -4),
+            fontsize=8,
+        )
+    ax_pareto.axvline(float(target_fps), color="#dc2626", linestyle="--", linewidth=1.5, label=f"{target_fps:.0f} FPS Target")
+    ax_pareto.set_title("Speed-Accuracy Pareto (E2E CPU FPS vs HOTA)", fontweight="bold")
+    ax_pareto.set_xlabel("End-to-End CPU FPS (higher is better)")
+    ax_pareto.set_ylabel("HOTA % (higher is better)")
+    ax_pareto.grid(True, alpha=0.25)
+    ax_pareto.legend(loc="lower right")
+
+    x_pos = np.arange(len(modes))
+    width = 0.72 / max(len(trackers), 1)
+    mode_labels = [_VIDEO_MODE_LABELS.get(m, m) for m in modes]
+
+    ax_rec = axes[0, 1]
+    for idx, tracker in enumerate(trackers):
+        sub = df[df["tracker"] == tracker].set_index("mode")
+        rec_sm = [
+            float(sub.loc[m, "track_recall_small"]) * 100.0
+            if m in sub.index and pd.notna(sub.loc[m, "track_recall_small"])
+            else 0.0
+            for m in modes
+        ]
+        deta = [
+            float(sub.loc[m, "DetA"]) if m in sub.index and pd.notna(sub.loc[m, "DetA"]) else 0.0
+            for m in modes
+        ]
+        offset = (idx - (len(trackers) - 1) / 2) * width
+        color = "#2563eb" if tracker == "bytetrack" else "#dc2626"
+        bars_sm = ax_rec.bar(
+            x_pos + offset,
+            rec_sm,
+            width=width * 0.48,
+            color=color,
+            label=f"{_TRACKER_LABELS.get(tracker, tracker)} Recall_small %",
+        )
+        bars_det = ax_rec.bar(
+            x_pos + offset + width * 0.48,
+            deta,
+            width=width * 0.48,
+            color=color,
+            alpha=0.45,
+            hatch="//",
+            label=f"{_TRACKER_LABELS.get(tracker, tracker)} DetA %",
+        )
+        for bar, val in zip(list(bars_sm) + list(bars_det), rec_sm + deta):
+            if val > 0:
+                ax_rec.text(bar.get_x() + bar.get_width() / 2, val + 1.0, f"{val:.1f}", ha="center", va="bottom", fontsize=7.5)
+    ax_rec.set_title("Small-Target Recall (<32x32) & DetA", fontweight="bold")
+    ax_rec.set_xticks(x_pos + width * 0.24)
+    ax_rec.set_xticklabels(mode_labels)
+    ax_rec.set_ylim(0, 112)
+    ax_rec.set_ylabel("Percentage (%)")
+    ax_rec.grid(axis="y", alpha=0.25)
+    ax_rec.legend(loc="lower right", ncol=2, fontsize=8)
+
+    ax_stab = axes[1, 0]
+    for idx, tracker in enumerate(trackers):
+        sub = df[df["tracker"] == tracker].set_index("mode")
+        idf1_vals = [float(sub.loc[m, "IDF1"]) if m in sub.index and pd.notna(sub.loc[m, "IDF1"]) else 0.0 for m in modes]
+        idsw_vals = [int(sub.loc[m, "IDSW"]) if m in sub.index and pd.notna(sub.loc[m, "IDSW"]) else 0 for m in modes]
+        offset = (idx - (len(trackers) - 1) / 2) * width
+        color = "#2563eb" if tracker == "bytetrack" else "#dc2626"
+        bars = ax_stab.bar(
+            x_pos + offset,
+            idf1_vals,
+            width=width,
+            color=color,
+            alpha=0.82,
+            label=f"{_TRACKER_LABELS.get(tracker, tracker)} IDF1",
+        )
+        for bar, val, sw in zip(bars, idf1_vals, idsw_vals):
+            ax_stab.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + 1.2,
+                f"{val:.1f}%\n(IDSW={sw})",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+    ax_stab.set_title("Track Identity Stability (IDF1 & ID Switches)", fontweight="bold")
+    ax_stab.set_xticks(x_pos)
+    ax_stab.set_xticklabels(mode_labels)
+    ax_stab.set_ylim(0, 115)
+    ax_stab.set_ylabel("IDF1 % (higher is better)")
+    ax_stab.grid(axis="y", alpha=0.25)
+    ax_stab.legend(loc="lower right", fontsize=8)
+
+    ax_lat = axes[1, 1]
+    for idx, tracker in enumerate(trackers):
+        sub = df[df["tracker"] == tracker].set_index("mode")
+        mean_vals = [float(sub.loc[m, "e2e_mean_ms"]) if m in sub.index else 0.0 for m in modes]
+        p95_vals = [float(sub.loc[m, "e2e_p95_ms"]) if m in sub.index else 0.0 for m in modes]
+        pct640_vals = [float(sub.loc[m, "pct_track_frames"]) if m in sub.index else 0.0 for m in modes]
+        offset = (idx - (len(trackers) - 1) / 2) * width
+        color = "#059669" if tracker == "bytetrack" else "#f59e0b"
+        bars = ax_lat.bar(
+            x_pos + offset,
+            mean_vals,
+            width=width,
+            color=color,
+            alpha=0.82,
+            label=f"{_TRACKER_LABELS.get(tracker, tracker)} Mean ms",
+        )
+        ax_lat.scatter(
+            x_pos + offset,
+            p95_vals,
+            color="#0f172a",
+            marker="^",
+            s=36,
+            zorder=5,
+            label="p95 ms" if idx == 0 else None,
+        )
+        for bar, val, pct in zip(bars, mean_vals, pct640_vals):
+            ax_lat.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + max(mean_vals) * 0.02,
+                f"{val:.1f}ms\n({pct:.0f}% 640)",
+                ha="center",
+                va="bottom",
+                fontsize=7.5,
+            )
+    ax_lat.axhline(1000.0 / float(target_fps), color="#dc2626", linestyle=":", linewidth=1.4, label=f"{1000.0 / float(target_fps):.1f}ms Budget")
+    ax_lat.set_title("CPU Latency (Mean / p95) & 640 Track Share", fontweight="bold")
+    ax_lat.set_xticks(x_pos)
+    ax_lat.set_xticklabels(mode_labels)
+    ax_lat.set_ylabel("Latency (ms/frame, lower is better)")
+    ax_lat.grid(axis="y", alpha=0.25)
+    ax_lat.legend(loc="upper right", fontsize=8)
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
