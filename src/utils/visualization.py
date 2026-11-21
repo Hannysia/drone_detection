@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 import numpy as np
@@ -1064,5 +1065,394 @@ def plot_error_gallery(
 
     for ax in flat_axes[len(items):]:
         ax.axis("off")
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+_QUANTIZATION_STAGE_ORDER = (
+    "pytorch_fp32",
+    "onnx_fp32",
+    "onnx_int8",
+    "openvino_fp32",
+    "openvino_int8",
+)
+_QUANTIZATION_STAGE_LABELS = {
+    "pytorch_fp32": "PyTorch FP32",
+    "onnx_fp32": "ONNX FP32",
+    "onnx_int8": "ONNX INT8",
+    "openvino_fp32": "OpenVINO FP32",
+    "openvino_int8": "OpenVINO INT8",
+}
+
+
+def load_quantization_reports(
+    quantization_dir: Path,
+    *,
+    eval_split: str = "val",
+) -> tuple[pd.DataFrame, dict]:
+    """Loads ablation CSV and metadata JSON for the requested evaluation split."""
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+
+    report_dir = Path(quantization_dir) / "reports" / eval_split
+    csv_path = report_dir / "ablation_results.csv"
+    metadata_path = report_dir / "quantization_metadata.json"
+
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Quantization ablation CSV not found: {csv_path}")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Quantization metadata JSON not found: {metadata_path}")
+
+    results_df = pd.read_csv(csv_path)
+    if results_df.empty:
+        raise ValueError(f"Quantization ablation CSV is empty: {csv_path}")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return results_df, metadata
+
+
+def _ordered_quantization_stages(stages_present) -> list[str]:
+    known = [s for s in _QUANTIZATION_STAGE_ORDER if s in set(stages_present)]
+    extra = sorted(s for s in set(stages_present) if s not in _QUANTIZATION_STAGE_ORDER)
+    return known + extra
+
+
+def plot_quantization_ablation_dashboard(
+    results_df: pd.DataFrame,
+    metadata: dict | None = None,
+    *,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots a 2x2 CPU quantization ablation dashboard across formats and resolutions."""
+    required = {
+        "imgsz",
+        "stage",
+        "compute_mean_ms",
+        "e2e_mean_ms",
+        "e2e_fps",
+        "AP50",
+        "AP50_small",
+        "mAP50",
+        "Neg FPR @ R>=0.85 (%)",
+        "Recall_small @ Neg FPR<=5%",
+    }
+    if results_df.empty or not required.issubset(results_df.columns):
+        missing = sorted(required - set(results_df.columns))
+        raise ValueError(f"Invalid quantization ablation dataframe; missing: {missing}")
+
+    df = results_df.copy()
+    stages = _ordered_quantization_stages(df["stage"])
+    resolutions = sorted((int(r) for r in df["imgsz"].unique()), reverse=True)
+    res_colors = {1280: "#2563eb", 640: "#059669"}
+    fallback_palette = ("#7c3aed", "#ea580c", "#0284c7")
+
+    def _res_color(idx: int, imgsz: int) -> str:
+        return res_colors.get(imgsz, fallback_palette[idx % len(fallback_palette)])
+
+    eval_split = str((metadata or {}).get("eval_split", "")).upper()
+    title_suffix = f" ({eval_split})" if eval_split else ""
+
+    fig, axes = plt.subplots(2, 2, figsize=(18, 11))
+    fig.suptitle(
+        f"CPU Quantization & Resolution Ablation{title_suffix}",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    x_pos = np.arange(len(stages))
+    width = 0.72 / max(len(resolutions), 1)
+    stage_labels = [_QUANTIZATION_STAGE_LABELS.get(s, s) for s in stages]
+
+    ax_lat = axes[0, 0]
+    for idx, imgsz in enumerate(resolutions):
+        sub = df[df["imgsz"] == imgsz].set_index("stage")
+        e2e_vals = [float(sub.loc[s, "e2e_mean_ms"]) if s in sub.index else 0.0 for s in stages]
+        comp_vals = [float(sub.loc[s, "compute_mean_ms"]) if s in sub.index else 0.0 for s in stages]
+        fps_vals = [float(sub.loc[s, "e2e_fps"]) if s in sub.index else 0.0 for s in stages]
+        offset = (idx - (len(resolutions) - 1) / 2) * width
+        color = _res_color(idx, imgsz)
+        bars = ax_lat.bar(
+            x_pos + offset,
+            e2e_vals,
+            width=width,
+            color=color,
+            alpha=0.85,
+            label=f"{imgsz} End-to-End ms",
+        )
+        ax_lat.scatter(
+            x_pos + offset,
+            comp_vals,
+            color="#0f172a",
+            marker="D",
+            s=36,
+            zorder=5,
+            label=f"{imgsz} Compute-Only ms" if idx == 0 else None,
+        )
+        for bar, val, fps in zip(bars, e2e_vals, fps_vals):
+            if val > 0:
+                ax_lat.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    val + max(e2e_vals) * 0.02,
+                    f"{val:.1f}ms\n({fps:.1f}fps)",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+    ax_lat.set_title("CPU Latency: End-to-End vs Compute-Only", fontweight="bold")
+    ax_lat.set_xticks(x_pos)
+    ax_lat.set_xticklabels(stage_labels, rotation=15, ha="right")
+    ax_lat.set_ylabel("Latency (ms, lower is better)")
+    ax_lat.grid(axis="y", alpha=0.25)
+    ax_lat.legend(loc="upper right")
+
+    eval_stages = [s for s in stages if df[df["stage"] == s]["AP50"].notna().any()]
+    x_eval = np.arange(len(eval_stages))
+    eval_labels = [_QUANTIZATION_STAGE_LABELS.get(s, s) for s in eval_stages]
+    ax_acc = axes[0, 1]
+    for idx, imgsz in enumerate(resolutions):
+        sub = df[df["imgsz"] == imgsz].set_index("stage")
+        ap50_vals = [
+            float(sub.loc[s, "AP50"]) if s in sub.index and pd.notna(sub.loc[s, "AP50"]) else 0.0
+            for s in eval_stages
+        ]
+        small_vals = [
+            float(sub.loc[s, "AP50_small"])
+            if s in sub.index and pd.notna(sub.loc[s, "AP50_small"])
+            else 0.0
+            for s in eval_stages
+        ]
+        offset = (idx - (len(resolutions) - 1) / 2) * width
+        color = _res_color(idx, imgsz)
+        bars_ap = ax_acc.bar(
+            x_eval + offset,
+            ap50_vals,
+            width=width * 0.48,
+            color=color,
+            label=f"{imgsz} AP50",
+        )
+        bars_sm = ax_acc.bar(
+            x_eval + offset + width * 0.48,
+            small_vals,
+            width=width * 0.48,
+            color=color,
+            alpha=0.45,
+            hatch="//",
+            label=f"{imgsz} AP50_small",
+        )
+        for bar, val in zip(bars_ap, ap50_vals):
+            if val > 0:
+                ax_acc.text(bar.get_x() + bar.get_width() / 2, val + 0.012, f"{val:.3f}", ha="center", va="bottom", fontsize=7.5)
+        for bar, val in zip(bars_sm, small_vals):
+            if val > 0:
+                ax_acc.text(bar.get_x() + bar.get_width() / 2, val + 0.012, f"{val:.3f}", ha="center", va="bottom", fontsize=7.5)
+    ax_acc.set_title("Threshold-Free Detection Quality (AP50 vs AP50_small)", fontweight="bold")
+    ax_acc.set_xticks(x_eval + width * 0.24)
+    ax_acc.set_xticklabels(eval_labels, rotation=15, ha="right")
+    ax_acc.set_ylim(0, 1.12)
+    ax_acc.set_ylabel("AP50")
+    ax_acc.grid(axis="y", alpha=0.25)
+    ax_acc.legend(loc="lower right", ncol=2, fontsize=8)
+
+    ax_safe = axes[1, 0]
+    ax_fpr = ax_safe.twinx()
+    for idx, imgsz in enumerate(resolutions):
+        sub = df[df["imgsz"] == imgsz].set_index("stage")
+        rec_sm = [
+            float(sub.loc[s, "Recall_small @ Neg FPR<=5%"])
+            if s in sub.index and pd.notna(sub.loc[s, "Recall_small @ Neg FPR<=5%"])
+            else 0.0
+            for s in eval_stages
+        ]
+        neg_fpr = [
+            float(sub.loc[s, "Neg FPR @ R>=0.85 (%)"])
+            if s in sub.index and pd.notna(sub.loc[s, "Neg FPR @ R>=0.85 (%)"])
+            else np.nan
+            for s in eval_stages
+        ]
+        offset = (idx - (len(resolutions) - 1) / 2) * width
+        color = _res_color(idx, imgsz)
+        ax_safe.bar(
+            x_eval + offset,
+            rec_sm,
+            width=width,
+            color=color,
+            alpha=0.75,
+            label=f"{imgsz} Recall_small @ Neg FPR<=5%",
+        )
+        valid_pts = [(pos, fpr) for pos, fpr in zip(x_eval + offset, neg_fpr) if pd.notna(fpr)]
+        if valid_pts:
+            ax_fpr.plot(
+                [p[0] for p in valid_pts],
+                [p[1] for p in valid_pts],
+                marker="o",
+                linestyle="--",
+                color="#dc2626" if idx == 0 else "#f59e0b",
+                linewidth=1.8,
+                label=f"{imgsz} Neg FPR @ R>=0.85 (%)",
+            )
+    ax_safe.set_title("Small-Target Recall vs Background False Alarms", fontweight="bold")
+    ax_safe.set_xticks(x_eval)
+    ax_safe.set_xticklabels(eval_labels, rotation=15, ha="right")
+    ax_safe.set_ylim(0, 1.1)
+    ax_safe.set_ylabel("Recall_small @ Neg FPR<=5% (higher better)")
+    ax_fpr.set_ylabel("Neg FPR @ R>=0.85 % (lower better)", color="#b91c1c")
+    ax_safe.grid(axis="y", alpha=0.25)
+    h1, l1 = ax_safe.get_legend_handles_labels()
+    h2, l2 = ax_fpr.get_legend_handles_labels()
+    if h1 or h2:
+        ax_safe.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=8)
+
+    ax_pareto = axes[1, 1]
+    stage_colors = {
+        "onnx_fp32": "#64748b",
+        "onnx_int8": "#2563eb",
+        "openvino_fp32": "#f59e0b",
+        "openvino_int8": "#059669",
+    }
+    res_markers = {1280: "o", 640: "s"}
+    for _, row in df[df["AP50"].notna()].iterrows():
+        imgsz = int(row["imgsz"])
+        stage = str(row["stage"])
+        fps = float(row["e2e_fps"])
+        ap50 = float(row["AP50"])
+        ax_pareto.scatter(
+            fps,
+            ap50,
+            color=stage_colors.get(stage, "#7c3aed"),
+            marker=res_markers.get(imgsz, "^"),
+            s=110,
+            edgecolor="black",
+            linewidth=0.8,
+            zorder=4,
+        )
+        ax_pareto.annotate(
+            f"{_QUANTIZATION_STAGE_LABELS.get(stage, stage)}\n({imgsz})",
+            (fps, ap50),
+            textcoords="offset points",
+            xytext=(6, -4),
+            fontsize=8,
+        )
+    ax_pareto.set_title("Speed-Accuracy Pareto Frontier (CPU End-to-End)", fontweight="bold")
+    ax_pareto.set_xlabel("End-to-End FPS (higher is better)")
+    ax_pareto.set_ylabel("Threshold-Free AP50 (higher is better)")
+    ax_pareto.grid(True, alpha=0.25)
+
+    _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
+
+
+def plot_quantization_curves(
+    metadata: dict,
+    *,
+    save_path: Path | None = None,
+    show: bool = True,
+) -> None:
+    """Plots threshold-free PR, small-recall vs Neg FA curves, and TP confidence spread."""
+    stage_details = metadata.get("stage_details") or {}
+    if not stage_details:
+        raise ValueError("Missing stage_details curves in quantization metadata")
+
+    def _key_sort(name: str) -> tuple[int, int, str]:
+        stem, _, res_str = name.rpartition("_")
+        res = int(res_str) if res_str.isdigit() else 0
+        order_idx = (
+            _QUANTIZATION_STAGE_ORDER.index(stem)
+            if stem in _QUANTIZATION_STAGE_ORDER
+            else len(_QUANTIZATION_STAGE_ORDER)
+        )
+        return -res, order_idx, name
+
+    stage_colors = {
+        "onnx_fp32": "#64748b",
+        "onnx_int8": "#2563eb",
+        "openvino_fp32": "#f59e0b",
+        "openvino_int8": "#059669",
+        "pytorch_fp32": "#7c3aed",
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5.5))
+    fig.suptitle(
+        "Threshold-Free Quantization Curves & Tracker Confidence Alignment",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    for key in sorted(stage_details, key=_key_sort):
+        curves = stage_details[key].get("curves") or {}
+        if not curves:
+            continue
+        stage_name, _, res_str = key.rpartition("_")
+        label = f"{_QUANTIZATION_STAGE_LABELS.get(stage_name, stage_name)} ({res_str})"
+        color = stage_colors.get(stage_name, "#0f172a")
+        linestyle = "-" if res_str == "1280" else "--"
+
+        axes[0].plot(
+            curves.get("recall", []),
+            curves.get("precision", []),
+            label=label,
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.8,
+        )
+        axes[1].plot(
+            curves.get("neg_fa_rate", []),
+            curves.get("recall_small", []),
+            label=label,
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.8,
+        )
+
+    axes[0].set_title("Precision-Recall Curve Across Formats", fontweight="bold")
+    axes[0].set_xlabel("Recall")
+    axes[0].set_ylabel("Precision")
+    axes[0].set_xlim(0, 1.02)
+    axes[0].set_ylim(0, 1.05)
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(loc="lower left", fontsize=8)
+
+    axes[1].axvline(5.0, color="#dc2626", linestyle=":", linewidth=1.5, label="5% Neg FA Target")
+    axes[1].set_title("Small-Target Recall vs Background False Alarms", fontweight="bold")
+    axes[1].set_xlabel("Negative Frame False Alarm Rate (%)")
+    axes[1].set_ylabel("Small-Target Recall")
+    axes[1].set_ylim(0, 1.05)
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(loc="lower right", fontsize=8)
+
+    summary_rows = [
+        row
+        for row in (metadata.get("summary_rows") or [])
+        if row.get("tp_conf_median") is not None and pd.notna(row.get("tp_conf_median"))
+    ]
+    ax_conf = axes[2]
+    ax_conf.axhspan(0.3, 0.7, color="#dbeafe", alpha=0.5, label="ByteTrack track_thresh Grid (0.3-0.7)")
+    if summary_rows:
+        y_labels = [
+            f"{_QUANTIZATION_STAGE_LABELS.get(str(r['stage']), r['stage'])} ({int(r['imgsz'])})"
+            for r in summary_rows
+        ]
+        x_idx = np.arange(len(summary_rows))
+        medians = np.asarray([float(r["tp_conf_median"]) for r in summary_rows])
+        p10s = np.asarray([float(r["tp_conf_p10"]) for r in summary_rows])
+        p90s = np.asarray([float(r["tp_conf_p90"]) for r in summary_rows])
+        yerr = np.vstack([np.maximum(0.0, medians - p10s), np.maximum(0.0, p90s - medians)])
+        ax_conf.errorbar(
+            x_idx,
+            medians,
+            yerr=yerr,
+            fmt="o",
+            color="#0f172a",
+            ecolor="#475569",
+            elinewidth=2,
+            capsize=5,
+            label="TP Conf Median (p10-p90)",
+        )
+        ax_conf.set_xticks(x_idx)
+        ax_conf.set_xticklabels(y_labels, rotation=25, ha="right", fontsize=8)
+    ax_conf.set_title("TP Confidence Stability (p10 / Median / p90)", fontweight="bold")
+    ax_conf.set_ylim(0, 1.05)
+    ax_conf.set_ylabel("Confidence Score")
+    ax_conf.grid(axis="y", alpha=0.25)
+    ax_conf.legend(loc="lower right", fontsize=8)
 
     _finalize_figure(fig, Path(save_path) if save_path is not None else None, show)
