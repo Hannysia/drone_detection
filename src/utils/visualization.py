@@ -1091,8 +1091,8 @@ def load_quantization_reports(
     eval_split: str = "val",
 ) -> tuple[pd.DataFrame, dict]:
     """Loads ablation CSV and metadata JSON for the requested evaluation split."""
-    if eval_split not in {"val", "test"}:
-        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+    if eval_split not in {"val", "test", "ptq_ablation_val", "ptq_ablation_test"}:
+        raise ValueError(f"eval_split must be 'val', 'test', 'ptq_ablation_val' or 'ptq_ablation_test', got {eval_split!r}")
 
     report_dir = Path(quantization_dir) / "reports" / eval_split
     csv_path = report_dir / "ablation_results.csv"

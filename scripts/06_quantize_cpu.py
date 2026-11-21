@@ -13,7 +13,9 @@ from src.config import MANIFESTS_DIR, QUANTIZATION_RESOLUTIONS
 from src.processing.quantization import (
     ALL_STAGES,
     DEFAULT_CALIBRATION_IMAGES,
+    PTQ_VARIANT_SPECS,
     run_cpu_quantization_ablation,
+    run_ptq_variant_ablation,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -133,6 +135,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also run full CPU evaluation for baseline PyTorch FP32 weights.",
     )
     parser.add_argument(
+        "--ptq-ablation",
+        action="store_true",
+        help="Run isolated local PTQ calibration/head/NNCF ablation without uploading models to HF.",
+    )
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=tuple(PTQ_VARIANT_SPECS),
+        default=list(PTQ_VARIANT_SPECS),
+        help="Subset of PTQ ablation variants when --ptq-ablation is enabled.",
+    )
+    parser.add_argument(
         "--upload",
         action="store_true",
         help="Upload final INT8 artifacts and split reports to Hugging Face.",
@@ -160,6 +174,8 @@ def _parse_and_validate_args(argv: list[str] | None = None) -> argparse.Namespac
         parser.error("--n-benchmark must be positive")
     if not 0.0 < args.collection_conf <= 1.0:
         parser.error("--collection-conf must be in (0, 1]")
+    if args.ptq_ablation and args.upload:
+        parser.error("--ptq-ablation cannot be combined with --upload")
     if args.hf_tag and not args.upload:
         parser.error("--hf-tag requires --upload")
 
@@ -186,7 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.quantization_dir is not None
         else config.QUANTIZATION_DIR
     )
-    log_path = target_quant_dir / "reports" / args.split / "quantize_cpu.log"
+    report_subdir = f"ptq_ablation_{args.split}" if args.ptq_ablation else args.split
+    log_path = target_quant_dir / "reports" / report_subdir / "quantize_cpu.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -194,28 +211,48 @@ def main(argv: list[str] | None = None) -> int:
     root_logger.addHandler(file_handler)
 
     try:
-        result = run_cpu_quantization_ablation(
-            dataset_root,
-            weights_path=args.weights,
-            quantization_dir=target_quant_dir,
-            working_dir=args.working_dir,
-            resolutions=tuple(args.resolutions),
-            stages=tuple(dict.fromkeys(args.stages)),
-            eval_split=args.split,
-            eval_pytorch=args.eval_pytorch,
-            resume=args.resume,
-            skip_existing_exports=args.skip_existing_exports,
-            max_calibration_images=args.calibration_images,
-            calibrate_method=args.calibrate_method,
-            seed=args.seed,
-            n_warmup=args.n_warmup,
-            n_benchmark=args.n_benchmark,
-            collection_conf=args.collection_conf,
-            manifest_path=args.manifest_path,
-            source_path=source_path,
-            upload_to_hf=args.upload,
-            hf_tag=args.hf_tag,
-        )
+        if args.ptq_ablation:
+            result = run_ptq_variant_ablation(
+                dataset_root,
+                weights_path=args.weights,
+                quantization_dir=target_quant_dir,
+                working_dir=args.working_dir,
+                resolutions=tuple(args.resolutions),
+                variants=tuple(dict.fromkeys(args.variants)),
+                eval_split=args.split,
+                resume=args.resume,
+                skip_existing_exports=args.skip_existing_exports,
+                max_calibration_images=args.calibration_images,
+                seed=args.seed,
+                n_warmup=args.n_warmup,
+                n_benchmark=args.n_benchmark,
+                collection_conf=args.collection_conf,
+                manifest_path=args.manifest_path,
+                source_path=source_path,
+            )
+        else:
+            result = run_cpu_quantization_ablation(
+                dataset_root,
+                weights_path=args.weights,
+                quantization_dir=target_quant_dir,
+                working_dir=args.working_dir,
+                resolutions=tuple(args.resolutions),
+                stages=tuple(dict.fromkeys(args.stages)),
+                eval_split=args.split,
+                eval_pytorch=args.eval_pytorch,
+                resume=args.resume,
+                skip_existing_exports=args.skip_existing_exports,
+                max_calibration_images=args.calibration_images,
+                calibrate_method=args.calibrate_method,
+                seed=args.seed,
+                n_warmup=args.n_warmup,
+                n_benchmark=args.n_benchmark,
+                collection_conf=args.collection_conf,
+                manifest_path=args.manifest_path,
+                source_path=source_path,
+                upload_to_hf=args.upload,
+                hf_tag=args.hf_tag,
+            )
 
         df = result["results_df"]
         cols = [col for col in _SUMMARY_COLUMNS if col in df.columns]
@@ -228,9 +265,11 @@ def main(argv: list[str] | None = None) -> int:
         failed = result.get("failed_stages") or []
         if failed:
             failed_names = " ".join(sorted({item["stage"] for item in failed}))
+            flag = "--ptq-ablation --variants" if args.ptq_ablation else "--stages"
             log.error(
-                "Some stages failed. Re-run safely with: .venv\\Scripts\\python.exe scripts\\06_quantize_cpu.py --split %s --resume --stages %s",
+                "Some stages failed. Re-run safely with: .venv\\Scripts\\python.exe scripts\\06_quantize_cpu.py --split %s --resume %s %s",
                 args.split,
+                flag,
                 failed_names,
             )
             return 1

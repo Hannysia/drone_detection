@@ -577,6 +577,20 @@ def _copy_onnx_metadata_and_ir(source_model: onnx.ModelProto, target_path: Path)
     onnx.save(quantized, str(target_path))
 
 
+def _finalize_quantized_onnx(
+    source_model: onnx.ModelProto,
+    staged_path: Path,
+    output_path: Path,
+    *,
+    ort_module,
+) -> Path:
+    if not staged_path.is_file():
+        raise FileNotFoundError(f"Quantized ONNX INT8 output was not created: {staged_path}")
+    _copy_onnx_metadata_and_ir(source_model, staged_path)
+    ort_module.InferenceSession(str(staged_path), providers=["CPUExecutionProvider"])
+    return _move_artifact(staged_path, output_path)
+
+
 def quantize_onnx_int8(
     onnx_fp32_path: Path,
     output_path: Path,
@@ -585,6 +599,9 @@ def quantize_onnx_int8(
     imgsz: int,
     calibrate_method: str = "MinMax",
     exclude_head_convs: bool = False,
+    moving_average: bool = False,
+    calibration_symmetric: bool | None = None,
+    percentile: float | None = None,
 ) -> Path:
     """Quantizes an ONNX FP32 model to QDQ INT8 with end2end head exclusion and ARM64 parity."""
     import onnxruntime as ort
@@ -603,11 +620,25 @@ def quantize_onnx_int8(
     ort_method = method_map.get(calibrate_method.strip().lower())
     if ort_method is None:
         raise ValueError(f"Unsupported ONNX calibrate_method: {calibrate_method!r}")
+    if moving_average and ort_method != CalibrationMethod.MinMax:
+        raise ValueError("moving_average calibration option is only valid with MinMax")
 
     source_model = onnx.load(str(onnx_fp32_path))
     if not source_model.graph.input:
         raise ValueError(f"ONNX model has no graph inputs: {onnx_fp32_path}")
     input_name = source_model.graph.input[0].name
+
+    extra_options: dict[str, object] = {
+        "ActivationSymmetric": False,
+        "WeightSymmetric": True,
+    }
+    if moving_average:
+        extra_options["CalibMovingAverage"] = True
+        extra_options["CalibMovingAverageConstant"] = 0.01
+    if calibration_symmetric is not None:
+        extra_options["CalibTensorRangeSymmetric"] = bool(calibration_symmetric)
+    if percentile is not None:
+        extra_options["CalibPercentile"] = float(percentile)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output_path.parent) as tmp_dir:
@@ -633,18 +664,14 @@ def quantize_onnx_int8(
             nodes_to_exclude=nodes_to_exclude,
             calibrate_method=ort_method,
             calibration_providers=["CPUExecutionProvider"],
-            extra_options={"ActivationSymmetric": False, "WeightSymmetric": True},
+            extra_options=extra_options,
         )
-        if not tmp_int8.is_file():
-            raise FileNotFoundError(f"Quantized ONNX INT8 output was not created: {tmp_int8}")
-
-        _copy_onnx_metadata_and_ir(source_model, tmp_int8)
-        ort.InferenceSession(str(tmp_int8), providers=["CPUExecutionProvider"])
-        _move_artifact(tmp_int8, output_path)
+        _finalize_quantized_onnx(source_model, tmp_int8, output_path, ort_module=ort)
 
     log.info(
-        "Exported ONNX INT8 (%s, exclude_head_convs=%s, excluded %d nodes) -> %s",
+        "Exported ONNX INT8 (%s, moving_average=%s, exclude_head_convs=%s, excluded %d nodes) -> %s",
         calibrate_method,
+        moving_average,
         exclude_head_convs,
         len(nodes_to_exclude),
         output_path,
@@ -748,6 +775,119 @@ def export_openvino_int8(
     )
 
 
+def quantize_onnx_int8_nncf(
+    onnx_fp32_path: Path,
+    output_path: Path,
+    calibration_images: list[Path],
+    *,
+    imgsz: int,
+    exclude_head_convs: bool = False,
+    fast_bias_correction: bool = True,
+) -> Path:
+    """Quantizes an ONNX FP32 model to INT8 using NNCF with bias correction."""
+    import nncf
+    import onnxruntime as ort
+
+    if not onnx_fp32_path.is_file():
+        raise FileNotFoundError(f"ONNX FP32 model not found: {onnx_fp32_path}")
+    if not calibration_images:
+        raise ValueError("calibration_images must not be empty")
+
+    source_model = onnx.load(str(onnx_fp32_path))
+    if not source_model.graph.input:
+        raise ValueError(f"ONNX model has no graph inputs: {onnx_fp32_path}")
+    input_name = source_model.graph.input[0].name
+
+    nodes_to_exclude = select_onnx_nodes_to_exclude(
+        source_model,
+        exclude_head_convs=exclude_head_convs,
+    )
+    ignored_scope = (
+        nncf.IgnoredScope(names=nodes_to_exclude, validate=False)
+        if nodes_to_exclude
+        else None
+    )
+    cal_dataset = nncf.Dataset(
+        calibration_images,
+        lambda path: {input_name: _preprocess_onnx_image(path, imgsz)},
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=output_path.parent) as tmp_dir:
+        tmp_int8 = Path(tmp_dir) / output_path.name
+        quantized_model = nncf.quantize(
+            model=source_model,
+            calibration_dataset=cal_dataset,
+            preset=nncf.QuantizationPreset.MIXED,
+            subset_size=len(calibration_images),
+            fast_bias_correction=fast_bias_correction,
+            ignored_scope=ignored_scope,
+        )
+        onnx.save(quantized_model, str(tmp_int8))
+        _finalize_quantized_onnx(source_model, tmp_int8, output_path, ort_module=ort)
+
+    log.info(
+        "Exported ONNX INT8 NNCF (exclude_head_convs=%s, excluded %d nodes) -> %s",
+        exclude_head_convs,
+        len(nodes_to_exclude),
+        output_path,
+    )
+    return output_path
+
+
+def export_openvino_int8_nncf(
+    openvino_fp32_dir: Path,
+    output_dir: Path,
+    calibration_images: list[Path],
+    *,
+    imgsz: int,
+    fast_bias_correction: bool = False,
+) -> Path:
+    """Quantizes an existing OpenVINO FP32 IR model via direct NNCF with Detect head ignored."""
+    import nncf
+    import openvino as ov
+
+    fp32_dir = _validate_openvino_dir(Path(openvino_fp32_dir))
+    if not calibration_images:
+        raise ValueError("calibration_images must not be empty")
+
+    xml_src = next(sorted(fp32_dir.glob("*.xml")).__iter__())
+    core = ov.Core()
+    ov_model = core.read_model(model=str(xml_src), weights=str(xml_src.with_suffix(".bin")))
+
+    cal_dataset = nncf.Dataset(
+        calibration_images,
+        lambda path: _preprocess_onnx_image(path, imgsz),
+    )
+    ignored_scope = nncf.IgnoredScope(
+        patterns=[r".*model\.23/.*"],
+        types=["Sigmoid"],
+        validate=False,
+    )
+
+    quantized_model = nncf.quantize(
+        model=ov_model,
+        calibration_dataset=cal_dataset,
+        preset=nncf.QuantizationPreset.MIXED,
+        subset_size=len(calibration_images),
+        fast_bias_correction=fast_bias_correction,
+        ignored_scope=ignored_scope,
+    )
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=output_dir.parent) as tmp_dir:
+        tmp_out = Path(tmp_dir) / output_dir.name
+        tmp_out.mkdir(parents=True, exist_ok=True)
+        ov.save_model(quantized_model, str(tmp_out / xml_src.name), compress_to_fp16=False)
+        meta_src = fp32_dir / "metadata.yaml"
+        if meta_src.is_file():
+            shutil.copy2(meta_src, tmp_out / "metadata.yaml")
+        _validate_openvino_dir(tmp_out)
+        _move_artifact(tmp_out, output_dir)
+
+    return _validate_openvino_dir(output_dir)
+
+
 def export_stage_models(
     weights_path: Path,
     quantization_dir: Path,
@@ -794,7 +934,7 @@ def export_stage_models(
 
 
 def _is_valid_stage_artifact(stage_name: str, artifact_path: Path) -> bool:
-    if stage_name in {"openvino_fp32", "openvino_int8"}:
+    if stage_name.startswith("openvino_"):
         try:
             _validate_openvino_dir(artifact_path)
             return True
@@ -876,6 +1016,23 @@ _INT8_TO_FP32_BASELINE = {
     "openvino_int8": "openvino_fp32",
 }
 
+_ALLOWED_REPORT_SPLITS = frozenset({
+    "val",
+    "test",
+    "ptq_ablation_val",
+    "ptq_ablation_test",
+})
+
+
+def _resolve_fp32_baseline_stage(stage: str) -> str | None:
+    if stage in _INT8_TO_FP32_BASELINE:
+        return _INT8_TO_FP32_BASELINE[stage]
+    if stage.startswith("onnx_int8"):
+        return "onnx_fp32"
+    if stage.startswith("openvino_int8"):
+        return "openvino_fp32"
+    return None
+
 
 def _load_yolo_for_artifact(artifact_path: Path) -> YOLO:
     if artifact_path.suffix.lower() == ".pt":
@@ -903,10 +1060,22 @@ def _get_process_memory_mb() -> tuple[float, float]:
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
 
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            get_mem_info = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+            if get_mem_info is None:
+                get_mem_info = ctypes.windll.psapi.GetProcessMemoryInfo
+            get_mem_info.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_MemoryCounters),
+                wintypes.DWORD,
+            ]
+            get_mem_info.restype = wintypes.BOOL
+
             counters = _MemoryCounters()
             counters.cb = ctypes.sizeof(_MemoryCounters)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            handle = kernel32.GetCurrentProcess()
+            if get_mem_info(handle, ctypes.byref(counters), counters.cb):
                 mb = 1024 * 1024
                 return counters.WorkingSetSize / mb, counters.PeakWorkingSetSize / mb
         except Exception:
@@ -1387,7 +1556,7 @@ def _annotate_ablation_deltas(rows: list[dict[str, object]]) -> pd.DataFrame:
         stage = str(row["stage"])
         pt_raw = by_key.get((imgsz, "pytorch_fp32"))
         pt_ref = pt_raw if pt_raw is not None and pt_raw.get("status", "ok") == "ok" else None
-        fp32_name = _INT8_TO_FP32_BASELINE.get(stage)
+        fp32_name = _resolve_fp32_baseline_stage(stage)
         fp32_raw = by_key.get((imgsz, fp32_name)) if fp32_name else None
         fp32_ref = fp32_raw if fp32_raw is not None and fp32_raw.get("status", "ok") == "ok" else None
 
@@ -1460,8 +1629,8 @@ def save_quantization_reports(
     eval_split: str,
 ) -> tuple[Path, Path]:
     """Saves CPU ablation CSV and full JSON metadata under reports/<eval_split>."""
-    if eval_split not in {"val", "test"}:
-        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+    if eval_split not in _ALLOWED_REPORT_SPLITS:
+        raise ValueError(f"eval_split must be one of {sorted(_ALLOWED_REPORT_SPLITS)}, got {eval_split!r}")
 
     report_dir = Path(quantization_dir) / "reports" / eval_split
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1646,6 +1815,17 @@ def _try_hf_operation(
         return False
 
 
+def _clean_checkpoint_row(row: dict[str, object]) -> dict[str, object]:
+    return {
+        k: (
+            float("nan")
+            if v is None and k not in {"artifact", "error", "stage", "status", "hf_uploaded"}
+            else v
+        )
+        for k, v in row.items()
+    }
+
+
 def _load_resume_checkpoint(
     quantization_dir: Path,
     eval_split: str,
@@ -1681,6 +1861,7 @@ def _load_resume_checkpoint(
         log.warning("Resume checkpoint config mismatch in %s; starting fresh.", meta_path)
         return {}, {}, {}, {}
 
+
     rows_by_key: dict[tuple[int, str], dict[str, object]] = {}
     for row in meta.get("summary_rows") or []:
         if row.get("status") != "ok":
@@ -1689,15 +1870,7 @@ def _load_resume_checkpoint(
         stage_name = str(row["stage"])
         if not _is_valid_stage_artifact(stage_name, artifact):
             continue
-        cleaned_row = {
-            k: (
-                float("nan")
-                if v is None and k not in {"artifact", "error", "stage", "status", "hf_uploaded"}
-                else v
-            )
-            for k, v in row.items()
-        }
-        rows_by_key[(int(row["imgsz"]), stage_name)] = cleaned_row
+        rows_by_key[(int(row["imgsz"]), stage_name)] = _clean_checkpoint_row(row)
 
     details = dict(meta.get("stage_details") or {})
     excluded = dict(onnx_cfg.get("excluded_nodes_by_resolution") or {})
@@ -1705,13 +1878,102 @@ def _load_resume_checkpoint(
     return rows_by_key, details, excluded, fallbacks
 
 
-def _ordered_rows_snapshot(rows_by_key: dict[tuple[int, str], dict[str, object]]) -> list[dict[str, object]]:
+def _ordered_rows_snapshot(
+    rows_by_key: dict[tuple[int, str], dict[str, object]],
+    stage_order: tuple[str, ...] = ALL_STAGES,
+) -> list[dict[str, object]]:
+    order_map = {name: idx for idx, name in enumerate(stage_order)}
+
     def _sort_key(key: tuple[int, str]) -> tuple[int, int, str]:
         imgsz, stage_name = key
-        idx = ALL_STAGES.index(stage_name) if stage_name in ALL_STAGES else len(ALL_STAGES)
-        return -imgsz, idx, stage_name
+        return -imgsz, order_map.get(stage_name, len(order_map)), stage_name
 
     return [rows_by_key[key] for key in sorted(rows_by_key, key=_sort_key)]
+
+
+def _measure_stage_artifact(
+    artifact_path: Path,
+    dataset_root: Path,
+    *,
+    stage_name: str,
+    imgsz: int,
+    bgr_frames: list[np.ndarray],
+    nchw_tensors: list[np.ndarray],
+    eval_split: str,
+    n_warmup: int,
+    n_benchmark: int,
+    collection_conf: float,
+    manifest_path: Path,
+    source_path: Path | None,
+    run_eval: bool = True,
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    size_mb = get_artifact_size_mb(artifact_path)
+    bench = benchmark_stage_model(
+        artifact_path,
+        bgr_frames,
+        nchw_tensors,
+        imgsz=imgsz,
+        n_warmup=n_warmup,
+        n_benchmark=n_benchmark,
+    )
+
+    detail: dict[str, object] | None = None
+    if run_eval:
+        eval_data = evaluate_quantized_stage(
+            artifact_path,
+            Path(dataset_root),
+            None,
+            stage_name,
+            imgsz=imgsz,
+            eval_split=eval_split,
+            collection_conf=collection_conf,
+            manifest_path=manifest_path,
+            source_path=source_path,
+        )
+        eval_metrics = eval_data["metrics"]
+        detail = {
+            "by_scale": eval_data["by_scale"],
+            "curves": eval_data["curves"],
+        }
+    else:
+        eval_metrics = _empty_eval_metrics()
+
+    row: dict[str, object] = {
+        "imgsz": imgsz,
+        "stage": stage_name,
+        "status": "ok",
+        "hf_uploaded": False,
+        "error": "",
+        "artifact": str(artifact_path),
+        "size_mb": size_mb,
+        **bench,
+        **eval_metrics,
+    }
+    log.info(
+        "[STAGE OK] %d %s | e2e=%.2fms (%.1ffps) | mAP50=%.4f | AP50=%.4f | AP50_small=%.4f",
+        imgsz,
+        stage_name,
+        bench["e2e_mean_ms"],
+        bench["e2e_fps"],
+        eval_metrics["mAP50"] if not math.isnan(eval_metrics["mAP50"]) else 0.0,
+        eval_metrics["AP50"] if not math.isnan(eval_metrics["AP50"]) else 0.0,
+        eval_metrics["AP50_small"] if not math.isnan(eval_metrics["AP50_small"]) else 0.0,
+    )
+    return row, detail
+
+
+def _failed_stage_row(imgsz: int, stage_name: str, error: str) -> dict[str, object]:
+    return {
+        "imgsz": imgsz,
+        "stage": stage_name,
+        "status": "failed",
+        "hf_uploaded": False,
+        "error": error,
+        "artifact": "",
+        "size_mb": float("nan"),
+        **_empty_benchmark_metrics(),
+        **_empty_eval_metrics(),
+    }
 
 
 def run_cpu_quantization_ablation(
@@ -1916,70 +2178,26 @@ def run_cpu_quantization_ablation(
                     if "onnx_fallback_full_head" in stage_meta:
                         onnx_fallback_flags[str(imgsz)] = bool(stage_meta["onnx_fallback_full_head"])
 
-                    size_mb = get_artifact_size_mb(artifact_path)
-                    bench = benchmark_stage_model(
+                    measured_row, measured_detail = _measure_stage_artifact(
                         artifact_path,
-                        bgr_frames,
-                        nchw_tensors,
+                        Path(dataset_root),
+                        stage_name=stage_name,
                         imgsz=imgsz,
+                        bgr_frames=bgr_frames,
+                        nchw_tensors=nchw_tensors,
+                        eval_split=eval_split,
                         n_warmup=n_warmup,
                         n_benchmark=n_benchmark,
+                        collection_conf=collection_conf,
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                        run_eval=(stage_name != "pytorch_fp32" or eval_pytorch),
                     )
-
-                    if stage_name != "pytorch_fp32" or eval_pytorch:
-                        eval_data = evaluate_quantized_stage(
-                            artifact_path,
-                            Path(dataset_root),
-                            None,
-                            stage_name,
-                            imgsz=imgsz,
-                            eval_split=eval_split,
-                            collection_conf=collection_conf,
-                            manifest_path=manifest_path,
-                            source_path=source_path,
-                        )
-                        eval_metrics = eval_data["metrics"]
-                        per_stage_details[f"{stage_name}_{imgsz}"] = {
-                            "by_scale": eval_data["by_scale"],
-                            "curves": eval_data["curves"],
-                        }
-                    else:
-                        eval_metrics = _empty_eval_metrics()
-
-                    rows_by_key[(imgsz, stage_name)] = {
-                        "imgsz": imgsz,
-                        "stage": stage_name,
-                        "status": "ok",
-                        "hf_uploaded": False,
-                        "error": "",
-                        "artifact": str(artifact_path),
-                        "size_mb": size_mb,
-                        **bench,
-                        **eval_metrics,
-                    }
-
-                    log.info(
-                        "[STAGE OK] %d %s | e2e=%.2fms (%.1ffps) | mAP50=%.4f | AP50=%.4f | AP50_small=%.4f",
-                        imgsz,
-                        stage_name,
-                        bench["e2e_mean_ms"],
-                        bench["e2e_fps"],
-                        eval_metrics["mAP50"] if not math.isnan(eval_metrics["mAP50"]) else 0.0,
-                        eval_metrics["AP50"] if not math.isnan(eval_metrics["AP50"]) else 0.0,
-                        eval_metrics["AP50_small"] if not math.isnan(eval_metrics["AP50_small"]) else 0.0,
-                    )
+                    rows_by_key[(imgsz, stage_name)] = measured_row
+                    if measured_detail is not None:
+                        per_stage_details[f"{stage_name}_{imgsz}"] = measured_detail
                 except Exception as exc:
-                    rows_by_key[(imgsz, stage_name)] = {
-                        "imgsz": imgsz,
-                        "stage": stage_name,
-                        "status": "failed",
-                        "hf_uploaded": False,
-                        "error": str(exc),
-                        "artifact": "",
-                        "size_mb": float("nan"),
-                        **_empty_benchmark_metrics(),
-                        **_empty_eval_metrics(),
-                    }
+                    rows_by_key[(imgsz, stage_name)] = _failed_stage_row(imgsz, stage_name, str(exc))
                     _save_checkpoint(complete=False)
                 else:
                     _save_checkpoint(complete=False)
@@ -2017,5 +2235,483 @@ def run_cpu_quantization_ablation(
         "csv_path": csv_path,
         "metadata_path": metadata_path,
         "artifacts": artifacts_by_res,
+        "failed_stages": failed_stages,
+    }
+
+
+
+
+PTQ_VARIANT_SPECS: dict[str, dict[str, object]] = {
+    "onnx_int8_minmax_head_int8": {
+        "engine": "ort",
+        "calibrate_method": "MinMax",
+        "moving_average": False,
+        "exclude_head_convs": False,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_moving_avg_head_int8": {
+        "engine": "ort",
+        "calibrate_method": "MinMax",
+        "moving_average": True,
+        "exclude_head_convs": False,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_entropy_head_int8": {
+        "engine": "ort",
+        "calibrate_method": "Entropy",
+        "moving_average": False,
+        "exclude_head_convs": False,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_percentile_head_int8": {
+        "engine": "ort",
+        "calibrate_method": "Percentile",
+        "moving_average": False,
+        "calibration_symmetric": False,
+        "percentile": 99.99,
+        "exclude_head_convs": False,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_minmax_head_fp32": {
+        "engine": "ort",
+        "calibrate_method": "MinMax",
+        "moving_average": False,
+        "exclude_head_convs": True,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_moving_avg_head_fp32": {
+        "engine": "ort",
+        "calibrate_method": "MinMax",
+        "moving_average": True,
+        "exclude_head_convs": True,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_entropy_head_fp32": {
+        "engine": "ort",
+        "calibrate_method": "Entropy",
+        "moving_average": False,
+        "exclude_head_convs": True,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_percentile_head_fp32": {
+        "engine": "ort",
+        "calibrate_method": "Percentile",
+        "moving_average": False,
+        "calibration_symmetric": False,
+        "percentile": 99.99,
+        "exclude_head_convs": True,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_nncf_head_int8": {
+        "engine": "nncf_onnx",
+        "exclude_head_convs": False,
+        "fast_bias_correction": True,
+        "resolutions": (1280, 640),
+    },
+    "onnx_int8_nncf_head_fp32": {
+        "engine": "nncf_onnx",
+        "exclude_head_convs": True,
+        "fast_bias_correction": True,
+        "resolutions": (1280, 640),
+    },
+    "openvino_int8_nncf_full_bias_head_fp32": {
+        "engine": "nncf_openvino",
+        "fast_bias_correction": False,
+        "resolutions": (1280,),
+    },
+}
+
+_PTQ_BASELINE_STAGE_ALIAS = {
+    "onnx_fp32": "onnx_fp32",
+    "onnx_int8": "onnx_int8_minmax_head_int8",
+    "openvino_fp32": "openvino_fp32",
+    "openvino_int8": "openvino_int8_ultralytics",
+}
+
+_PTQ_REPORT_STAGE_ORDER = (
+    "onnx_fp32",
+    *tuple(k for k in PTQ_VARIANT_SPECS if k.startswith("onnx_int8")),
+    "openvino_fp32",
+    "openvino_int8_ultralytics",
+    *tuple(k for k in PTQ_VARIANT_SPECS if k.startswith("openvino_int8")),
+)
+
+
+def _seed_ptq_baseline_rows(
+    quantization_dir: Path,
+    eval_split: str,
+    *,
+    source_sha256: str,
+    resolutions: tuple[int, ...],
+    rows_by_key: dict[tuple[int, str], dict[str, object]],
+    per_stage_details: dict[str, dict[str, object]],
+) -> None:
+    base_meta_path = Path(quantization_dir) / "reports" / eval_split / "quantization_metadata.json"
+    if not base_meta_path.is_file():
+        return
+    try:
+        base_meta = json.loads(base_meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if base_meta.get("source_weights_sha256") != source_sha256:
+        return
+
+    base_details = base_meta.get("stage_details") or {}
+    for row in base_meta.get("summary_rows") or []:
+        if row.get("status") != "ok":
+            continue
+        imgsz = int(row["imgsz"])
+        orig_stage = str(row["stage"])
+        mapped_stage = _PTQ_BASELINE_STAGE_ALIAS.get(orig_stage)
+        if mapped_stage is None or imgsz not in resolutions:
+            continue
+        artifact = Path(str(row.get("artifact", "")))
+        if not _is_valid_stage_artifact(mapped_stage, artifact):
+            continue
+        if (imgsz, mapped_stage) not in rows_by_key:
+            cleaned = _clean_checkpoint_row(row)
+            cleaned["stage"] = mapped_stage
+            cleaned["hf_uploaded"] = False
+            rows_by_key[(imgsz, mapped_stage)] = cleaned
+        detail_key = f"{orig_stage}_{imgsz}"
+        mapped_detail_key = f"{mapped_stage}_{imgsz}"
+        if detail_key in base_details and mapped_detail_key not in per_stage_details:
+            per_stage_details[mapped_detail_key] = base_details[detail_key]
+
+
+def _ensure_fp32_for_ptq(
+    fp32_stage: str,
+    source_pt: Path,
+    quantization_dir: Path,
+    *,
+    imgsz: int,
+    model_stem: str,
+) -> Path:
+    paths = get_quantized_model_paths(quantization_dir, imgsz, model_stem=model_stem)
+    if fp32_stage == "onnx_fp32":
+        if _is_valid_stage_artifact("onnx_fp32", paths["onnx_fp32"]):
+            return paths["onnx_fp32"]
+        return export_onnx_fp32(source_pt, paths["onnx_fp32"], imgsz=imgsz)
+    if fp32_stage == "openvino_fp32":
+        if _is_valid_stage_artifact("openvino_fp32", paths["openvino_fp32"]):
+            return paths["openvino_fp32"]
+        return export_openvino_fp32(source_pt, paths["openvino_fp32"], imgsz=imgsz)
+    raise ValueError(f"Unsupported FP32 stage: {fp32_stage!r}")
+
+
+def _export_ptq_variant(
+    variant_name: str,
+    spec: dict[str, object],
+    *,
+    source_pt: Path,
+    quantization_dir: Path,
+    calibration_images: list[Path],
+    imgsz: int,
+    model_stem: str,
+    skip_existing: bool,
+) -> Path:
+    ablation_dir = Path(quantization_dir) / "ptq_ablation" / str(imgsz)
+    ablation_dir.mkdir(parents=True, exist_ok=True)
+    engine = str(spec["engine"])
+
+    if engine == "nncf_openvino":
+        ov_fp32 = _ensure_fp32_for_ptq(
+            "openvino_fp32",
+            source_pt,
+            quantization_dir,
+            imgsz=imgsz,
+            model_stem=model_stem,
+        )
+        out_dir = ablation_dir / f"{model_stem}_{variant_name}_{imgsz}_openvino_model"
+        if skip_existing and _is_valid_stage_artifact(variant_name, out_dir):
+            return out_dir
+        return export_openvino_int8_nncf(
+            ov_fp32,
+            out_dir,
+            calibration_images,
+            imgsz=imgsz,
+            fast_bias_correction=bool(spec.get("fast_bias_correction", False)),
+        )
+
+    onnx_fp32 = _ensure_fp32_for_ptq(
+        "onnx_fp32",
+        source_pt,
+        quantization_dir,
+        imgsz=imgsz,
+        model_stem=model_stem,
+    )
+    out_onnx = ablation_dir / f"{model_stem}_{variant_name}_{imgsz}.onnx"
+    if skip_existing and _is_valid_stage_artifact(variant_name, out_onnx):
+        return out_onnx
+
+    if engine == "ort":
+        return quantize_onnx_int8(
+            onnx_fp32,
+            out_onnx,
+            calibration_images,
+            imgsz=imgsz,
+            calibrate_method=str(spec["calibrate_method"]),
+            exclude_head_convs=bool(spec["exclude_head_convs"]),
+            moving_average=bool(spec.get("moving_average", False)),
+            calibration_symmetric=spec.get("calibration_symmetric"),
+            percentile=spec.get("percentile"),
+        )
+    if engine == "nncf_onnx":
+        return quantize_onnx_int8_nncf(
+            onnx_fp32,
+            out_onnx,
+            calibration_images,
+            imgsz=imgsz,
+            exclude_head_convs=bool(spec["exclude_head_convs"]),
+            fast_bias_correction=bool(spec.get("fast_bias_correction", True)),
+        )
+    raise ValueError(f"Unsupported PTQ engine: {engine!r}")
+
+
+def run_ptq_variant_ablation(
+    dataset_root: Path,
+    *,
+    weights_path: Path | None = None,
+    quantization_dir: Path | None = None,
+    working_dir: Path | None = None,
+    resolutions: tuple[int, ...] = QUANTIZATION_RESOLUTIONS,
+    variants: tuple[str, ...] = tuple(PTQ_VARIANT_SPECS),
+    eval_split: str = "val",
+    resume: bool = False,
+    skip_existing_exports: bool = False,
+    max_calibration_images: int = DEFAULT_CALIBRATION_IMAGES,
+    seed: int = 42,
+    n_warmup: int = 10,
+    n_benchmark: int = 100,
+    collection_conf: float = 0.01,
+    manifest_path: Path = MANIFESTS_DIR / "temporal" / "v1" / "main.csv",
+    source_path: Path | None = None,
+    model_stem: str = YOLO_MODEL_STEM,
+) -> dict[str, object]:
+    """Runs isolated local PTQ ablation across calibration/head/NNCF settings without touching HF."""
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"eval_split must be 'val' or 'test', got {eval_split!r}")
+    if not resolutions or any(r <= 0 for r in resolutions):
+        raise ValueError(f"resolutions must be non-empty positive ints, got {resolutions!r}")
+    if not variants or any(v not in PTQ_VARIANT_SPECS for v in variants):
+        raise ValueError(f"Invalid variants {variants!r}; expected subset of {tuple(PTQ_VARIANT_SPECS)}")
+
+    report_split = f"ptq_ablation_{eval_split}"
+    target_quant_dir = Path(quantization_dir) if quantization_dir is not None else config.QUANTIZATION_DIR
+    target_working_dir = Path(working_dir) if working_dir is not None else config.WORKING_DIR
+    cache_dir = target_working_dir / "hf_cache" if working_dir is not None else config.LOCAL_HF_DATA_DIR
+    source_pt = resolve_source_weights(
+        weights_path,
+        cache_dir=cache_dir if weights_path is None else None,
+    )
+    source_sha256 = _file_sha256(source_pt)
+
+    rows_by_key: dict[tuple[int, str], dict[str, object]] = {}
+    per_stage_details: dict[str, dict[str, object]] = {}
+    if resume:
+        rows_by_key, per_stage_details, _, _ = _load_resume_checkpoint(
+            target_quant_dir,
+            report_split,
+            source_sha256=source_sha256,
+            max_calibration_images=max_calibration_images,
+            seed=seed,
+            calibrate_method="ptq_ablation",
+        )
+
+    _seed_ptq_baseline_rows(
+        target_quant_dir,
+        eval_split,
+        source_sha256=source_sha256,
+        resolutions=resolutions,
+        rows_by_key=rows_by_key,
+        per_stage_details=per_stage_details,
+    )
+
+    effective_skip_exports = resume or skip_existing_exports
+    cal_run_name = "calibration_ptq_ablation"
+    _, calibration_images = prepare_calibration_dataset(
+        Path(dataset_root),
+        target_working_dir,
+        manifest_path=manifest_path,
+        source_path=source_path,
+        max_images=max_calibration_images,
+        seed=seed,
+        run_name=cal_run_name,
+        overwrite=True,
+    )
+
+    def _build_metadata(results_df: pd.DataFrame, *, complete: bool, failed_items: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "source_weights": str(source_pt),
+            "source_weights_sha256": source_sha256,
+            "eval_split": eval_split,
+            "report_split": report_split,
+            "resolutions": list(resolutions),
+            "variants": list(variants),
+            "collection_conf": collection_conf,
+            "complete": complete,
+            "failed_stages": failed_items,
+            "benchmark": {
+                "n_warmup": n_warmup,
+                "n_benchmark": n_benchmark,
+                "split": eval_split,
+            },
+            "calibration": {
+                "manifest_path": str(manifest_path),
+                "max_images": max_calibration_images,
+                "actual_images": len(calibration_images),
+                "seed": seed,
+                "filenames": [path.name for path in calibration_images],
+            },
+            "onnx_quantization": {
+                "format": "QDQ",
+                "activation_type": "QUInt8",
+                "weight_type": "QInt8",
+                "per_channel": True,
+                "reduce_range": False,
+                "calibrate_method": "ptq_ablation",
+            },
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "cpu_count": os.cpu_count(),
+                "packages": _extract_runtime_versions(),
+            },
+            "stage_details": per_stage_details,
+            "summary_rows": results_df.to_dict(orient="records"),
+        }
+
+    def _save_checkpoint(*, complete: bool | None = None) -> tuple[pd.DataFrame, list[dict[str, object]], Path, Path]:
+        snapshot = _ordered_rows_snapshot(rows_by_key, stage_order=_PTQ_REPORT_STAGE_ORDER)
+        snapshot_df = _annotate_ablation_deltas(snapshot)
+        failed_items = [
+            {"imgsz": int(r["imgsz"]), "stage": str(r["stage"]), "error": str(r.get("error", ""))}
+            for r in snapshot
+            if r.get("status") != "ok"
+        ]
+        is_complete = (len(failed_items) == 0) if complete is None else complete
+        saved_csv, saved_meta = save_quantization_reports(
+            snapshot_df,
+            target_quant_dir,
+            _build_metadata(snapshot_df, complete=is_complete, failed_items=failed_items),
+            eval_split=report_split,
+        )
+        return snapshot_df, failed_items, saved_csv, saved_meta
+
+    try:
+        for imgsz in resolutions:
+            bgr_frames = None
+            nchw_tensors = None
+
+            active_variants = [
+                v for v in variants if imgsz in tuple(PTQ_VARIANT_SPECS[v]["resolutions"])
+            ]
+            if not active_variants:
+                continue
+
+            needed_baselines = []
+            if any(v.startswith("onnx_int8") for v in active_variants):
+                needed_baselines.append("onnx_fp32")
+            if any(v.startswith("openvino_int8") for v in active_variants):
+                needed_baselines.append("openvino_fp32")
+
+            for base_stage in needed_baselines:
+                if (imgsz, base_stage) in rows_by_key:
+                    continue
+                if bgr_frames is None:
+                    bgr_frames, nchw_tensors = _load_benchmark_frames(
+                        Path(dataset_root),
+                        eval_split,
+                        imgsz,
+                        max_frames=max(n_benchmark, 50),
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                    )
+                try:
+                    base_artifact = _ensure_fp32_for_ptq(
+                        base_stage,
+                        source_pt,
+                        target_quant_dir,
+                        imgsz=imgsz,
+                        model_stem=model_stem,
+                    )
+                    row, detail = _measure_stage_artifact(
+                        base_artifact,
+                        Path(dataset_root),
+                        stage_name=base_stage,
+                        imgsz=imgsz,
+                        bgr_frames=bgr_frames,
+                        nchw_tensors=nchw_tensors,
+                        eval_split=eval_split,
+                        n_warmup=n_warmup,
+                        n_benchmark=n_benchmark,
+                        collection_conf=collection_conf,
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                        run_eval=True,
+                    )
+                    rows_by_key[(imgsz, base_stage)] = row
+                    if detail is not None:
+                        per_stage_details[f"{base_stage}_{imgsz}"] = detail
+                except Exception as exc:
+                    rows_by_key[(imgsz, base_stage)] = _failed_stage_row(imgsz, base_stage, str(exc))
+                _save_checkpoint(complete=False)
+
+            for variant_name in active_variants:
+                if (imgsz, variant_name) in rows_by_key:
+                    log.info("[SKIP-RESUME] imgsz=%d variant=%s", imgsz, variant_name)
+                    continue
+
+                if bgr_frames is None:
+                    bgr_frames, nchw_tensors = _load_benchmark_frames(
+                        Path(dataset_root),
+                        eval_split,
+                        imgsz,
+                        max_frames=max(n_benchmark, 50),
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                    )
+
+                try:
+                    artifact_path = _export_ptq_variant(
+                        variant_name,
+                        PTQ_VARIANT_SPECS[variant_name],
+                        source_pt=source_pt,
+                        quantization_dir=target_quant_dir,
+                        calibration_images=calibration_images,
+                        imgsz=imgsz,
+                        model_stem=model_stem,
+                        skip_existing=effective_skip_exports,
+                    )
+                    row, detail = _measure_stage_artifact(
+                        artifact_path,
+                        Path(dataset_root),
+                        stage_name=variant_name,
+                        imgsz=imgsz,
+                        bgr_frames=bgr_frames,
+                        nchw_tensors=nchw_tensors,
+                        eval_split=eval_split,
+                        n_warmup=n_warmup,
+                        n_benchmark=n_benchmark,
+                        collection_conf=collection_conf,
+                        manifest_path=manifest_path,
+                        source_path=source_path,
+                        run_eval=True,
+                    )
+                    rows_by_key[(imgsz, variant_name)] = row
+                    if detail is not None:
+                        per_stage_details[f"{variant_name}_{imgsz}"] = detail
+                except Exception as exc:
+                    rows_by_key[(imgsz, variant_name)] = _failed_stage_row(imgsz, variant_name, str(exc))
+                _save_checkpoint(complete=False)
+    finally:
+        cleanup_calibration_dataset(target_working_dir, run_name=cal_run_name)
+
+    results_df, failed_stages, csv_path, metadata_path = _save_checkpoint()
+    return {
+        "results_df": results_df,
+        "csv_path": csv_path,
+        "metadata_path": metadata_path,
         "failed_stages": failed_stages,
     }

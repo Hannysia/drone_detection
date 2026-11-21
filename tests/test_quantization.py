@@ -1070,3 +1070,338 @@ def test_ablation_checkpoints_stage_before_hf_upload_timeout(tmp_path, monkeypat
     assert df.loc[0, "status"] == "ok"
     assert bool(df.loc[0, "hf_uploaded"]) is False
     assert df.loc[0, "AP50"] == pytest.approx(0.90)
+
+
+
+
+def test_get_process_memory_mb_returns_positive_on_current_process():
+    rss_mb, peak_rss_mb = quantization._get_process_memory_mb()
+    assert rss_mb > 0.0
+    assert peak_rss_mb >= rss_mb
+
+
+def test_quantize_onnx_int8_passes_moving_average_and_percentile_options(tmp_path, monkeypatch):
+    fp32 = _make_conv_sigmoid_onnx(tmp_path / "model.onnx", ir_version=9)
+    cal_img = tmp_path / "cal.jpg"
+    assert cv2.imwrite(str(cal_img), np.full((32, 32, 3), 120, dtype=np.uint8))
+
+    captured = []
+
+    def fake_quantize_static(**kwargs):
+        captured.append(kwargs)
+        shutil_dst = Path(kwargs["model_output"])
+        shutil_dst.write_bytes(fp32.read_bytes())
+
+    import onnxruntime as ort
+    import onnxruntime.quantization as ort_q
+
+    monkeypatch.setattr(quantization, "_preprocess_onnx_for_quantization", lambda src, dst: src)
+    monkeypatch.setattr(ort_q, "quantize_static", fake_quantize_static)
+    monkeypatch.setattr(ort, "InferenceSession", Mock())
+
+    quantization.quantize_onnx_int8(
+        fp32,
+        tmp_path / "mavg.onnx",
+        [cal_img],
+        imgsz=32,
+        calibrate_method="MinMax",
+        moving_average=True,
+    )
+    assert captured[-1]["extra_options"]["CalibMovingAverage"] is True
+    assert captured[-1]["extra_options"]["CalibMovingAverageConstant"] == pytest.approx(0.01)
+
+    quantization.quantize_onnx_int8(
+        fp32,
+        tmp_path / "pct.onnx",
+        [cal_img],
+        imgsz=32,
+        calibrate_method="Percentile",
+        calibration_symmetric=False,
+        percentile=99.99,
+        exclude_head_convs=True,
+    )
+    assert captured[-1]["extra_options"]["CalibTensorRangeSymmetric"] is False
+    assert captured[-1]["extra_options"]["CalibPercentile"] == pytest.approx(99.99)
+
+    with pytest.raises(ValueError, match="MinMax"):
+        quantization.quantize_onnx_int8(
+            fp32,
+            tmp_path / "bad.onnx",
+            [cal_img],
+            imgsz=32,
+            calibrate_method="Entropy",
+            moving_average=True,
+        )
+
+
+def test_quantize_onnx_nncf_and_export_openvino_nncf_preserve_metadata(tmp_path, monkeypatch):
+    import nncf
+    import openvino as ov
+    import onnxruntime as ort
+
+    fp32_onnx = _make_conv_sigmoid_onnx(tmp_path / "model.onnx", ir_version=9)
+    cal_img = tmp_path / "cal.jpg"
+    assert cv2.imwrite(str(cal_img), np.full((32, 32, 3), 120, dtype=np.uint8))
+
+    nncf_calls = []
+
+    def fake_nncf_quantize(**kwargs):
+        nncf_calls.append(kwargs)
+        return kwargs["model"]
+
+    monkeypatch.setattr(nncf, "quantize", fake_nncf_quantize)
+    monkeypatch.setattr(ort, "InferenceSession", Mock())
+
+    out_onnx = quantization.quantize_onnx_int8_nncf(
+        fp32_onnx,
+        tmp_path / "nncf.onnx",
+        [cal_img],
+        imgsz=32,
+        exclude_head_convs=True,
+        fast_bias_correction=True,
+    )
+    assert out_onnx.is_file()
+    assert nncf_calls[-1]["preset"] == nncf.QuantizationPreset.MIXED
+    assert nncf_calls[-1]["fast_bias_correction"] is True
+    assert "/model.23/Add" in nncf_calls[-1]["ignored_scope"].names
+    assert {p.key: p.value for p in onnx.load(str(out_onnx)).metadata_props}["task"] == "detect"
+
+    ov_fp32_dir = tmp_path / "fp32_openvino_model"
+    ov_fp32_dir.mkdir()
+    (ov_fp32_dir / "best.xml").write_text("<net/>", encoding="utf-8")
+    (ov_fp32_dir / "best.bin").write_bytes(b"bin")
+    (ov_fp32_dir / "metadata.yaml").write_text("task: detect\n", encoding="utf-8")
+
+    fake_core = SimpleNamespace(read_model=Mock(return_value="ov_model_obj"))
+    monkeypatch.setattr(ov, "Core", Mock(return_value=fake_core))
+
+    def fake_save_model(model_obj, xml_path, compress_to_fp16=False):
+        p = Path(xml_path)
+        p.write_text("<net/>", encoding="utf-8")
+        p.with_suffix(".bin").write_bytes(b"bin")
+
+    monkeypatch.setattr(ov, "save_model", fake_save_model)
+
+    ov_out = quantization.export_openvino_int8_nncf(
+        ov_fp32_dir,
+        tmp_path / "ov_nncf_openvino_model",
+        [cal_img],
+        imgsz=32,
+        fast_bias_correction=False,
+    )
+    assert (ov_out / "best.xml").is_file()
+    assert (ov_out / "metadata.yaml").is_file()
+    assert nncf_calls[-1]["fast_bias_correction"] is False
+    assert r".*model\.23/.*" in nncf_calls[-1]["ignored_scope"].patterns
+
+
+def test_run_ptq_variant_ablation_seeds_baseline_skips_hf_and_filters_resolutions(tmp_path, monkeypatch):
+    from src.utils.visualization import load_quantization_reports
+
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+    ]
+    root, manifest_path = _write_calibration_bundle(tmp_path, rows)
+    weights = tmp_path / "best.pt"
+    weights.write_bytes(b"pt")
+    quant_dir = tmp_path / "quant"
+    working_dir = tmp_path / "work"
+    (quant_dir / "1280").mkdir(parents=True, exist_ok=True)
+
+    base_onnx = _make_conv_sigmoid_onnx(quant_dir / "1280" / "yolo26n_run_with_negatives_best_fp32_1280.onnx")
+    base_int8 = _make_conv_sigmoid_onnx(quant_dir / "1280" / "yolo26n_run_with_negatives_best_int8_1280.onnx")
+    base_ov_fp32 = quant_dir / "1280" / "yolo26n_run_with_negatives_best_fp32_1280_openvino_model"
+    base_ov_fp32.mkdir(parents=True)
+    (base_ov_fp32 / "model.xml").write_text("<net/>", encoding="utf-8")
+    (base_ov_fp32 / "model.bin").write_bytes(b"bin")
+    base_ov_int8 = quant_dir / "1280" / "yolo26n_run_with_negatives_best_int8_1280_openvino_model"
+    base_ov_int8.mkdir(parents=True)
+    (base_ov_int8 / "model.xml").write_text("<net/>", encoding="utf-8")
+    (base_ov_int8 / "model.bin").write_bytes(b"bin")
+
+    report_val_dir = quant_dir / "reports" / "val"
+    report_val_dir.mkdir(parents=True)
+    seed_sha = quantization._file_sha256(weights)
+    seed_rows = [
+        {
+            "imgsz": 1280,
+            "stage": "onnx_fp32",
+            "status": "ok",
+            "artifact": str(base_onnx),
+            "size_mb": 9.8,
+            "compute_mean_ms": 300.0,
+            "e2e_mean_ms": 380.0,
+            "e2e_fps": 2.6,
+            "mAP50": 0.96,
+            "mAP50-95": 0.82,
+            "AP50": 0.95,
+            "AP50_small": 0.91,
+            "Recall_small @ Neg FPR<=5%": 0.70,
+            "Neg FPR @ R>=0.85 (%)": 4.0,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "onnx_int8",
+            "status": "ok",
+            "artifact": str(base_int8),
+            "size_mb": 3.5,
+            "compute_mean_ms": 350.0,
+            "e2e_mean_ms": 580.0,
+            "e2e_fps": 1.7,
+            "mAP50": 0.90,
+            "mAP50-95": 0.72,
+            "AP50": 0.88,
+            "AP50_small": 0.87,
+            "Recall_small @ Neg FPR<=5%": 0.80,
+            "Neg FPR @ R>=0.85 (%)": 16.0,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "openvino_fp32",
+            "status": "ok",
+            "artifact": str(base_ov_fp32),
+            "size_mb": 9.8,
+            "compute_mean_ms": 270.0,
+            "e2e_mean_ms": 540.0,
+            "e2e_fps": 1.85,
+            "mAP50": 0.96,
+            "mAP50-95": 0.82,
+            "AP50": 0.95,
+            "AP50_small": 0.92,
+            "Recall_small @ Neg FPR<=5%": 0.66,
+            "Neg FPR @ R>=0.85 (%)": 5.4,
+        },
+        {
+            "imgsz": 1280,
+            "stage": "openvino_int8",
+            "status": "ok",
+            "artifact": str(base_ov_int8),
+            "size_mb": 3.5,
+            "compute_mean_ms": 138.0,
+            "e2e_mean_ms": 600.0,
+            "e2e_fps": 1.66,
+            "mAP50": 0.955,
+            "mAP50-95": 0.795,
+            "AP50": 0.95,
+            "AP50_small": 0.94,
+            "Recall_small @ Neg FPR<=5%": 0.75,
+            "Neg FPR @ R>=0.85 (%)": 6.8,
+        },
+    ]
+    (report_val_dir / "quantization_metadata.json").write_text(
+        json.dumps({"source_weights_sha256": seed_sha, "summary_rows": seed_rows, "stage_details": {}}),
+        encoding="utf-8",
+    )
+
+    exported = []
+
+    def fake_export_ptq(variant_name, spec, *, source_pt, quantization_dir, calibration_images, imgsz, model_stem, skip_existing):
+        exported.append((imgsz, variant_name))
+        out_dir = Path(quantization_dir) / "ptq_ablation" / str(imgsz)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if spec["engine"] == "nncf_openvino":
+            ov_dir = out_dir / f"{model_stem}_{variant_name}_{imgsz}_openvino_model"
+            ov_dir.mkdir(exist_ok=True)
+            (ov_dir / "model.xml").write_text("<net/>", encoding="utf-8")
+            (ov_dir / "model.bin").write_bytes(b"bin")
+            return ov_dir
+        return _make_conv_sigmoid_onnx(out_dir / f"{model_stem}_{variant_name}_{imgsz}.onnx")
+
+    def fake_ensure_fp32(fp32_stage, source_pt, qdir, *, imgsz, model_stem):
+        exported.append((imgsz, fp32_stage))
+        res_dir = Path(qdir) / str(imgsz)
+        res_dir.mkdir(parents=True, exist_ok=True)
+        return _make_conv_sigmoid_onnx(res_dir / f"{model_stem}_fp32_{imgsz}.onnx")
+
+    monkeypatch.setattr(quantization, "verify_hf_access", Mock(side_effect=AssertionError("HF must not be called")))
+    monkeypatch.setattr(quantization, "_export_ptq_variant", fake_export_ptq)
+    monkeypatch.setattr(quantization, "_ensure_fp32_for_ptq", fake_ensure_fp32)
+    monkeypatch.setattr(
+        quantization,
+        "benchmark_stage_model",
+        lambda *a, **k: {
+            "compute_mean_ms": 50.0,
+            "compute_std_ms": 1.0,
+            "compute_p50_ms": 50.0,
+            "compute_p95_ms": 52.0,
+            "compute_p99_ms": 53.0,
+            "compute_fps": 20.0,
+            "compute_fps_p50": 20.0,
+            "e2e_mean_ms": 80.0,
+            "e2e_std_ms": 1.0,
+            "e2e_p50_ms": 80.0,
+            "e2e_p95_ms": 82.0,
+            "e2e_p99_ms": 83.0,
+            "e2e_fps": 12.5,
+            "e2e_fps_p50": 12.5,
+            "rss_mb": 120.0,
+            "peak_rss_mb": 130.0,
+        },
+    )
+    monkeypatch.setattr(
+        quantization,
+        "evaluate_quantized_stage",
+        lambda *a, **k: {
+            "metrics": {**quantization._empty_eval_metrics(), "mAP50": 0.94, "AP50": 0.93, "AP50_small": 0.90, "Neg FPR @ R>=0.85 (%)": 5.0, "Recall_small @ Neg FPR<=5%": 0.72},
+            "by_scale": [],
+            "curves": {},
+        },
+    )
+
+    result = quantization.run_ptq_variant_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(1280, 640),
+        variants=(
+            "onnx_int8_minmax_head_int8",
+            "onnx_int8_entropy_head_fp32",
+            "openvino_int8_nncf_full_bias_head_fp32",
+        ),
+        eval_split="val",
+        resume=True,
+        n_warmup=1,
+        n_benchmark=1,
+        manifest_path=manifest_path,
+    )
+
+    assert (1280, "onnx_int8_minmax_head_int8") not in exported
+    assert (640, "onnx_fp32") in exported
+    assert (640, "onnx_int8_minmax_head_int8") in exported
+    assert (1280, "onnx_int8_entropy_head_fp32") in exported
+    assert (640, "onnx_int8_entropy_head_fp32") in exported
+    assert (1280, "openvino_int8_nncf_full_bias_head_fp32") in exported
+    assert (640, "openvino_int8_nncf_full_bias_head_fp32") not in exported
+    assert result["csv_path"] == quant_dir / "reports" / "ptq_ablation_val" / "ablation_results.csv"
+
+    loaded_df, loaded_meta = load_quantization_reports(quant_dir, eval_split="ptq_ablation_val")
+    assert loaded_meta["report_split"] == "ptq_ablation_val"
+    df_idx = loaded_df.set_index(["imgsz", "stage"])
+    assert df_idx.loc[(1280, "onnx_int8_entropy_head_fp32"), "ap50_delta_vs_fp32"] == pytest.approx(-0.02)
+    assert df_idx.loc[(1280, "openvino_int8_nncf_full_bias_head_fp32"), "ap50_delta_vs_fp32"] == pytest.approx(-0.02)
+
+
+def test_quantize_cpu_cli_ptq_ablation_rejects_upload_and_invokes_runner(tmp_path, monkeypatch):
+    cli = _load_quantize_cli_module()
+    monkeypatch.setenv("LOCAL_BASE_DIR", str(tmp_path))
+
+    with pytest.raises(SystemExit):
+        cli.main(["--ptq-ablation", "--upload"])
+
+    import pandas as pd
+
+    mock_ptq = Mock(return_value={
+        "results_df": pd.DataFrame([{"imgsz": 1280, "stage": "onnx_int8_entropy_head_fp32", "status": "ok"}]),
+        "csv_path": tmp_path / "working" / "quantization" / "reports" / "ptq_ablation_val" / "ablation_results.csv",
+        "metadata_path": tmp_path / "working" / "quantization" / "reports" / "ptq_ablation_val" / "quantization_metadata.json",
+        "failed_stages": [],
+    })
+    monkeypatch.setattr(cli, "run_ptq_variant_ablation", mock_ptq)
+
+    code = cli.main(["--ptq-ablation", "--resume", "--variants", "onnx_int8_entropy_head_fp32"])
+    log_file = tmp_path / "working" / "quantization" / "reports" / "ptq_ablation_val" / "quantize_cpu.log"
+    assert code == 0
+    assert log_file.is_file()
+    assert mock_ptq.call_args.kwargs["variants"] == ("onnx_int8_entropy_head_fp32",)
