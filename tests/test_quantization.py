@@ -409,7 +409,20 @@ def test_run_cpu_quantization_ablation_uses_val_skips_pt_eval_and_cleans_up(tmp_
     quant_dir = tmp_path / "quant"
     working_dir = tmp_path / "work"
 
-    def fake_export_single(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+    def fake_export_single(
+        stage_name,
+        pt,
+        qdir,
+        cal_imgs,
+        cal_yaml,
+        *,
+        imgsz,
+        model_stem,
+        calibrate_method,
+        onnx_moving_average=True,
+        onnx_exclude_head_convs=True,
+        skip_existing=False,
+    ):
         res_dir = Path(qdir) / str(imgsz)
         res_dir.mkdir(parents=True, exist_ok=True)
         if stage_name == "pytorch_fp32":
@@ -647,6 +660,8 @@ def test_quantize_cpu_cli_defaults_and_flags(tmp_path, monkeypatch):
     assert first_kwargs["resolutions"] == (1280, 640)
     assert first_kwargs["eval_pytorch"] is False
     assert first_kwargs["max_calibration_images"] == 500
+    assert first_kwargs["onnx_moving_average"] is True
+    assert first_kwargs["onnx_exclude_head_convs"] is True
     assert first_kwargs["upload_to_hf"] is False
     assert first_kwargs["source_path"] == cli.MANIFESTS_DIR / "sources" / "hf.json"
 
@@ -672,6 +687,8 @@ def test_quantize_cpu_cli_defaults_and_flags(tmp_path, monkeypatch):
     assert second_kwargs["source_path"] is None
     assert second_kwargs["max_calibration_images"] == 128
     assert second_kwargs["calibrate_method"] == "Entropy"
+    assert second_kwargs["onnx_moving_average"] is False
+    assert second_kwargs["onnx_exclude_head_convs"] is True
     assert second_kwargs["n_warmup"] == 2
     assert second_kwargs["n_benchmark"] == 5
     assert second_kwargs["eval_pytorch"] is True
@@ -822,7 +839,20 @@ def test_ablation_uploads_each_int8_immediately_and_resumes_from_failed_stage(tm
     export_history = []
     uploaded_models = []
 
-    def fake_export(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+    def fake_export(
+        stage_name,
+        pt,
+        qdir,
+        cal_imgs,
+        cal_yaml,
+        *,
+        imgsz,
+        model_stem,
+        calibrate_method,
+        onnx_moving_average=True,
+        onnx_exclude_head_convs=True,
+        skip_existing=False,
+    ):
         export_history.append((stage_name, skip_existing))
         res_dir = Path(qdir) / str(imgsz)
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -998,7 +1028,20 @@ def test_ablation_checkpoints_stage_before_hf_upload_timeout(tmp_path, monkeypat
     csv_existed_before_upload = []
     stop_event = threading.Event()
 
-    def fake_export(stage_name, pt, qdir, cal_imgs, cal_yaml, *, imgsz, model_stem, calibrate_method, skip_existing=False):
+    def fake_export(
+        stage_name,
+        pt,
+        qdir,
+        cal_imgs,
+        cal_yaml,
+        *,
+        imgsz,
+        model_stem,
+        calibrate_method,
+        onnx_moving_average=True,
+        onnx_exclude_head_convs=True,
+        skip_existing=False,
+    ):
         events.append("export")
         res_dir = Path(qdir) / str(imgsz)
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -1563,3 +1606,98 @@ def test_prepare_calibration_dataset_stratifies_by_bbox_scale_and_shuffles_order
         run_name="cal_c",
     )
     assert [path.name for path in cal_99] != names_42_a
+
+
+def test_run_cpu_quantization_ablation_uses_moving_avg_head_fp32_and_checks_resume(tmp_path, monkeypatch):
+    rows = [
+        {"filename": "quad_rgb_sky_001_f0001.jpg", "split": "train", "category": "positive", "excluded_at": ""},
+        {"filename": "quad_rgb_sky_002_f0001.jpg", "split": "val", "category": "positive", "excluded_at": ""},
+    ]
+    root, manifest_path = _write_calibration_bundle(tmp_path, rows)
+    weights = tmp_path / "best.pt"
+    weights.write_bytes(b"pt")
+    quant_dir = tmp_path / "quant"
+    working_dir = tmp_path / "work"
+
+    q_calls = []
+
+    def fake_export_onnx_fp32(pt_path, out_onnx, *, imgsz):
+        return _make_conv_sigmoid_onnx(out_onnx)
+
+    def fake_quantize_int8(src, dst, cal, *, imgsz, calibrate_method="MinMax", exclude_head_convs=False, moving_average=False, **kwargs):
+        q_calls.append((calibrate_method, exclude_head_convs, moving_average))
+        dst.write_bytes(b"qdq-mavg")
+        return dst
+
+    monkeypatch.setattr(quantization, "export_onnx_fp32", fake_export_onnx_fp32)
+    monkeypatch.setattr(quantization, "quantize_onnx_int8", fake_quantize_int8)
+    monkeypatch.setattr(
+        quantization,
+        "benchmark_stage_model",
+        lambda *a, **k: {
+            "compute_mean_ms": 10.0,
+            "compute_std_ms": 0.5,
+            "compute_p50_ms": 10.0,
+            "compute_p95_ms": 11.0,
+            "compute_p99_ms": 12.0,
+            "compute_fps": 100.0,
+            "compute_fps_p50": 100.0,
+            "e2e_mean_ms": 12.0,
+            "e2e_std_ms": 0.5,
+            "e2e_p50_ms": 12.0,
+            "e2e_p95_ms": 13.0,
+            "e2e_p99_ms": 14.0,
+            "e2e_fps": 83.3,
+            "e2e_fps_p50": 83.3,
+            "rss_mb": 100.0,
+            "peak_rss_mb": 110.0,
+        },
+    )
+    monkeypatch.setattr(
+        quantization,
+        "evaluate_quantized_stage",
+        lambda *a, **k: {
+            "metrics": {**quantization._empty_eval_metrics(), "mAP50": 0.94, "AP50": 0.93, "AP50_small": 0.90},
+            "by_scale": [],
+            "curves": {},
+        },
+    )
+
+    first = quantization.run_cpu_quantization_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(640,),
+        stages=("onnx_int8",),
+        n_warmup=1,
+        n_benchmark=1,
+        manifest_path=manifest_path,
+    )
+    assert q_calls == [("MinMax", True, True)]
+    meta = json.loads(first["metadata_path"].read_text(encoding="utf-8"))
+    assert meta["onnx_quantization"]["moving_average"] is True
+    assert meta["onnx_quantization"]["exclude_head_convs"] is True
+    assert "/model.23/Add" in meta["onnx_quantization"]["excluded_nodes_by_resolution"]["640"]
+
+    resumed_mismatch = quantization.run_cpu_quantization_ablation(
+        root,
+        weights_path=weights,
+        quantization_dir=quant_dir,
+        working_dir=working_dir,
+        resolutions=(640,),
+        stages=("onnx_int8",),
+        onnx_moving_average=False,
+        resume=True,
+        n_warmup=1,
+        n_benchmark=1,
+        manifest_path=manifest_path,
+    )
+    assert len(q_calls) == 2
+    assert q_calls[-1] == ("MinMax", True, False)
+    meta_2 = json.loads(resumed_mismatch["metadata_path"].read_text(encoding="utf-8"))
+    assert meta_2["onnx_quantization"]["moving_average"] is False
+
+    cli = _load_quantize_cli_module()
+    with pytest.raises(SystemExit):
+        cli.main(["--calibrate-method", "Entropy", "--onnx-moving-average"])

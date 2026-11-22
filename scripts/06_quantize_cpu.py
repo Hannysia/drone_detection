@@ -108,6 +108,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="MinMax",
         help="ONNX Runtime static calibration method.",
     )
+    parser.add_argument(
+        "--onnx-moving-average",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable ORT CalibMovingAverage (defaults to True for MinMax).",
+    )
+    parser.add_argument(
+        "--onnx-exclude-head-convs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep YOLO Detect head projections in FP32 during ONNX INT8 quantization.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-warmup", type=int, default=10)
     parser.add_argument("--n-benchmark", type=int, default=100)
@@ -178,6 +190,10 @@ def _parse_and_validate_args(argv: list[str] | None = None) -> argparse.Namespac
         parser.error("--ptq-ablation cannot be combined with --upload")
     if args.hf_tag and not args.upload:
         parser.error("--hf-tag requires --upload")
+    if args.onnx_moving_average is None:
+        args.onnx_moving_average = args.calibrate_method == "MinMax"
+    elif args.onnx_moving_average and args.calibrate_method != "MinMax":
+        parser.error("--onnx-moving-average requires --calibrate-method MinMax")
 
     return args
 
@@ -244,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                 skip_existing_exports=args.skip_existing_exports,
                 max_calibration_images=args.calibration_images,
                 calibrate_method=args.calibrate_method,
+                onnx_moving_average=args.onnx_moving_average,
+                onnx_exclude_head_convs=args.onnx_exclude_head_convs,
                 seed=args.seed,
                 n_warmup=args.n_warmup,
                 n_benchmark=args.n_benchmark,

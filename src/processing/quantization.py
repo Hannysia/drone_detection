@@ -800,7 +800,22 @@ def _quantize_onnx_with_fallback(
     *,
     imgsz: int,
     calibrate_method: str,
+    moving_average: bool = False,
+    exclude_head_convs: bool = False,
 ) -> tuple[Path, list[str], bool]:
+    extra_kwargs = {"moving_average": True} if moving_average else {}
+    if exclude_head_convs:
+        out = quantize_onnx_int8(
+            onnx_fp32_path,
+            output_path,
+            calibration_images,
+            imgsz=imgsz,
+            calibrate_method=calibrate_method,
+            exclude_head_convs=True,
+            **extra_kwargs,
+        )
+        excluded = select_onnx_nodes_to_exclude(onnx.load(str(onnx_fp32_path)), exclude_head_convs=True)
+        return out, excluded, False
     try:
         out = quantize_onnx_int8(
             onnx_fp32_path,
@@ -809,6 +824,7 @@ def _quantize_onnx_with_fallback(
             imgsz=imgsz,
             calibrate_method=calibrate_method,
             exclude_head_convs=False,
+            **extra_kwargs,
         )
         excluded = select_onnx_nodes_to_exclude(onnx.load(str(onnx_fp32_path)), exclude_head_convs=False)
         return out, excluded, False
@@ -821,6 +837,7 @@ def _quantize_onnx_with_fallback(
             imgsz=imgsz,
             calibrate_method=calibrate_method,
             exclude_head_convs=True,
+            **extra_kwargs,
         )
         excluded = select_onnx_nodes_to_exclude(onnx.load(str(onnx_fp32_path)), exclude_head_convs=True)
         return out, excluded, True
@@ -1011,12 +1028,19 @@ def export_stage_models(
     imgsz: int,
     model_stem: str = YOLO_MODEL_STEM,
     calibrate_method: str = "MinMax",
+    moving_average: bool | None = None,
+    exclude_head_convs: bool = True,
 ) -> dict[str, Path]:
     """Exports all CPU ablation stages for a fixed square input resolution."""
     weights_path = Path(weights_path)
     if not weights_path.is_file():
         raise FileNotFoundError(f"PyTorch weights not found: {weights_path}")
 
+    resolved_moving_avg = (
+        calibrate_method.strip().lower() == "minmax"
+        if moving_average is None
+        else bool(moving_average)
+    )
     paths = get_quantized_model_paths(Path(quantization_dir), imgsz, model_stem=model_stem)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     if weights_path.resolve() != paths["pt"].resolve():
@@ -1029,6 +1053,8 @@ def export_stage_models(
         calibration_images,
         imgsz=imgsz,
         calibrate_method=calibrate_method,
+        exclude_head_convs=exclude_head_convs,
+        moving_average=resolved_moving_avg,
     )
     ov_fp32 = export_openvino_fp32(paths["pt"], paths["openvino_fp32"], imgsz=imgsz)
     ov_int8 = export_openvino_int8(
@@ -1067,6 +1093,8 @@ def _export_single_stage(
     imgsz: int,
     model_stem: str = YOLO_MODEL_STEM,
     calibrate_method: str = "MinMax",
+    onnx_moving_average: bool = True,
+    onnx_exclude_head_convs: bool = True,
     skip_existing: bool = False,
 ) -> tuple[Path, dict[str, object]]:
     paths = get_quantized_model_paths(Path(quantization_dir), imgsz, model_stem=model_stem)
@@ -1089,7 +1117,10 @@ def _export_single_stage(
             if not _is_valid_stage_artifact("onnx_fp32", paths["onnx_fp32"]):
                 export_onnx_fp32(weights_path, paths["onnx_fp32"], imgsz=imgsz)
         if skip_existing and _is_valid_stage_artifact("onnx_int8", paths["onnx_int8"]):
-            excluded = select_onnx_nodes_to_exclude(onnx.load(str(paths["onnx_fp32"])))
+            excluded = select_onnx_nodes_to_exclude(
+                onnx.load(str(paths["onnx_fp32"])),
+                exclude_head_convs=onnx_exclude_head_convs,
+            )
             meta_info["excluded_nodes"] = excluded
             meta_info["onnx_fallback_full_head"] = False
             return paths["onnx_int8"], meta_info
@@ -1099,6 +1130,8 @@ def _export_single_stage(
             calibration_images,
             imgsz=imgsz,
             calibrate_method=calibrate_method,
+            moving_average=onnx_moving_average,
+            exclude_head_convs=onnx_exclude_head_convs,
         )
         meta_info["excluded_nodes"] = excluded
         meta_info["onnx_fallback_full_head"] = used_fallback
@@ -1948,6 +1981,8 @@ def _load_resume_checkpoint(
     max_calibration_images: int,
     seed: int,
     calibrate_method: str,
+    onnx_moving_average: bool | None = None,
+    onnx_exclude_head_convs: bool | None = None,
 ) -> tuple[
     dict[tuple[int, str], dict[str, object]],
     dict[str, dict[str, object]],
@@ -1971,6 +2006,14 @@ def _load_resume_checkpoint(
         or cal.get("max_images") != max_calibration_images
         or cal.get("seed") != seed
         or onnx_cfg.get("calibrate_method") != calibrate_method
+        or (
+            onnx_moving_average is not None
+            and bool(onnx_cfg.get("moving_average", False)) != onnx_moving_average
+        )
+        or (
+            onnx_exclude_head_convs is not None
+            and bool(onnx_cfg.get("exclude_head_convs", False)) != onnx_exclude_head_convs
+        )
     ):
         log.warning("Resume checkpoint config mismatch in %s; starting fresh.", meta_path)
         return {}, {}, {}, {}
@@ -2104,6 +2147,8 @@ def run_cpu_quantization_ablation(
     skip_existing_exports: bool = False,
     max_calibration_images: int = DEFAULT_CALIBRATION_IMAGES,
     calibrate_method: str = "MinMax",
+    onnx_moving_average: bool | None = None,
+    onnx_exclude_head_convs: bool = True,
     seed: int = 42,
     n_warmup: int = 10,
     n_benchmark: int = 100,
@@ -2123,6 +2168,13 @@ def run_cpu_quantization_ablation(
         raise ValueError(f"resolutions must be non-empty positive ints, got {resolutions!r}")
     if not stages or any(s not in ALL_STAGES for s in stages):
         raise ValueError(f"Invalid stages {stages!r}; expected subset of {ALL_STAGES}")
+    resolved_onnx_moving_average = (
+        calibrate_method.strip().lower() == "minmax"
+        if onnx_moving_average is None
+        else bool(onnx_moving_average)
+    )
+    if resolved_onnx_moving_average and calibrate_method.strip().lower() != "minmax":
+        raise ValueError("onnx_moving_average is only supported with calibrate_method='MinMax'")
 
     if upload_to_hf:
         _try_hf_operation(
@@ -2149,6 +2201,7 @@ def run_cpu_quantization_ablation(
     onnx_excluded_nodes: dict[str, list[str]] = {}
     onnx_fallback_flags: dict[str, bool] = {}
 
+    checkpoint_existed = (target_quant_dir / "reports" / eval_split / "quantization_metadata.json").is_file()
     if resume:
         rows_by_key, per_stage_details, onnx_excluded_nodes, onnx_fallback_flags = _load_resume_checkpoint(
             target_quant_dir,
@@ -2157,9 +2210,13 @@ def run_cpu_quantization_ablation(
             max_calibration_images=max_calibration_images,
             seed=seed,
             calibrate_method=calibrate_method,
+            onnx_moving_average=resolved_onnx_moving_average,
+            onnx_exclude_head_convs=onnx_exclude_head_convs,
         )
 
-    effective_skip_exports = resume or skip_existing_exports
+    effective_skip_exports = skip_existing_exports or (
+        resume and (bool(rows_by_key) or not checkpoint_existed)
+    )
     cal_run_name = "calibration_ptq"
     calibration_yaml, calibration_images = prepare_calibration_dataset(
         Path(dataset_root),
@@ -2206,6 +2263,8 @@ def run_cpu_quantization_ablation(
                 "per_channel": True,
                 "reduce_range": False,
                 "calibrate_method": calibrate_method,
+                "moving_average": resolved_onnx_moving_average,
+                "exclude_head_convs": onnx_exclude_head_convs,
                 "excluded_nodes_by_resolution": onnx_excluded_nodes,
                 "fallback_full_head_by_resolution": onnx_fallback_flags,
             },
@@ -2286,6 +2345,8 @@ def run_cpu_quantization_ablation(
                         imgsz=imgsz,
                         model_stem=model_stem,
                         calibrate_method=calibrate_method,
+                        onnx_moving_average=resolved_onnx_moving_average,
+                        onnx_exclude_head_convs=onnx_exclude_head_convs,
                         skip_existing=effective_skip_exports,
                     )
                     artifacts_by_res[imgsz][stage_name] = artifact_path
