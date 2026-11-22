@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
-from typing import Callable, Literal, Protocol
+from typing import Callable, Iterable, Literal, Protocol
 
 import cv2
 import numpy as np
@@ -507,16 +507,14 @@ class AdaptiveROIRunner:
 
     def run_sequence(
         self,
-        frames: list[dict[str, object]],
+        frames: Iterable[dict[str, object]],
         *,
         frame_loader: Callable[[dict[str, object]], np.ndarray] = _read_sequence_frame,
         output_txt_path: Path | None = None,
         return_frame_records: bool = False,
+        on_frame: Callable[[np.ndarray, dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
         """Processes one chronological frame sequence and returns MOT outputs plus E2E timing telemetry."""
-        if not frames:
-            raise ValueError("Sequence frames must not be empty")
-
         tracker = self._create_tracker()
         forecaster = self._create_forecaster()
         is_roi_mode = self.config.mode in ("roi_static", "roi_kalman")
@@ -532,8 +530,10 @@ class AdaptiveROIRunner:
         latencies_ms: list[float] = []
         mot_rows: list[list[float]] = []
         frame_records: list[dict[str, object]] = []
+        processed_frames = 0
 
         for idx, frame_spec in enumerate(frames, start=1):
+            processed_frames = idx
             bgr_frame = frame_loader(frame_spec)
             frame_h, frame_w = bgr_frame.shape[:2]
             mot_frame = int(frame_spec.get("mot_frame", idx))
@@ -603,8 +603,8 @@ class AdaptiveROIRunner:
                 )
                 mot_rows.append([mot_frame, tid, x1, y1, x2 - x1, y2 - y1, conf, -1, -1, -1])
 
-            if return_frame_records:
-                frame_records.append({
+            if return_frame_records or on_frame is not None:
+                record = {
                     "mot_frame": mot_frame,
                     "mode_used": mode_used,
                     "state_after": state,
@@ -614,7 +614,14 @@ class AdaptiveROIRunner:
                     "detections": global_dets.tolist(),
                     "tracks": tracks[:, :6].tolist() if tracks.shape[0] > 0 else [],
                     "latency_ms": elapsed_ms,
-                })
+                }
+                if return_frame_records:
+                    frame_records.append(record)
+                if on_frame is not None:
+                    on_frame(bgr_frame, record)
+
+        if processed_frames == 0:
+            raise ValueError("Sequence frames must not be empty")
 
         if output_txt_path is not None:
             _write_mot_results(output_txt_path, mot_rows)
