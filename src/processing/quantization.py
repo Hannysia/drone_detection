@@ -24,6 +24,7 @@ from huggingface_hub import HfApi, constants as hf_constants, hf_hub_download
 import numpy as np
 import onnx
 import pandas as pd
+from PIL import Image
 import torch
 from ultralytics import YOLO
 import yaml
@@ -41,6 +42,7 @@ from src.config import (
 from src.processing.dataset import parse_frame_filename_logic
 from src.processing.diagnostics import letterbox_image
 from src.processing.evaluation import (
+    _classify_bbox_scale,
     _collect_matched_detections,
     _compute_average_precision,
     evaluate_predictions,
@@ -58,7 +60,9 @@ from src.utils.io import parse_frame_name, parse_video_id
 
 log = logging.getLogger(__name__)
 
-DEFAULT_CALIBRATION_IMAGES = 300
+DEFAULT_CALIBRATION_IMAGES = 500
+DEFAULT_MIN_SMALL_CALIBRATION_FRACTION = 0.15
+_CALIBRATION_SCALE_ORDER = {"small": 0, "medium": 1, "large": 2}
 MAX_ONNX_IR_VERSION = 10
 HF_UPLOAD_TIMEOUT_SECONDS = 180.0
 ALL_STAGES = (
@@ -194,9 +198,9 @@ def _interleave_farthest_order(items: list[Path]) -> list[Path]:
 
 
 def _allocate_stratum_quotas(
-    stratum_sizes: dict[tuple[str, str, str, str], int],
+    stratum_sizes: dict[tuple[str, ...], int],
     max_images: int,
-) -> dict[tuple[str, str, str, str], int]:
+) -> dict[tuple[str, ...], int]:
     total_available = sum(stratum_sizes.values())
     if total_available <= max_images:
         return dict(stratum_sizes)
@@ -227,6 +231,113 @@ def _allocate_stratum_quotas(
             leftover -= 1
 
     return quotas
+
+
+def _read_image_size(img_path: Path) -> tuple[int, int]:
+    """Reads image width and height from header metadata."""
+    with Image.open(img_path) as image:
+        width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Expected positive image dimensions, got {width}x{height} for {img_path}")
+    return int(width), int(height)
+
+
+def _resolve_calibration_label_path(img_path: Path) -> Path | None:
+    """Resolves YOLO label path for raw or staged calibration images."""
+    direct = img_path.with_suffix(".txt")
+    if direct.is_file():
+        return direct
+    if len(img_path.parents) >= 3 and img_path.parent.parent.name == "images":
+        staged = img_path.parents[2] / "labels" / img_path.parent.name / f"{img_path.stem}.txt"
+        if staged.is_file():
+            return staged
+    return None
+
+
+def _infer_calibration_scale_bucket(img_path: Path, category: str | None = None) -> str:
+    """Classifies a calibration frame by its smallest COCO ground-truth bbox scale."""
+    if category == "negative":
+        return "none"
+    label_path = _resolve_calibration_label_path(img_path)
+    if label_path is None:
+        return "none" if category is None else "unknown"
+
+    normalized_boxes: list[tuple[float, float]] = []
+    for raw_line in label_path.read_text(encoding="utf-8").splitlines():
+        parts = raw_line.split()
+        if len(parts) < 5:
+            continue
+        normalized_boxes.append((float(parts[3]), float(parts[4])))
+
+    if not normalized_boxes or not img_path.is_file():
+        return "unknown"
+
+    width, height = _read_image_size(img_path)
+    scales = [
+        _classify_bbox_scale([0.0, 0.0, w_norm * width, h_norm * height])
+        for w_norm, h_norm in normalized_boxes
+    ]
+    return min(scales, key=_CALIBRATION_SCALE_ORDER.__getitem__)
+
+
+def _summarize_calibration_scales(calibration_images: list[Path]) -> dict[str, int]:
+    """Counts calibration frames by target scale bucket or negative background."""
+    counts: Counter[str] = Counter(_infer_calibration_scale_bucket(path) for path in calibration_images)
+    summary = {
+        "small": counts["small"],
+        "medium": counts["medium"],
+        "large": counts["large"],
+        "negative": counts["none"],
+    }
+    if counts["unknown"] > 0:
+        summary["unknown"] = counts["unknown"]
+    return summary
+
+
+def _rebalance_small_quotas(
+    quotas: dict[tuple[str, str, str, str, str], int],
+    stratum_sizes: dict[tuple[str, str, str, str, str], int],
+    *,
+    min_small_fraction: float = DEFAULT_MIN_SMALL_CALIBRATION_FRACTION,
+) -> dict[tuple[str, str, str, str, str], int]:
+    """Transfers positive non-small surplus to small-target strata without reducing negatives."""
+    adjusted = dict(quotas)
+    total_budget = sum(adjusted.values())
+    if total_budget <= 0 or min_small_fraction <= 0.0:
+        return adjusted
+
+    small_keys = sorted(key for key in adjusted if key[4] == "small")
+    if not small_keys:
+        return adjusted
+
+    current_small = sum(adjusted[key] for key in small_keys)
+    available_small = sum(stratum_sizes[key] for key in small_keys)
+    target_small = min(
+        available_small,
+        max(current_small, round(total_budget * min_small_fraction)),
+    )
+    needed = target_small - current_small
+    if needed <= 0:
+        return adjusted
+
+    for _ in range(needed):
+        receivers = [key for key in small_keys if adjusted[key] < stratum_sizes[key]]
+        donors = [
+            key
+            for key in adjusted
+            if key[0] == "positive" and key[4] != "small" and adjusted[key] > 1
+        ]
+        if not receivers or not donors:
+            break
+        receiver = min(
+            receivers,
+            key=lambda key: (adjusted[key], -(stratum_sizes[key] - adjusted[key]), key),
+        )
+        donor = min(donors, key=lambda key: (-(adjusted[key] - 1), key))
+        adjusted[receiver] += 1
+        adjusted[donor] -= 1
+
+    return adjusted
 
 
 def _sample_stratum_round_robin(
@@ -292,32 +403,31 @@ def prepare_calibration_dataset(
         allowed_splits=("train",),
     )
 
-    strata: dict[tuple[str, str, str, str], list[tuple[Path, str]]] = {}
+    strata: dict[tuple[str, str, str, str, str], list[Path]] = {}
     for img_path, category in active_train:
         meta = parse_frame_filename_logic(img_path.name)
-        key = (category, meta["shape"], meta["camera"], meta["background"])
-        strata.setdefault(key, []).append((img_path, category))
+        scale = _infer_calibration_scale_bucket(img_path, category)
+        key = (category, meta["shape"], meta["camera"], meta["background"], scale)
+        strata.setdefault(key, []).append(img_path)
 
-    quotas = _allocate_stratum_quotas(
-        {key: len(items) for key, items in strata.items()},
-        max_images,
+    stratum_sizes = {key: len(paths) for key, paths in strata.items()}
+    quotas = _rebalance_small_quotas(
+        _allocate_stratum_quotas(stratum_sizes, max_images),
+        stratum_sizes,
     )
 
     rng = random.Random(seed)
     selected_entries: list[tuple[Path, str]] = []
-    category_lookup: dict[Path, str] = {}
+    scale_counts: Counter[str] = Counter()
     for key in sorted(strata):
-        items = strata[key]
-        for path, category in items:
-            category_lookup[path] = category
         sampled_paths = _sample_stratum_round_robin(
-            [path for path, _ in items],
+            strata[key],
             quotas[key],
             rng,
         )
-        selected_entries.extend((path, category_lookup[path]) for path in sampled_paths)
-
-    selected_entries.sort(key=lambda entry: entry[0].name)
+        category = key[0]
+        scale_counts[key[4]] += len(sampled_paths)
+        selected_entries.extend((path, category) for path in sampled_paths)
     working_dir = Path(working_dir)
     output_dir = working_dir / f"yolo_dataset_{validated_name}"
     yaml_path = working_dir / f"dataset_{validated_name}.yaml"
@@ -376,13 +486,17 @@ def prepare_calibration_dataset(
             raise
 
     staged_images = sorted((output_dir / "images" / "cal").glob("*.jpg"))
+    rng.shuffle(staged_images)
     log.info(
-        "Prepared train-only calibration set %s: %d images (%d pos, %d neg, %d strata)",
+        "Prepared train-only calibration set %s: %d images (%d pos, %d neg, %d strata, scales: small=%d medium=%d large=%d)",
         validated_name,
         len(staged_images),
         counts["positive"],
         counts["negative"],
         len([q for q in quotas.values() if q > 0]),
+        scale_counts["small"],
+        scale_counts["medium"],
+        scale_counts["large"],
     )
     return yaml_path, staged_images
 
@@ -2057,6 +2171,7 @@ def run_cpu_quantization_ablation(
         run_name=cal_run_name,
         overwrite=True,
     )
+    calibration_scale_counts = _summarize_calibration_scales(calibration_images)
 
     artifacts_by_res: dict[int, dict[str, Path]] = {}
 
@@ -2081,6 +2196,7 @@ def run_cpu_quantization_ablation(
                 "max_images": max_calibration_images,
                 "actual_images": len(calibration_images),
                 "seed": seed,
+                "scale_counts": calibration_scale_counts,
                 "filenames": [path.name for path in calibration_images],
             },
             "onnx_quantization": {
@@ -2539,6 +2655,7 @@ def run_ptq_variant_ablation(
         run_name=cal_run_name,
         overwrite=True,
     )
+    calibration_scale_counts = _summarize_calibration_scales(calibration_images)
 
     def _build_metadata(results_df: pd.DataFrame, *, complete: bool, failed_items: list[dict[str, object]]) -> dict[str, object]:
         return {
@@ -2561,6 +2678,7 @@ def run_ptq_variant_ablation(
                 "max_images": max_calibration_images,
                 "actual_images": len(calibration_images),
                 "seed": seed,
+                "scale_counts": calibration_scale_counts,
                 "filenames": [path.name for path in calibration_images],
             },
             "onnx_quantization": {

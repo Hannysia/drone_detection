@@ -646,7 +646,7 @@ def test_quantize_cpu_cli_defaults_and_flags(tmp_path, monkeypatch):
     assert first_kwargs["eval_split"] == "val"
     assert first_kwargs["resolutions"] == (1280, 640)
     assert first_kwargs["eval_pytorch"] is False
-    assert first_kwargs["max_calibration_images"] == 300
+    assert first_kwargs["max_calibration_images"] == 500
     assert first_kwargs["upload_to_hf"] is False
     assert first_kwargs["source_path"] == cli.MANIFESTS_DIR / "sources" / "hf.json"
 
@@ -1462,3 +1462,104 @@ def test_plot_ptq_variant_ablation_dashboard_handles_failed_rows(tmp_path):
     out_png = tmp_path / "ptq_dash.png"
     plot_ptq_variant_ablation_dashboard(df, save_path=out_png, show=False)
     assert out_png.is_file()
+
+
+def test_rebalance_small_quotas_boosts_small_without_reducing_negatives():
+    stratum_sizes = {
+        ("negative", "quad", "rgb", "sky", "none"): 100,
+        ("positive", "quad", "rgb", "sky", "large"): 200,
+        ("positive", "quad", "rgb", "sky", "medium"): 80,
+        ("positive", "quad", "rgb", "sky", "small"): 20,
+    }
+    base = quantization._allocate_stratum_quotas(stratum_sizes, 100)
+    rebalanced = quantization._rebalance_small_quotas(base, stratum_sizes)
+
+    assert sum(rebalanced.values()) == 100
+    assert (
+        rebalanced[("negative", "quad", "rgb", "sky", "none")]
+        == base[("negative", "quad", "rgb", "sky", "none")]
+    )
+    assert rebalanced[("positive", "quad", "rgb", "sky", "small")] >= 15
+
+
+def test_prepare_calibration_dataset_stratifies_by_bbox_scale_and_shuffles_order(tmp_path):
+    root = tmp_path / "curated"
+    manifest_rows = []
+    specs = [
+        ("negative", "quad_rgb_sky_001", 40, None),
+        ("positive", "quad_rgb_sky_002", 45, "0 0.5 0.5 0.4 0.4\n"),
+        ("positive", "wing_rgb_city_003", 45, "0 0.5 0.5 0.1 0.1\n"),
+        ("positive", "quad_thermal_forest_004", 6, "0 0.5 0.5 0.02 0.04\n"),
+    ]
+    black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    for category, prefix, count, label_line in specs:
+        folder = root / "train" / CATEGORY_DIRS[category]
+        folder.mkdir(parents=True, exist_ok=True)
+        for idx in range(1, count + 1):
+            filename = f"{prefix}_f{idx:04d}.jpg"
+            img_path = folder / filename
+            assert cv2.imwrite(str(img_path), black_frame)
+            if label_line is not None:
+                img_path.with_suffix(".txt").write_text(label_line, encoding="utf-8")
+            manifest_rows.append({
+                "filename": filename,
+                "split": "train",
+                "category": category,
+                "excluded_at": "",
+            })
+
+    val_folder = root / "val" / CATEGORY_DIRS["positive"]
+    val_folder.mkdir(parents=True, exist_ok=True)
+    val_path = val_folder / "quad_rgb_sky_900_f0001.jpg"
+    assert cv2.imwrite(str(val_path), black_frame)
+    val_path.with_suffix(".txt").write_text("0 0.5 0.5 0.02 0.04\n", encoding="utf-8")
+    manifest_rows.append({
+        "filename": val_path.name,
+        "split": "val",
+        "category": "positive",
+        "excluded_at": "",
+    })
+
+    manifest_path = tmp_path / "main.csv"
+    write_manifest(manifest_rows, manifest_path)
+    working_dir = tmp_path / "working"
+
+    _, cal_42_a = quantization.prepare_calibration_dataset(
+        root,
+        working_dir,
+        manifest_path=manifest_path,
+        max_images=24,
+        seed=42,
+        run_name="cal_a",
+    )
+    scale_counts = quantization._summarize_calibration_scales(cal_42_a)
+    assert len(cal_42_a) == 24
+    assert scale_counts["small"] >= round(24 * quantization.DEFAULT_MIN_SMALL_CALIBRATION_FRACTION)
+    assert scale_counts["medium"] >= 1
+    assert scale_counts["large"] >= 1
+    assert scale_counts["negative"] >= 1
+    assert all(path.name != val_path.name for path in cal_42_a)
+
+    names_42_a = [path.name for path in cal_42_a]
+    assert names_42_a != sorted(names_42_a)
+
+    _, cal_42_b = quantization.prepare_calibration_dataset(
+        root,
+        working_dir,
+        manifest_path=manifest_path,
+        max_images=24,
+        seed=42,
+        run_name="cal_b",
+    )
+    assert [path.name for path in cal_42_b] == names_42_a
+
+    _, cal_99 = quantization.prepare_calibration_dataset(
+        root,
+        working_dir,
+        manifest_path=manifest_path,
+        max_images=24,
+        seed=99,
+        run_name="cal_c",
+    )
+    assert [path.name for path in cal_99] != names_42_a
