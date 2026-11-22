@@ -6,6 +6,8 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import subprocess
 from tempfile import mkdtemp
 from typing import Callable, Iterable
 
@@ -338,9 +340,13 @@ def render_demo_frame(
     return canvas
 
 
-def _create_mp4_writer(output_path: Path, fps: float, frame_wh: tuple[int, int]) -> cv2.VideoWriter:
+def _create_mp4_writer(
+    output_path: Path,
+    fps: float,
+    frame_wh: tuple[int, int],
+) -> tuple[cv2.VideoWriter, str]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    for codec in ("mp4v", "avc1"):
+    for codec in ("avc1", "H264", "mp4v"):
         writer = cv2.VideoWriter(
             str(output_path),
             cv2.VideoWriter_fourcc(*codec),
@@ -348,9 +354,45 @@ def _create_mp4_writer(output_path: Path, fps: float, frame_wh: tuple[int, int])
             frame_wh,
         )
         if writer.isOpened():
-            return writer
+            return writer, codec
         writer.release()
     raise RuntimeError(f"Could not initialize MP4 writer for {output_path}")
+
+
+def _transcode_to_h264_if_needed(output_path: Path, codec: str) -> None:
+    if codec in ("avc1", "H264"):
+        return
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        return
+    tmp_path = output_path.with_name(f"{output_path.stem}_h264{output_path.suffix}")
+    try:
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(output_path),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(tmp_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        tmp_path.unlink(missing_ok=True)
+        return
+    if tmp_path.is_file() and tmp_path.stat().st_size > 0:
+        os.replace(tmp_path, output_path)
+    else:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _iter_video_frames(cap: cv2.VideoCapture, *, max_frames: int | None) -> Iterable[dict[str, object]]:
@@ -426,6 +468,7 @@ def process_video_file(
         raise ValueError(f"Could not decode video stream: {source_path}")
 
     writer: cv2.VideoWriter | None = None
+    chosen_codec = ""
     try:
         raw_fps = float(cap.get(cv2.CAP_PROP_FPS))
         video_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0.0 else 30.0
@@ -464,10 +507,10 @@ def process_video_file(
         frame_wh: tuple[int, int] | None = None
 
         def _on_frame(bgr_frame: np.ndarray, record: dict[str, object]) -> None:
-            nonlocal writer, frame_wh
+            nonlocal writer, chosen_codec, frame_wh
             if writer is None:
                 frame_wh = (int(bgr_frame.shape[1]), int(bgr_frame.shape[0]))
-                writer = _create_mp4_writer(out_path, video_fps, frame_wh)
+                writer, chosen_codec = _create_mp4_writer(out_path, video_fps, frame_wh)
             rendered = render_demo_frame(
                 bgr_frame,
                 record,
@@ -505,6 +548,7 @@ def process_video_file(
 
     if not out_path.is_file() or out_path.stat().st_size == 0:
         raise RuntimeError(f"Output video was not written: {out_path}")
+    _transcode_to_h264_if_needed(out_path, chosen_codec)
 
     summary = {
         "mode": mode,

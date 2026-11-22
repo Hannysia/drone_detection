@@ -324,3 +324,71 @@ def test_resolve_demo_openvino_models_falls_back_to_hf_manifest_without_revision
 
     with pytest.raises(ValueError, match="REPO_ID is required"):
         video_demo.resolve_demo_openvino_models(source_path=tmp_path / "missing.json")
+
+
+def test_create_mp4_writer_prefers_h264_before_mp4v(tmp_path, monkeypatch):
+    attempted = []
+    released = []
+
+    class _FakeWriter:
+        def __init__(self, codec: str, opened: bool):
+            self.codec = codec
+            self._opened = opened
+
+        def isOpened(self) -> bool:
+            return self._opened
+
+        def release(self) -> None:
+            released.append(self.codec)
+
+    def _fake_fourcc(*chars):
+        return "".join(chars)
+
+    def _fake_writer_factory(path, fourcc, fps, frame_wh):
+        attempted.append(fourcc)
+        return _FakeWriter(fourcc, opened=(fourcc == "mp4v"))
+
+    monkeypatch.setattr(video_demo.cv2, "VideoWriter_fourcc", _fake_fourcc)
+    monkeypatch.setattr(video_demo.cv2, "VideoWriter", _fake_writer_factory)
+
+    writer, chosen = video_demo._create_mp4_writer(tmp_path / "sub" / "out.mp4", 30.0, (640, 480))
+    assert chosen == "mp4v"
+    assert writer.codec == "mp4v"
+    assert attempted == ["avc1", "H264", "mp4v"]
+    assert released == ["avc1", "H264"]
+
+    monkeypatch.setattr(
+        video_demo.cv2,
+        "VideoWriter",
+        lambda *args: _FakeWriter(args[1], opened=False),
+    )
+    with pytest.raises(RuntimeError, match="Could not initialize MP4 writer"):
+        video_demo._create_mp4_writer(tmp_path / "fail.mp4", 30.0, (640, 480))
+
+
+def test_transcode_to_h264_if_needed_handles_h264_and_ffmpeg(tmp_path, monkeypatch):
+    out_video = tmp_path / "clip.mp4"
+    out_video.write_bytes(b"mp4v-bytes")
+
+    monkeypatch.setattr(video_demo.shutil, "which", lambda _cmd: None)
+    video_demo._transcode_to_h264_if_needed(out_video, "avc1")
+    assert out_video.read_bytes() == b"mp4v-bytes"
+
+    calls = []
+
+    def _fake_run(cmd, check, capture_output):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"h264-bytes")
+
+    monkeypatch.setattr(video_demo.shutil, "which", lambda _cmd: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_demo.subprocess, "run", _fake_run)
+
+    video_demo._transcode_to_h264_if_needed(out_video, "avc1")
+    assert calls == []
+
+    video_demo._transcode_to_h264_if_needed(out_video, "mp4v")
+    assert len(calls) == 1
+    assert "libx264" in calls[0]
+    assert "+faststart" in calls[0]
+    assert out_video.read_bytes() == b"h264-bytes"
+    assert not (tmp_path / "clip_h264.mp4").exists()
