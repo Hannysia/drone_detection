@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
+from huggingface_hub import snapshot_download
 import numpy as np
 import pandas as pd
 
@@ -88,6 +89,75 @@ def load_curated_ablation_sequences(
     return {name: all_sequences[name] for name in seqmap_names}
 
 
+def _resolve_curated_hf_source(
+    source_path: Path | None,
+    *,
+    repo_id: str | None,
+    token: str | None,
+    annotation_version: str,
+) -> tuple[str | None, str, str | None, str, str | None]:
+    source_meta: dict[str, object] = {}
+    if source_path is not None and Path(source_path).is_file():
+        source_meta = json.loads(Path(source_path).read_text(encoding="utf-8"))
+
+    target_repo = (
+        repo_id
+        if repo_id is not None
+        else source_meta.get("repo_id") or getattr(config, "REPO_ID", None)
+    )
+    repo_str = str(target_repo).strip() if target_repo else None
+    repo_type = str(source_meta.get("repo_type") or "dataset").strip() or "dataset"
+    raw_rev = source_meta.get("revision")
+    revision = str(raw_rev).strip() if raw_rev else None
+    version = str(source_meta.get("annotation_version") or annotation_version).strip() or annotation_version
+    target_token = token if token is not None else getattr(config, "HF_TOKEN", None)
+    token_str = str(target_token).strip() if target_token else None
+    return repo_str, repo_type, revision, version, token_str
+
+
+def ensure_curated_annotations(
+    hf_dir: Path,
+    *,
+    splits: tuple[str, ...] = ("val", "test"),
+    annotation_version: str = "v1",
+    source_path: Path | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+) -> str:
+    """Ensures curated annotation archives exist locally, downloading missing splits from HF Hub."""
+    hf_root = Path(hf_dir)
+    repo_str, repo_type, revision, version, token_str = _resolve_curated_hf_source(
+        source_path,
+        repo_id=repo_id,
+        token=token,
+        annotation_version=annotation_version,
+    )
+    curated_root = hf_root / "labels_curated" / version
+    missing_patterns = [
+        f"labels_curated/{version}/{split}/**"
+        for split in splits
+        if not (curated_root / split).is_dir() or not any((curated_root / split).rglob("*.zip"))
+    ]
+    if not missing_patterns or not repo_str:
+        return version
+
+    hf_root.mkdir(parents=True, exist_ok=True)
+    download_kwargs: dict[str, object] = {
+        "repo_id": repo_str,
+        "repo_type": repo_type,
+        "local_dir": str(hf_root),
+        "allow_patterns": missing_patterns,
+    }
+    if revision:
+        download_kwargs["revision"] = revision
+    if token_str:
+        download_kwargs["token"] = token_str
+
+    log.info("Downloading curated annotations (%s) from %s -> %s", ", ".join(splits), repo_str, hf_root)
+    snapshot_download(**download_kwargs)
+    return version
+
+
 def prepare_curated_mot_ground_truth(
     hf_dir: Path,
     dataset_root: Path,
@@ -98,13 +168,23 @@ def prepare_curated_mot_ground_truth(
     manifest_path: Path = MANIFESTS_DIR / "baseline" / "v1" / "main.csv",
     source_path: Path | None = None,
     fps: float = 30.0,
+    repo_id: str | None = None,
+    token: str | None = None,
 ) -> dict[str, list[str]]:
     """Builds curated TrackEval ground truth aligned to baseline/v1 frames."""
+    annotation_version = ensure_curated_annotations(
+        Path(hf_dir),
+        splits=splits,
+        source_path=Path(source_path) if source_path is not None else None,
+        repo_id=repo_id,
+        token=token,
+    )
     return compile_kaggle_mot_dataset(
         Path(hf_dir),
         Path(mot_dataset_dir),
         Path(seqmaps_dir),
         tuple(VIDEO_EXTENSIONS),
+        annotation_version=annotation_version,
         splits=splits,
         baseline_dataset_root=Path(dataset_root),
         manifest_path=Path(manifest_path),

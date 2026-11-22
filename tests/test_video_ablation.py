@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -224,3 +225,76 @@ def test_video_ablation_cli_requires_val_metadata_before_test(tmp_path, monkeypa
 
     with pytest.raises(FileNotFoundError):
         cli.main(["--stage", "test", "--skip-prepare-gt", "--no-source-check"])
+
+
+def test_prepare_curated_mot_ground_truth_downloads_missing_annotations(tmp_path, monkeypatch):
+    hf_dir = tmp_path / "hf_data"
+    source_path = tmp_path / "hf.json"
+    source_path.write_text(
+        json.dumps({
+            "repo_id": "owner/ds",
+            "repo_type": "dataset",
+            "revision": "rev123",
+            "annotation_version": "v1",
+        }),
+        encoding="utf-8",
+    )
+    dl_calls = []
+
+    def fake_snapshot_download(**kwargs):
+        dl_calls.append(kwargs)
+        val_dir = Path(kwargs["local_dir"]) / "labels_curated" / "v1" / "val"
+        val_dir.mkdir(parents=True, exist_ok=True)
+        (val_dir / "seq_1.zip").write_bytes(b"zip")
+        return str(hf_dir)
+
+    compile_mock = Mock(return_value={"val": ["seq_1"]})
+    monkeypatch.setattr(video_ablation, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(video_ablation, "compile_kaggle_mot_dataset", compile_mock)
+    monkeypatch.setattr(video_ablation.config, "HF_TOKEN", "tok-1", raising=False)
+
+    out = video_ablation.prepare_curated_mot_ground_truth(
+        hf_dir,
+        tmp_path / "baseline",
+        tmp_path / "mot",
+        tmp_path / "seqmaps",
+        splits=("val", "test"),
+        source_path=source_path,
+    )
+
+    assert out == {"val": ["seq_1"]}
+    assert len(dl_calls) == 1
+    assert dl_calls[0]["repo_id"] == "owner/ds"
+    assert dl_calls[0]["repo_type"] == "dataset"
+    assert dl_calls[0]["revision"] == "rev123"
+    assert dl_calls[0]["token"] == "tok-1"
+    assert dl_calls[0]["allow_patterns"] == [
+        "labels_curated/v1/val/**",
+        "labels_curated/v1/test/**",
+    ]
+    assert compile_mock.call_args.kwargs["annotation_version"] == "v1"
+
+
+def test_prepare_curated_mot_ground_truth_skips_download_when_present(tmp_path, monkeypatch):
+    hf_dir = tmp_path / "hf_data"
+    for split in ("val", "test"):
+        split_dir = hf_dir / "labels_curated" / "v1" / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "seq.zip").write_bytes(b"zip")
+
+    dl_mock = Mock()
+    compile_mock = Mock(return_value={"val": [], "test": []})
+    monkeypatch.setattr(video_ablation, "snapshot_download", dl_mock)
+    monkeypatch.setattr(video_ablation, "compile_kaggle_mot_dataset", compile_mock)
+
+    video_ablation.prepare_curated_mot_ground_truth(
+        hf_dir,
+        tmp_path / "baseline",
+        tmp_path / "mot",
+        tmp_path / "seqmaps",
+        splits=("val", "test"),
+        repo_id="owner/ds",
+    )
+
+    dl_mock.assert_not_called()
+    compile_mock.assert_called_once()
