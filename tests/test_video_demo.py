@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -286,3 +287,40 @@ def test_app_run_demo_inference_caches_detectors_and_builds_telemetry(tmp_path, 
     assert isinstance(fig_1, matplotlib.figure.Figure) and len(fig_1.axes) == 2
     assert len(progress_calls) == 5
     assert app.build_demo_app() is not None
+
+
+
+def test_resolve_demo_openvino_models_falls_back_to_hf_manifest_without_revision(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOCAL_BASE_DIR", raising=False)
+    monkeypatch.delenv("REPO_ID", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(video_demo.config, "REPO_ID", None, raising=False)
+    monkeypatch.setattr(video_demo.config, "HF_TOKEN", None, raising=False)
+
+    manifests_dir = tmp_path / "manifests"
+    hf_source = manifests_dir / "sources" / "hf.json"
+    hf_source.parent.mkdir(parents=True, exist_ok=True)
+    hf_source.write_text(
+        json.dumps({"repo_id": "owner/ds", "repo_type": "dataset", "revision": "old-rev"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(video_demo.config, "MANIFESTS_DIR", manifests_dir, raising=False)
+
+    snap_dir = tmp_path / "hf_snap"
+    hf_1280 = _write_fake_openvino_dir(
+        snap_dir / "models" / "quantization" / "1280" / f"{video_demo.YOLO_MODEL_STEM}_int8_1280_openvino_model"
+    )
+    hf_640 = _write_fake_openvino_dir(
+        snap_dir / "models" / "quantization" / "640" / f"{video_demo.YOLO_MODEL_STEM}_int8_640_openvino_model"
+    )
+    mock_hf = Mock(return_value=str(snap_dir))
+    monkeypatch.setattr(video_demo, "snapshot_download", mock_hf)
+
+    got_1280, got_640 = video_demo.resolve_demo_openvino_models()
+    assert (got_1280, got_640) == (hf_1280, hf_640)
+    assert mock_hf.call_args.kwargs["repo_id"] == "owner/ds"
+    assert mock_hf.call_args.kwargs["repo_type"] == "dataset"
+    assert "revision" not in mock_hf.call_args.kwargs
+
+    with pytest.raises(ValueError, match="REPO_ID is required"):
+        video_demo.resolve_demo_openvino_models(source_path=tmp_path / "missing.json")

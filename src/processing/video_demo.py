@@ -71,6 +71,16 @@ def _validate_openvino_pair(model_1280: Path, model_640: Path) -> tuple[Path, Pa
     return model_1280, model_640
 
 
+def _resolve_hf_source_defaults(source_path: Path | None) -> tuple[str, str]:
+    path = config.MANIFESTS_DIR / "sources" / "hf.json" if source_path is None else Path(source_path)
+    if not path.is_file():
+        return "", "dataset"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    repo_id = str(meta.get("repo_id") or "").strip()
+    repo_type = str(meta.get("repo_type") or "dataset").strip() or "dataset"
+    return repo_id, repo_type
+
+
 def resolve_demo_openvino_models(
     *,
     model_1280_dir: Path | None = None,
@@ -78,6 +88,7 @@ def resolve_demo_openvino_models(
     repo_id: str | None = None,
     token: str | None = None,
     model_stem: str = YOLO_MODEL_STEM,
+    source_path: Path | None = None,
 ) -> tuple[Path, Path]:
     """Resolves 1280 and 640 OpenVINO INT8 directories locally if present or via HF Hub."""
     if model_1280_dir is not None and model_640_dir is not None:
@@ -91,6 +102,9 @@ def resolve_demo_openvino_models(
             return local_1280, local_640
 
     target_repo = (repo_id if repo_id is not None else os.getenv("REPO_ID") or config.REPO_ID or "").strip()
+    target_repo_type = "dataset"
+    if not target_repo:
+        target_repo, target_repo_type = _resolve_hf_source_defaults(source_path)
     if not target_repo:
         raise ValueError("REPO_ID is required to download quantized OpenVINO models from Hugging Face")
     target_token = token if token is not None else (os.getenv("HF_TOKEN") or config.HF_TOKEN)
@@ -99,7 +113,7 @@ def resolve_demo_openvino_models(
     rel_640 = f"models/quantization/640/{model_stem}_int8_640_openvino_model"
     download_kwargs: dict[str, object] = {
         "repo_id": target_repo,
-        "repo_type": "dataset",
+        "repo_type": target_repo_type,
         "allow_patterns": [f"{rel_1280}/**", f"{rel_640}/**"],
     }
     if target_token:
