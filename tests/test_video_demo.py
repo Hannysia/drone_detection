@@ -182,3 +182,107 @@ def test_process_video_file_validates_inputs_and_max_frames(tmp_path):
     )
     assert res["summary"]["total_frames"] == 3
     assert len(res["per_frame_df"]) == 3
+
+
+
+def _load_app_for_test(monkeypatch):
+    import importlib
+    import sys
+    from types import ModuleType
+
+    try:
+        importlib.import_module("gradio")
+    except ModuleNotFoundError:
+        fake_gr = ModuleType("gradio")
+
+        class _FakeError(Exception):
+            pass
+
+        class _FakeWidget:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def click(self, *args, **kwargs):
+                return None
+
+        fake_gr.Error = _FakeError
+        for name in (
+            "Blocks",
+            "Markdown",
+            "Row",
+            "Column",
+            "Video",
+            "Radio",
+            "Dropdown",
+            "Accordion",
+            "Slider",
+            "Checkbox",
+            "Button",
+            "Plot",
+            "Dataframe",
+            "Progress",
+        ):
+            setattr(fake_gr, name, _FakeWidget)
+        monkeypatch.setitem(sys.modules, "gradio", fake_gr)
+
+    sys.modules.pop("app", None)
+    return importlib.import_module("app")
+
+
+def test_app_run_demo_inference_caches_detectors_and_builds_telemetry(tmp_path, monkeypatch):
+    import matplotlib.figure
+    import pandas as pd
+
+    app = _load_app_for_test(monkeypatch)
+    app._DETECTOR_CACHE.clear()
+    det = _WhiteBoxDetector()
+    load_mock = Mock(return_value=(det, det))
+    monkeypatch.setattr(app, "build_demo_detector_pair", load_mock)
+
+    with pytest.raises(app.gr.Error, match="Upload a video"):
+        app.run_demo_inference(None, "roi_kalman", "bytetrack", 4, 0.1, 0.1, 0.25, 0, True, True, True)
+
+    in_video = _write_synthetic_video(tmp_path / "space_clip.mp4", width=960, height=720, n_frames=5)
+    progress_calls = []
+
+    out_path_1, summary_df_1, fig_1 = app.run_demo_inference(
+        {"path": str(in_video)},
+        "roi_kalman",
+        "bytetrack",
+        3,
+        0.1,
+        0.1,
+        0.25,
+        0,
+        True,
+        True,
+        True,
+        progress=lambda step, desc="": progress_calls.append((step, desc)),
+    )
+    out_path_2, _, _ = app.run_demo_inference(
+        str(in_video),
+        "full_1280",
+        "bytetrack",
+        3,
+        0.1,
+        0.1,
+        0.25,
+        2,
+        False,
+        False,
+        True,
+    )
+
+    assert load_mock.call_count == 1
+    assert Path(out_path_1).is_file() and Path(out_path_2).is_file()
+    assert isinstance(summary_df_1, pd.DataFrame) and not summary_df_1.empty
+    assert isinstance(fig_1, matplotlib.figure.Figure) and len(fig_1.axes) == 2
+    assert len(progress_calls) == 5
+    assert app.build_demo_app() is not None

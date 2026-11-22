@@ -6,7 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 from typing import Callable, Iterable
 
 import cv2
@@ -326,7 +326,7 @@ def render_demo_frame(
 
 def _create_mp4_writer(output_path: Path, fps: float, frame_wh: tuple[int, int]) -> cv2.VideoWriter:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    for codec in ("avc1", "mp4v"):
+    for codec in ("mp4v", "avc1"):
         writer = cv2.VideoWriter(
             str(output_path),
             cv2.VideoWriter_fourcc(*codec),
@@ -420,8 +420,7 @@ def process_video_file(
             estimated_total = min(estimated_total, int(max_frames))
 
         if output_video_path is None:
-            with TemporaryDirectory(prefix="drone_demo_", delete=False) as tmp_dir:
-                out_path = Path(tmp_dir) / f"{source_path.stem}_{mode}.mp4"
+            out_path = Path(mkdtemp(prefix="drone_demo_")) / f"{source_path.stem}_{mode}.mp4"
         else:
             out_path = Path(output_video_path)
 
