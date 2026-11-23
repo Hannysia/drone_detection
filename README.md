@@ -6,9 +6,7 @@
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-INT8-0071C5)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-INT8-grey)
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/27a58b55-77d6-4a57-81fa-82197f6c5c2f" width="750" controls></video>
-</p>
+https://github.com/user-attachments/assets/27a58b55-77d6-4a57-81fa-82197f6c5c2f
 
 ## Engineering Challenges & Overview
 
