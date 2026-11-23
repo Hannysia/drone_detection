@@ -20,15 +20,9 @@ To address this trade-off for semi-autonomous tracking after operator target loc
 
 ## 1. Dataset Curation & Deduplication
 
-```mermaid
-flowchart TD
-    A["610 Raw<br/>OSINT Clips"] --> B["pHash Dedup<br/>(594 clips)"]
-    B --> C["LLM Metadata<br/>Tagging"]
-    C --> D["70/15/15 Split<br/>(Video-level)"]
-    D --> E["Meta SAM 3<br/>+ CVAT Audit"]
-    E --> F["Train DINOv2<br/>46,858→10,730"]
-    E --> G["Val / Test<br/>1,754 / 1,940"]
-```
+<p align="center">
+  <img src="docs/dataset_pipeline.png" width="880" alt="Dataset Curation & Deduplication Pipeline">
+</p>
 
 - **Area-Weighted Two-Vector DINOv2 Deduplication ([`03`](notebooks/03_extract_embeddings.ipynb), [`04`](notebooks/04_embeddings_threshold_analysis.ipynb)):** Standard full-frame embeddings miss small distant UAV motion against static skies. For each frame, I extracted two `dinov2_vitb14` vectors — **global scene** (background) and **scale-adaptive target crop** — weighted dynamically by bbox area ratio (`area` vs `1 - area`) and concatenated into a single L2-normalized descriptor before greedy k-center cosine deduplication (`46,858 → 10,730` train frames, `-77.1%`).
 - **Temporal Sampling & Hard Negatives ([`05`](notebooks/05_temporal_sampling_analysis.ipynb)):** `val` and `test` were subsampled via deterministic `block_size=5` temporal windows. Combat clips contain on-screen telemetry overlays (OSD) and unit watermarks, meaning a detector could **potentially learn OSD/watermark cues instead of UAV geometry** — so I added `1,118` pure-background negative frames containing clutter, horizons, and overlays.
