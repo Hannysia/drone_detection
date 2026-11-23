@@ -1,10 +1,22 @@
-# Real-Time Embedded Drone Detection and Tracking Pipeline (YOLO26n & ByteTrack)
+---
+title: UAV Adaptive ROI Tracking
+emoji: 🛸
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: 5.50.0
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
 
-![Status](https://img.shields.io/badge/Status-Completed-success)
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)
-![TensorRT](https://img.shields.io/badge/TensorRT-FP16-76B900)
+# Real-Time UAV Detection & Adaptive ROI Tracking (YOLO26n OpenVINO INT8)
+
+![Status](https://img.shields.io/badge/Status-In_Progress-blue)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![OpenVINO](https://img.shields.io/badge/OpenVINO-INT8-0071C5)
 ![YOLO26n](https://img.shields.io/badge/Model-YOLO26n-yellow)
+![Gradio](https://img.shields.io/badge/Gradio-5.50-orange)
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/531a8a64-148a-4106-9fde-620d44585e0f" width="750" controls></video>
@@ -14,58 +26,59 @@
 
 ## 🛠 Tech Stack
 
-* **Frameworks & Models:** PyTorch, Ultralytics YOLO26n, Meta SAM 3, DINOv2
-* **Optimization & Compilers:** NVIDIA TensorRT FP16
-* **Tracking & Tools:** BoxMOT (ByteTrack, OC-SORT), OpenCV, CVAT, Hugging Face
-* **APIs & Cloud:** Gemini 2.5 Pro (Vertex AI API), Kaggle (Tesla T4)
+* **Detection & Compression:** PyTorch, Ultralytics YOLO26n, ONNX Runtime (QDQ INT8), OpenVINO + NNCF (INT8)
+* **Adaptive Video Tracking:** Adaptive ROI (`SEARCH 1280` ↔ `TRACK 640`), Kalman Center Forecaster, BoxMOT (`ByteTrack`, `OC-SORT`), TrackEval
+* **Dataset Engineering:** Meta SAM 3, DINOv2 (`k-Center Greedy`), OpenCV, CVAT, Hugging Face Hub
+* **Deployment & UI:** Gradio (`app.py`), Hugging Face Spaces
 
 ---
 
 ## 📌 Project Overview
 
-This project presents a high-performance, real-time computer vision pipeline developed for semi-autonomous UAV interception on resource-constrained Edge AI hardware. The core challenge was to maintain a processing frequency of at least **30 FPS** to compensate for the high closing speeds between the interceptor and the target, which causes rapid scale changes and loss of frame-to-frame overlap.
+Latency-driven model and tracker selection for semi-autonomous UAV interception on CPU/edge hardware (`>= 30 FPS` real-time target budget). Global high-resolution `1280×1280` inference captures distant sub-`32×32 px` fixed-wing targets accurately, while steady-state tracking switches to unscaled `640×640` Kalman-predicted ROI crops around the target to reduce CPU compute without sacrificing pixel scale.
 
 ---
 
-## 🧠 Core Architecture & Performance
+## 🧠 Core Architecture
 
-* **Detection Model:** YOLO26n. Chosen for its ultra-lightweight architecture (~2.5M parameters, 5.4 GFLOPs) and the absence of an NMS module, which minimizes latency via direct coordinate output.
-* **Hardware Acceleration:** Compiled into a binary **TensorRT FP16** engine.
-* **Inference Speed:** Reduced raw GPU inference time to **10.45 ms (95.7 FPS)**.
-* **Temporal Tracking:** Integrated **ByteTrack** using a double-association method to bridge missing frame detections and maintain ID persistence.
-* **System Latency:** The end-to-end pipeline processing latency is **13.14 ms (76 FPS)**, leaving sufficient budget for flight controllers.
+* **Detection Model (`YOLO26n`):** Lightweight end-to-end NMS-free architecture (~2.5M parameters, `yolo26n_run_with_negatives_best.pt`) trained with negative frames to eliminate watermark/OSD shortcut learning.
+* **CPU INT8 Quantization (Phase A):**
+  * **Calibration:** 500 train-only scale-stratified frames (`seed=42`: `small=75`, `medium=95`, `large=275`, `negative=55`; zero `val`/`test` leakage).
+  * **Primary Runtime (`OpenVINO INT8`):** NNCF mixed-precision PTQ executed directly via `OpenVINOYOLODetector` (`device_name="CPU"`, `PERFORMANCE_HINT="LATENCY"`).
+  * **Cross-Platform ONNX INT8:** Custom `QDQ` static quantization (`reduce_range=False`, `CalibMovingAverage`) keeping the `/model.23/` Detect head in FP32 to preserve tracker-compatible confidence calibration (`tp_conf_median = 0.92–0.97`).
+* **Dual-Resolution Adaptive ROI (Phase B):**
+  * **`SEARCH 1280`:** Full-frame `1280×1280` `OpenVINO INT8` scan on acquisition or after `max_lost_frames` consecutive misses.
+  * **`TRACK 640`:** Unscaled `640×640` `OpenVINO INT8` crop centered on the Kalman/tracker forecast + multi-object tracking (`ByteTrack` / `OC-SORT`).
 
 ---
 
 ## 📊 Dataset Engineering & Pipeline
 
 * **Dataset Size:** 13,200 verified frames (12,000 positive, 1,200 negative) extracted from 69,529 raw frames.
-* **Challenge:** Existing public datasets (like VisDrone) suffer from incorrect "ground-to-air" perspectives and feature civil copters rather than military fixed-wing UAVs.
-* **Automated Curation (Human-in-the-Loop):** 
-    1. Automated metadata classification.
-    2. Pseudo-annotations generated via **Meta SAM 3**.
-    3. Manual expert refinement.
-* **Deduplication:** Implemented a multi-stage deduplication pipeline to prevent model overfitting on near-identical adjacent frames:
-    1. **Spatial deduplication:** IoU-based filtering (removed 9,796 static frames).
-    2. **Semantic deduplication:** Utilizing **DINOv2** embeddings and the *k-Center Greedy* algorithm (removed 46,263 low-information frames).
+* **Automated Curation (Human-in-the-Loop):**
+  1. Automated metadata classification.
+  2. Pseudo-annotations generated via **Meta SAM 3**.
+  3. Manual CVAT refinement.
+* **Deduplication:**
+  1. **Spatial deduplication:** IoU-based filtering (removed 9,796 static frames).
+  2. **Semantic deduplication:** **DINOv2** embeddings and *k-Center Greedy* sampling (removed 46,263 low-information frames).
 
 ### 🎯 Generalization & Shortcut Learning Mitigation
-The presence of watermarks and OSD telemetry in OSINT data triggers the "Clever Hans" effect. This was solved by integrating negative samples, successfully shifting the model's EigenCAM attention maps from UI artifacts to the actual drone morphology.
+Negative samples eliminated watermark and OSD telemetry shortcuts ("Clever Hans" effect), shifting EigenCAM attention onto UAV airframes.
 
 <p align="center">
   <img src="docs/eigencam_analysis.png" width="400" alt="EigenCAM Attention Maps">
 </p>
 
-*Comparison of EigenCAM attention maps. Left: Model trained only on positive samples (distracted by watermarks). Right: Final model trained with negative samples (focused correctly on the target).*
+<p align="center">
+  <img src="docs/bbox_spatial_heatmap.png" width="400" alt="BBox Spatial Heatmap">
+</p>
 
 ---
 
 ## 📈 Results
 
-### 1. Detection Metrics (YOLO26n)
-The final model was evaluated on independent validation and test splits, demonstrating high robustness and generalization capabilities.
-
-<div align="center">
+### 1. Detection Baseline (FP32 PyTorch `YOLO26n`)
 
 | Metric | Validation Split | Test Split |
 | :--- | :---: | :---: |
@@ -74,22 +87,20 @@ The final model was evaluated on independent validation and test splits, demonst
 | **mAP@50** | 0.9094 | 0.8668 |
 | **mAP@50-95** | 0.7021 | 0.6696 |
 
-</div>
+### 2. CPU Quantization Verification (`val` → frozen `test`, threshold-free `collection_conf=0.01`)
 
-### 2. Tracking Metrics
-* **ByteTrack:** HOTA = 69.26%, IDF1 = 84.14%, MOTA = 77.29%
-* **OC-SORT:** HOTA = 61.38%, IDF1 = 69.11%, MOTA = 69.99%
+| `imgsz` | Variant | Size (MB) | `AP50` (val → test) | `Δ AP50 vs FP32` (val / test) | `AP50_small` (val → test) | Relative Compute Speedup vs own FP32 (val / test) |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **1280** | `onnx_fp32` | 9.83 | 0.9508 → 0.9005 | baseline | 0.9132 → 0.6952 | 1.00× / 1.00× |
+| **1280** | `onnx_int8` *(MovingAvg + FP32 Head)* | 3.74 | 0.9358 → 0.8908 | -0.0150 / -0.0097 | 0.9185 → 0.7066 | 0.75× / 0.62× |
+| **1280** | `openvino_fp32` | 9.81 | 0.9523 → 0.8999 | baseline | 0.9175 → 0.6949 | 1.00× / 1.00× |
+| **1280** | **`openvino_int8`** *(deployed)* | **3.48** | **0.9499 → 0.8958** | **-0.0025 / -0.0042** | **0.9244 → 0.6992** | **1.06× / 2.17×** *(1.73× vs PyTorch)* |
+| **640** | `onnx_fp32` | 9.35 | 0.7578 → 0.6167 | baseline | 0.2564 → 0.1683 | 1.00× / 1.00× |
+| **640** | `onnx_int8` *(MovingAvg + FP32 Head)* | 3.26 | 0.7522 → 0.6099 | -0.0056 / -0.0067 | 0.4536 → 0.1822 | 1.33× / 1.08× *(2.56× vs PyTorch)* |
+| **640** | `openvino_fp32` | 9.52 | 0.7571 → 0.6161 | baseline | 0.2591 → 0.1690 | 1.00× / 1.00× |
+| **640** | **`openvino_int8`** *(deployed)* | **3.19** | **0.7779 → 0.6354** | **+0.0207 / +0.0193** | **0.4626 → 0.1736** | **2.30× / 3.29×** *(5.61×–10.62× vs PyTorch)* |
 
----
+*Note: Raw `test` `AP50_small` reflects a 2.7× higher share of small ground-truth targets (`142` vs `53` on `val`) already visible in FP32. Relative CPU compute speedups measure pure INT8 vs FP32 gains rather than a fixed target-device FPS guarantee.*
 
-## 🎯 Future Model Optimizations
-
-Analysis of bounding box coordinates revealed a severe **spatial center bias**. As shown in the coordinate density heatmap below, target centers are heavily concentrated in a narrow vertical strip right down the center of the frame ($X \approx 0.5$).
-
-<p align="center">
-  <img src="docs/bbox_spatial_heatmap.png" width="400" alt="BBox Spatial Heatmap">
-</p>
-
-This center bias is caused by the automatic camera tracking on interceptor drones. It creates a structural shortcut where the model expects targets to always be centered. To break this spatial bias and further improve the pipeline, the following optimizations are planned:
-* **Aggressive Random Translation (Shifting):** Shift images horizontally and vertically during training to artificially force bounding box centers away from the $X=0.5$ axis.
-* **Random Crop & Scale:** Crop off-center patches of frames to teach the model to detect targets located near the frame boundaries.
+### 3. Adaptive ROI & MOT Video Ablation (`val` → `test`)
+*Pending completion of `scripts/07_video_ablation.py --stage all` and `notebooks/09_mot_analysis.ipynb` (`full_1280` vs `resize_640` vs `roi_static` vs `roi_kalman` across `ByteTrack` and `OC-SORT`).*
