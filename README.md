@@ -7,7 +7,7 @@
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-INT8-grey)
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/531a8a64-148a-4106-9fde-620d44585e0f" width="750" controls></video>
+  <video src="https://github.com/user-attachments/assets/27a58b55-77d6-4a57-81fa-82197f6c5c2f" width="750" controls></video>
 </p>
 
 ## Engineering Challenges & Overview
