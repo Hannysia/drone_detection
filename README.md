@@ -1,4 +1,4 @@
-# Interceptor UAV Detection & Tracking System for Edge Devices
+# Counter-UAV Edge Detection & Tracking for Interceptor Drones
 
 ![Status](https://img.shields.io/badge/Status-v1.0_Benchmarked-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
