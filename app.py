@@ -19,8 +19,8 @@ from src.processing.video_demo import (
 DEFAULT_METADATA_PATH = Path(__file__).resolve().parent / "configs" / "video_ablation_metadata.json"
 
 MODE_CHOICES: list[tuple[str, str]] = [
-    ("ROI Kalman (1280 Search + 640 Track)", "roi_kalman"),
     ("ROI Static (1280 Search + 640 Track)", "roi_static"),
+    ("ROI Kalman (1280 Search + 640 Track)", "roi_kalman"),
     ("Full 1280 (Baseline)", "full_1280"),
     ("Resize 640 (Fast Baseline)", "resize_640"),
 ]
@@ -191,14 +191,15 @@ def build_demo_app() -> gr.Blocks:
     with gr.Blocks(title="UAV Adaptive ROI Tracking (OpenVINO INT8)") as blocks:
         gr.Markdown(
             "## UAV Detection & Adaptive ROI Tracking (OpenVINO INT8)\n"
-            "Compares `SEARCH 1280` -> `TRACK 640` ROI cropping (Kalman / Static) against Full 1280 and Resize 640 baselines on CPU."
+            "Compares `SEARCH 1280` -> `TRACK 640` ROI cropping (`ROI Static` default, `ROI Kalman` optional) against Full 1280 and Resize 640 baselines on CPU.\n\n"
+            "*Note: `ROI Static` and `ROI Kalman` share the same OpenVINO 1280/640 compute profile (~81.5% `640` crops on test); both remain selectable for side-by-side comparison on real videos.*"
         )
         with gr.Row():
             with gr.Column(scale=1):
                 video_input = gr.Video(label="Input Video (.mp4 / .mov / .avi)")
                 mode_input = gr.Radio(
                     choices=MODE_CHOICES,
-                    value="roi_kalman",
+                    value="roi_static",
                     label="Inference Mode",
                 )
                 tracker_input = gr.Radio(
