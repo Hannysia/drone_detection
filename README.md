@@ -68,9 +68,9 @@ To address this trade-off for semi-autonomous tracking after operator target loc
 
 ---
 
-## 2. Shortcut Learning Audit (`YOLO26n`)
+## 2. Training Dynamics & Shortcut Learning Audit (`YOLO26n`)
 
-To test whether OSD overlays or brigade/charity watermarks induce shortcut learning, I trained two `YOLO26n` models ([`06_yolo_training.ipynb`](notebooks/06_yolo_training.ipynb)) — `positives_only` vs `with_negatives` — and compared their `val` metrics and paired EigenCAM saliency maps ([`07_yolo_evaluation_diagnostics.ipynb`](notebooks/07_yolo_evaluation_diagnostics.ipynb)):
+To verify generalization without overfitting and test whether OSD overlays or unit watermarks induce shortcut learning, I trained two `YOLO26n` models ([`06_yolo_training.ipynb`](notebooks/06_yolo_training.ipynb)) — `positives_only` vs `with_negatives` — and compared their `val` training curves and paired EigenCAM saliency maps ([`07_yolo_evaluation_diagnostics.ipynb`](notebooks/07_yolo_evaluation_diagnostics.ipynb)):
 
 <div align="center">
   <table>
@@ -80,23 +80,29 @@ To test whether OSD overlays or brigade/charity watermarks induce shortcut learn
         <th align="center">Precision</th>
         <th align="center">Recall</th>
         <th align="center">mAP@50</th>
+        <th align="center">mAP@50-95</th>
         <th align="center">Negatives FP (@0.25)</th>
+        <th align="center">W&amp;B Training Log</th>
       </tr>
     </thead>
     <tbody>
       <tr>
         <td><code>positives_only</code></td>
         <td align="center">0.9415</td>
-        <td align="center">0.9336</td>
+        <td align="center">0.9375</td>
         <td align="center">0.9593</td>
+        <td align="center">0.7976</td>
         <td align="center">39.19% (29/74)</td>
+        <td align="center"><a href="https://wandb.ai/anyknysh2000-/drone-detection/runs/c3jw45f6">47 ep (best @32)</a></td>
       </tr>
       <tr>
         <td><strong><code>with_negatives</code></strong></td>
         <td align="center"><strong>0.9526</strong></td>
-        <td align="center"><strong>0.9375</strong></td>
+        <td align="center"><strong>0.9336</strong></td>
         <td align="center"><strong>0.9617</strong></td>
+        <td align="center"><strong>0.8084</strong></td>
         <td align="center"><strong>28.38% (21/74)</strong></td>
+        <td align="center"><strong><a href="https://wandb.ai/anyknysh2000-/drone-detection/runs/0v5yenly">50 ep (best @38)</a></strong></td>
       </tr>
     </tbody>
   </table>
@@ -106,7 +112,7 @@ To test whether OSD overlays or brigade/charity watermarks induce shortcut learn
   <img src="docs/eigencam_analysis.png" width="880" alt="EigenCAM Comparison: Positives Only vs With Negatives">
 </p>
 
-Both `val` metrics and EigenCAM saliency maps confirm no watermark shortcut learning on either model, while hard negatives visibly improve background rejection (`39.19% → 28.38%` FP on `val` empty scenes).
+Both `val` metrics and EigenCAM saliency maps confirm no watermark shortcut learning on either model, while hard negatives visibly improve background rejection (`39.19% → 28.38%` FP on `val` empty scenes). Full W&amp;B training logs ([`with_negatives`](https://forge.coreweave.com/wandb/anyknysh2000-/drone-detection/reports/Positives-and-negatives-model--VmlldzoxODM1NDg1MQ?accessToken=pf2cu66emuln4r8m1t0fg9ctk7f538x9ftiyradw1nqizxalt7kpyfj6ec5l5249), [`positives_only`](https://forge.coreweave.com/wandb/anyknysh2000-/drone-detection/reports/Positives-only-model--VmlldzoxODM1NDg0Mw?accessToken=0gcpouu3y4wo5sqofzolw67qtths8k2ysohgi04hwjkeofraomyske9ub3gusd85)) confirm a **`Balanced fit`** without overfitting: `val` losses decrease cleanly and `mAP@50-95` plateaus without late-epoch degradation (`0.8084` at epoch `38` vs `0.807` at epoch `50`; `0.7976` at epoch `32` vs `0.796` at epoch `47` with `EarlyStopping`).
 
 ---
 
